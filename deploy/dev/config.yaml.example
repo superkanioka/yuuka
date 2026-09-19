@@ -31,3 +31,33 @@ BASE_URL: "http://localhost:7855"
 PRIVACY_POLICY_URL: "/privacy"
 TERMS_URL: "/terms"
 GOOGLE_SITE_VERIFICATION: ""
+
+# ==============================================================================
+# Instagram 連携（§3.15・任意）
+# ==============================================================================
+# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します。
+# Docker 運用では compose の環境変数 pass-through が固定リストのため、トークンを含め
+# **すべてこの config.yaml に書く**（本ファイルは .gitignore 済み・:ro マウント）。
+#
+# 前提: Instagramアカウントを Business/Creator に切り替え、Meta for Developers でアプリを作成し
+# instagram_business_basic スコープで認可しておくこと（Facebookページ連携は不要）。
+# 本機能は Rust 実装のみ（Node イメージでは動作しません）。
+
+# 転送先DiscordチャンネルID。空欄なら連携サービスは登録されません。
+# INSTAGRAM_CHANNEL_ID: ""
+
+# チャンネル露出ガードの検証対象＝オーナーのDiscordユーザーID。
+# 未設定なら ADMIN_DISCORD_IDS の先頭を使います。このユーザーが転送先チャンネルの
+# ギルドに在籍していないとDMへフォールバックします。
+# INSTAGRAM_OWNER_DISCORD_ID: ""
+
+# 初回連携用アクセストークン（短期可）。起動時に長期トークン（60日）へ交換し、
+# instagram_account テーブルへ暗号化保存します。以降はDB側が正のため削除して構いません。
+# INSTAGRAM_ACCESS_TOKEN: ""
+
+# アプリシークレット。短期→長期トークンの交換に必要です。
+# INSTAGRAM_APP_SECRET: ""
+
+# ポーリング間隔（cron式、既定 */20 * * * *）。
+# Instagram APIのレート制限（1時間200コール/ユーザー）に収まる範囲で設定します。
+# INSTAGRAM_POLL_CRON: "*/20 * * * *"

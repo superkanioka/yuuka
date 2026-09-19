@@ -866,13 +866,20 @@ Node版には存在しない **Rust 実装のみの機能**（`crates/yuuka-serv
 
 #### 3.15.2 設定項目
 
-| 項目 | 設定場所 | 説明 |
-|------|----------|------|
-| `INSTAGRAM_ACCESS_TOKEN` | .env | 初回連携用アクセストークン（短期可）。連携後はDB側が正 |
-| `INSTAGRAM_APP_SECRET` | .env | アプリシークレット。短期→長期トークンの交換に使用 |
-| `INSTAGRAM_CHANNEL_ID` | config.yaml | 転送先DiscordチャンネルID。未設定ならサービス自体を登録しない |
-| `INSTAGRAM_OWNER_DISCORD_ID` | config.yaml | チャンネル露出ガードの検証対象。未設定なら `ADMIN_DISCORD_IDS` の先頭 |
-| `INSTAGRAM_POLL_CRON` | config.yaml | ポーリング間隔（cron式、既定 `*/20 * * * *`） |
+設定は `yaml[KEY] ?? env[KEY]` の優先順で読む（§6.8）。Docker運用ではcomposeの環境変数
+pass-throughが固定リストのため、**5項目すべてを `deploy/<インスタンス>/config.yaml` に書く**
+（同ファイルは .gitignore 済みで `/app/config.yaml:ro` としてマウントされる）。
+
+| 項目 | 説明 |
+|------|------|
+| `INSTAGRAM_ACCESS_TOKEN` | 初回連携用アクセストークン（短期可）。連携後はDB側が正 |
+| `INSTAGRAM_APP_SECRET` | アプリシークレット。短期→長期トークンの交換に使用 |
+| `INSTAGRAM_CHANNEL_ID` | 転送先DiscordチャンネルID。未設定ならサービス自体を登録しない |
+| `INSTAGRAM_OWNER_DISCORD_ID` | チャンネル露出ガードの検証対象。未設定なら `ADMIN_DISCORD_IDS` の先頭 |
+| `INSTAGRAM_POLL_CRON` | ポーリング間隔（cron式、既定 `*/20 * * * *`） |
+
+本機能はRust実装のみで、Node版（`node dist/index.js`）では動作しない。またRust cronは
+`YUUKA_RUST_CRON=1` でのみ起動する（Dockerfileが焼き込み済み・移行期の二重writer回避）。
 
 #### 3.15.3 アクセストークンの管理
 
