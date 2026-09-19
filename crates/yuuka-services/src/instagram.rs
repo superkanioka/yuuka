@@ -305,32 +305,32 @@ fn child_image_url(child: &MediaChild) -> Option<String> {
 ///
 /// 画像 URL を本文に置くと Discord 側がプレビュー展開するため、`RichEmbed`（画像フィールドを
 /// 持たない）を使わずに写真を見せられる。パーマリンクは投稿ページへの導線として併記する。
+///
+/// 文面は秘書（早瀬ユウカ）の業務報告調。固定文言なので LLM 呼び出しは行わない
+/// （cron 経路での API コスト・遅延・失敗を持ち込まない）。
 #[must_use]
 pub fn render_post(post: &Media) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    let header = post.username.as_ref().map_or_else(
-        || "📸 Instagram に新しい投稿".to_owned(),
-        |u| format!("📸 @{u} の新しい投稿"),
-    );
-    lines.push(header);
+    lines.push("📸 新規投稿を1件確認しました。".to_owned());
 
     if let Some(caption) = post.caption.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         lines.push(String::new());
         lines.push(truncate_chars(caption, MAX_CAPTION_CHARS));
     }
 
-    let extra = match post.media_type.as_str() {
-        "VIDEO" => Some("🎬 動画".to_owned()),
+    let note = match post.media_type.as_str() {
+        "VIDEO" => "🎬 動画です。内容はリンク先でご確認ください。".to_owned(),
         "CAROUSEL_ALBUM" if post.children.len() > 1 => {
-            Some(format!("🖼 画像{}枚", post.children.len()))
+            format!(
+                "🖼 写真{}枚の投稿です。先頭の1枚のみ載せておきますね。",
+                post.children.len()
+            )
         }
-        _ => None,
+        _ => "内容は以上です。共有しておきますね。".to_owned(),
     };
-    if let Some(note) = extra {
-        lines.push(String::new());
-        lines.push(note);
-    }
+    lines.push(String::new());
+    lines.push(note);
 
     if let Some(permalink) = post.permalink.as_deref() {
         lines.push(String::new());
@@ -855,8 +855,9 @@ mod tests {
     #[test]
     fn rendered_post_carries_caption_permalink_and_image() {
         let body = render_post(&post("P", "2026-09-19T12:00:00+0000"));
-        assert!(body.contains("@yanas の新しい投稿"));
+        assert!(body.starts_with("📸 新規投稿を1件確認しました。"));
         assert!(body.contains("投稿 P"));
+        assert!(body.contains("内容は以上です。共有しておきますね。"));
         assert!(body.contains("https://instagram.com/p/P"));
         // 画像 URL を本文に置くことで Discord がプレビュー展開する。
         assert!(body.contains("https://cdn.example/P.jpg"));
@@ -868,7 +869,7 @@ mod tests {
         p.media_type = "VIDEO".to_owned();
         p.thumbnail_url = Some("https://cdn.example/V.jpg".to_owned());
         let body = render_post(&p);
-        assert!(body.contains("🎬 動画"));
+        assert!(body.contains("🎬 動画です。"));
         assert!(body.contains("https://cdn.example/V.jpg"));
     }
 
@@ -888,7 +889,7 @@ mod tests {
                 thumbnail_url: None,
             },
         ];
-        assert!(render_post(&p).contains("🖼 画像2枚"));
+        assert!(render_post(&p).contains("🖼 写真2枚の投稿です。"));
     }
 
     #[test]
