@@ -93,3 +93,18 @@ TERMS_URL: "/terms"
 # またはメタタグの content 属性の値を指定します。
 # 空欄の場合、メタタグは挿入されません。
 GOOGLE_SITE_VERIFICATION: ""
+
+# ==============================================================================
+# Instagram 連携 (Instagram → Discord 自動転送・任意)
+# ==============================================================================
+# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します。
+# アクセストークンとアプリシークレットは機密情報のため .env 側で設定してください
+# （INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_APP_SECRET、.env.example 参照）。
+
+# 新規投稿の転送先DiscordチャンネルID。
+# 空欄の場合、Instagram連携は起動しません。
+INSTAGRAM_CHANNEL_ID: ""
+
+# 新規投稿を確認する間隔 (cron式、デフォルトは20分毎)。
+# Instagram APIのレート制限（1時間あたり200コール/ユーザー）に収まる範囲で設定してください。
+INSTAGRAM_POLL_CRON: "*/20 * * * *"

@@ -22,6 +22,10 @@ import {
 	startClipboardCleanup,
 	stopClipboardCleanup,
 } from "./services/clipboardCleanupService.js";
+import {
+	startInstagramFeedService,
+	stopInstagramFeedService,
+} from "./services/instagramFeedService.js";
 import { startMetricsLogging, stopMetricsLogging } from "./services/metrics.js";
 import {
 	startPaymentRecurrenceService,
@@ -120,6 +124,7 @@ async function main() {
 	startReportService(); // 日報・週報（§3.8）
 	startBriefingService(); // 朝報: 天気・ニュース（§3.9）
 	startBackupScheduler(); // ユーザー単位Google Driveバックアップ（§8）
+	startInstagramFeedService(); // Instagram新規投稿のDiscord転送（§3.15）
 
 	// シナプス認知アーキテクチャ（v3 / schema v10）。常時有効。
 	await startSynapseEngine(); // Rust シナプスエンジンのウォームスタート（バイナリ不在時は現行挙動へデグレード）
@@ -146,6 +151,7 @@ async function gracefulShutdown(): Promise<void> {
 	try {
 		stopMetricsLogging();
 		stopSynapseEngine();
+		stopInstagramFeedService();
 		stopBackupScheduler();
 		stopBriefingService();
 		stopReportService();
