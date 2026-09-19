@@ -27,6 +27,8 @@ pub enum Schedule {
     DailyAt { hour: u32, minute: u32 },
     /// 任意の 5-field cron 式（ユーザー由来ではなくサービス定義の固定式）。
     Cron(&'static str),
+    /// 設定由来の 5-field cron 式（`INSTAGRAM_POLL_CRON` 等・起動時に検証済みの値を渡す）。
+    CronExpr(String),
     /// 固定間隔（秒）。cron 非整列（現行 metrics の `setInterval`）。
     FixedSecs(u64),
 }
@@ -39,6 +41,7 @@ impl Schedule {
             Schedule::Hourly => Some("0 * * * *".to_owned()),
             Schedule::DailyAt { hour, minute } => Some(format!("{minute} {hour} * * *")),
             Schedule::Cron(expr) => Some((*expr).to_owned()),
+            Schedule::CronExpr(expr) => Some(expr.clone()),
             Schedule::FixedSecs(_) => None,
         }
     }

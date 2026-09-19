@@ -8,9 +8,8 @@ import { getDb } from "./database.js";
  * バージョン不一致を検出した場合は旧テーブルを DROP して作り直す。
  *
  * v3→v4: MCPサーバーを (user_id, bot_id) 複合スコープへ移行。bot_mcp_links テーブルを廃止。
- * v17→v18: Instagram連携（§3.15）の instagram_account テーブルを追加（新規テーブルのみ・移行不要）。
  */
-const SCHEMA_VERSION = "18";
+const SCHEMA_VERSION = "17";
 
 /** 旧スキーマ（v1）のテーブル群。v2移行時に破棄する */
 const LEGACY_TABLES = [
@@ -841,35 +840,6 @@ function migrateToTimeline(db: ReturnType<typeof getDb>): void {
   `);
 }
 
-/**
- * v17→v18: Instagram連携（§3.15）。
- * 自分専用の単一アカウント運用のため id = 1 の1行のみを保持する（CHECK 制約で担保）。
- * 長期アクセストークンは60日で失効し定期リフレッシュで値そのものが書き換わるため、
- * .env ではなくDBへ「システム鍵」で暗号化して保存する（user_google_accounts と同方式）。
- * 新規投稿の判定は last_post_id ではなく last_post_timestamp（この時刻より新しい投稿が未送信）
- * で行う。IDは順序を持たず、投稿削除や一度に多数投稿された場合に取りこぼし・重複送信が起きるため。
- * 新規テーブルのみの冪等追加（破壊的再構築なし・後方互換）。
- */
-function migrateToInstagram(db: ReturnType<typeof getDb>): void {
-	db.exec(`
-    CREATE TABLE IF NOT EXISTS instagram_account (
-      id                     INTEGER PRIMARY KEY CHECK (id = 1), -- 単一アカウント運用の番人
-      ig_user_id             TEXT,
-      username               TEXT,
-      access_token_encrypted TEXT NOT NULL,
-      access_token_iv        TEXT NOT NULL,
-      access_token_tag       TEXT NOT NULL,
-      token_expires_at       TEXT,                     -- 長期トークンの失効予定時刻
-      last_refreshed_at      TEXT,                     -- 最後にリフレッシュに成功した時刻
-      last_post_id           TEXT,                     -- 最後にDiscordへ送信した投稿のID（ログ・重複防止用）
-      last_post_timestamp    TEXT,                     -- 送信済みの最新投稿時刻（新規判定のカーソル）
-      last_checked_at        TEXT,
-      created_at             TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-      updated_at             TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-    );
-  `);
-}
-
 export async function runMigrations(): Promise<void> {
 	const db = getDb();
 
@@ -1601,10 +1571,6 @@ export async function runMigrations(): Promise<void> {
 
 	// ─── v17: デイリータイムライン（day_plan_blocks + timeline_records） ──
 	migrateToTimeline(db);
-
-	// ─── v18: Instagram連携（instagram_account） ──
-	// 新規テーブルのみの冪等追加（破壊的再構築なし）。既存テーブル不変。
-	migrateToInstagram(db);
 
 	// スキーマバージョンを記録
 	db.prepare(

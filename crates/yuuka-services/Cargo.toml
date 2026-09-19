@@ -27,6 +27,10 @@ thiserror.workspace = true
 rusqlite.workspace = true                 # services 固有 cron SQL（clipboard_entries / planned_payments・専用ドメイン crate 未整備）
 chrono.workspace = true
 croner.workspace = true
+# Instagram 連携（§3.15）: Graph API 取得 + 長期トークンの at-rest 暗号化。
+reqwest.workspace = true
+serde_json.workspace = true
+yuuka-crypto.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -182,23 +182,4 @@ export const config = {
 	 */
 	desktopDemoComponents:
 		getSetting("DESKTOP_DEMO_COMPONENTS", "false") === "true",
-
-	// ─── Instagram 連携（§3.15） ───────────────────────────────────────────────
-	// 機密値（トークン・アプリシークレット）は config.yaml ではなく .env で設定すること。
-
-	/**
-	 * 初回連携用のInstagramアクセストークン（短期トークン可）。
-	 * DBに未連携の場合のみ使用し、起動時に長期トークンへ交換してDBへ暗号化保存する。
-	 * 連携後はDB側が正となるため、この値は削除してよい。
-	 */
-	instagramAccessToken: getSetting("INSTAGRAM_ACCESS_TOKEN", ""),
-
-	/** Instagramアプリシークレット（短期→長期トークンの交換に必要） */
-	instagramAppSecret: getSetting("INSTAGRAM_APP_SECRET", ""),
-
-	/** 新規投稿の転送先DiscordチャンネルID（未設定の場合、連携機能は起動しない） */
-	instagramChannelId: getSetting("INSTAGRAM_CHANNEL_ID", ""),
-
-	/** Instagram新規投稿のポーリング間隔（cron式、デフォルトは20分毎） */
-	instagramPollCron: getSetting("INSTAGRAM_POLL_CRON", "*/20 * * * *"),
 };

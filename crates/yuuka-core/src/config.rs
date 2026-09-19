@@ -61,6 +61,20 @@ pub struct Config {
     pub google_client_id: Option<String>,
     /// Google OAuth2 クライアントシークレット（`GOOGLE_CLIENT_SECRET`・同上・Node `config.googleClientSecret`）。
     pub google_client_secret: Option<String>,
+    /// Instagram 新規投稿の転送先 Discord チャンネル ID（`INSTAGRAM_CHANNEL_ID`・§3.15）。
+    /// 未設定なら Instagram 連携サービスは起動しない。
+    pub instagram_channel_id: Option<String>,
+    /// Instagram のポーリング間隔（5-field cron 式・`INSTAGRAM_POLL_CRON`・既定 `*/20 * * * *`）。
+    pub instagram_poll_cron: String,
+    /// 初回連携用の Instagram アクセストークン（`INSTAGRAM_ACCESS_TOKEN`・短期トークン可）。
+    /// DB に未連携のときだけ使い、長期トークンへ交換して暗号化保存する。以後は DB 側が正。
+    pub instagram_access_token: Option<SecretString>,
+    /// Instagram アプリシークレット（`INSTAGRAM_APP_SECRET`・短期→長期トークンの交換に必要）。
+    pub instagram_app_secret: Option<SecretString>,
+    /// 転送先チャンネルの閲覧資格を検証する対象ユーザー（`INSTAGRAM_OWNER_DISCORD_ID`）。
+    /// 通知配信はチャンネル露出ガード（対象ユーザーの在籍確認）を通るため、オーナー本人の
+    /// Discord ユーザー ID が要る。未設定なら `ADMIN_DISCORD_IDS` の先頭を使う。
+    pub instagram_owner_discord_id: Option<String>,
 }
 
 impl Config {
@@ -120,6 +134,13 @@ impl Config {
             reminder_cron: get("REMINDER_CRON").unwrap_or_else(|| "* * * * *".to_owned()),
             google_client_id: non_empty(get("GOOGLE_CLIENT_ID")),
             google_client_secret: non_empty(get("GOOGLE_CLIENT_SECRET")),
+            instagram_channel_id: non_empty(get("INSTAGRAM_CHANNEL_ID")),
+            instagram_poll_cron: non_empty(get("INSTAGRAM_POLL_CRON"))
+                .unwrap_or_else(|| "*/20 * * * *".to_owned()),
+            instagram_access_token: non_empty(get("INSTAGRAM_ACCESS_TOKEN"))
+                .map(SecretString::from),
+            instagram_app_secret: non_empty(get("INSTAGRAM_APP_SECRET")).map(SecretString::from),
+            instagram_owner_discord_id: non_empty(get("INSTAGRAM_OWNER_DISCORD_ID")),
         };
         cfg.validate()?;
         Ok(cfg)

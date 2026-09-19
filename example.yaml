@@ -97,13 +97,17 @@ GOOGLE_SITE_VERIFICATION: ""
 # ==============================================================================
 # Instagram 連携 (Instagram → Discord 自動転送・任意)
 # ==============================================================================
-# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します。
+# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します（§3.15）。
 # アクセストークンとアプリシークレットは機密情報のため .env 側で設定してください
 # （INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_APP_SECRET、.env.example 参照）。
 
-# 新規投稿の転送先DiscordチャンネルID。
-# 空欄の場合、Instagram連携は起動しません。
+# 新規投稿の転送先DiscordチャンネルID。空欄なら連携サービスは登録されません。
 INSTAGRAM_CHANNEL_ID: ""
+
+# 転送先チャンネルの閲覧資格を検証する対象＝オーナーのDiscordユーザーID。
+# 通知配信はチャンネル露出ガード（対象ユーザーの在籍確認）を通るため必要です。
+# 空欄の場合は ADMIN_DISCORD_IDS の先頭を使います。
+INSTAGRAM_OWNER_DISCORD_ID: ""
 
 # 新規投稿を確認する間隔 (cron式、デフォルトは20分毎)。
 # Instagram APIのレート制限（1時間あたり200コール/ユーザー）に収まる範囲で設定してください。

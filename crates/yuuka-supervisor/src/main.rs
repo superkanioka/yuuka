@@ -21,7 +21,7 @@ use yuuka_core::{Config, DbError};
 use yuuka_crypto::{rotate_secret_key, SystemCrypto, LEGACY_FALLBACK_SECRET};
 use yuuka_discord::{rate_limit_message, DiscordManager, ManagerPorts, Prepared, RateLimiter};
 use yuuka_orchestrator::{ChatEngine, DbBotDirectory, DbMembership, InMemoryRateLimiter};
-use yuuka_services::{MetricsRegistry, ServiceContext};
+use yuuka_services::{InstagramSettings, MetricsRegistry, ServiceContext};
 use yuuka_supervisor::{
     build_app, build_supervised_services, build_tool_registry, ws_routes, MessengerRegistrationDm,
     RegistryBotRuntime, RegistryBotViewRuntime, RegistryDiscordLive, RegistryLifecycle,
@@ -324,6 +324,8 @@ async fn run() -> Result<(), String> {
     let device_auth_routes =
         yuuka_auth::device_auth_routes(yuuka_auth::DeviceAuthStore::new(verification_base));
 
+    // Instagram 連携（§3.15）のトークン暗号化に使うため、AuthRuntime へ move される前に確保する。
+    let instagram_crypto = crypto.clone();
     let auth_runtime = Arc::new(AuthRuntime::new(
         sessions,
         cfg.session_ttl_days,
@@ -410,6 +412,28 @@ async fn run() -> Result<(), String> {
         // 据え置き＝走査はするが実行は失敗）。手動 trigger（settings）と同一の GoogleBackupClient を共有する。
         if let Some(client) = google_backup_client.clone() {
             service_ctx = service_ctx.with_backup(Arc::new(BackupRunnerAdapter { client }));
+        }
+        // Instagram 新規投稿の Discord 転送（§3.15）。転送先チャンネルと暗号鍵が揃っている場合のみ
+        // 登録する（未設定ならサービス自体を持たない＝既存挙動に影響しない）。配信はチャンネル露出
+        // ガードを通るため、在籍確認の対象となるオーナーの Discord ユーザー ID が要る。
+        if let (Some(channel_id), Some(crypto)) =
+            (cfg.instagram_channel_id.clone(), instagram_crypto)
+        {
+            if let Some(owner_user_id) = instagram_owner_id(&cfg) {
+                service_ctx = service_ctx.with_instagram(Arc::new(InstagramSettings {
+                    channel_id,
+                    poll_cron: cfg.instagram_poll_cron.clone(),
+                    owner_user_id,
+                    bot_id: "system_default".to_owned(),
+                    seed_token: cfg.instagram_access_token.clone(),
+                    app_secret: cfg.instagram_app_secret.clone(),
+                    crypto,
+                }));
+            } else {
+                tracing::warn!(
+                    "Instagram 連携: オーナーの Discord ユーザー ID が未設定のため開始しません（INSTAGRAM_OWNER_DISCORD_ID もしくは ADMIN_DISCORD_IDS）"
+                );
+            }
         }
         let cron = build_supervised_services(&service_ctx);
         tracing::warn!(
@@ -641,6 +665,16 @@ async fn rotate_secret_if_requested(db: &Db, cfg: &Config) -> Result<(), String>
 
 /// Rust cron 常駐サービスを起動するか（strangler カットオーバーの env ゲート）。
 /// `YUUKA_RUST_CRON` が `1`/`true`/`yes`（大小無視）のときのみ有効。
+/// Instagram 転送のチャンネル露出ガードで在籍確認する対象ユーザー（§3.15）。
+///
+/// `INSTAGRAM_OWNER_DISCORD_ID` を優先し、未設定なら `ADMIN_DISCORD_IDS` の先頭で代替する。
+/// どちらも無ければ `None`＝Instagram 連携は開始しない。
+fn instagram_owner_id(cfg: &yuuka_core::Config) -> Option<String> {
+    cfg.instagram_owner_discord_id
+        .clone()
+        .or_else(|| cfg.admin_discord_ids.first().cloned())
+}
+
 fn rust_cron_enabled() -> bool {
     std::env::var("YUUKA_RUST_CRON")
         .ok()

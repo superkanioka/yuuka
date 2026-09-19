@@ -1,4 +1,4 @@
-# Yuuka v2 アーキテクチャ規範（仕様書 docs/spec/discordbot_spec.md v0.6.2 準拠 / DB schema v18）
+# Yuuka v2 アーキテクチャ規範（仕様書 docs/spec/discordbot_spec.md v0.6.2 準拠 / DB schema v16 / Rust refinery V21）
 
 本書は仕様書（docs/spec/discordbot_spec.md）を既存コードベースへ落とし込むための**実装規範**である。
 実装エージェント・開発者は必ず本書のコントラクトに従うこと。仕様書と本書が矛盾する場合は本書を優先する（本書は仕様書を既存実装と調和させた結果である）。
@@ -215,7 +215,6 @@ v2=初版全面再構築 / v3=ユーザーデータ各表へ bot_id 付与（`mi
 | 機能モジュール化（§14。docs/design/function_modularization.md） | functions/moduleCatalog.ts, functions/browserModule.ts, functions/richContentModule.ts, services/botModules.ts, db/botUserModulesRepo.ts（API/UI は botAttributeRoutes.ts・public/* と統合） |
 | desktopclient（§15。汎用チャット API。docs/design/desktop_client/） | server/chatWebSocket.ts, services/chatChannelService.ts, services/componentInteractionService.ts, services/desktopAuthService.ts, db/desktopTokenRepo.ts, server/routes/deviceAuthRoutes.ts, server/routes/deviceMgmtRoutes.ts, server/routes/desktopClientRoutes.ts |
 | charts | services/chartService.ts, functions/chartFunctions.ts |
-| instagram | db/instagramRepo.ts, services/instagramFeedService.ts |
 | calendar | services/googleCalendarService.ts, services/googleDriveService.ts, services/backupService.ts, db/scheduleRepo.ts, db/googleAccountRepo.ts, functions/scheduleFunctions.ts, server/routes/scheduleRoutes.ts |
 | synapse（§13。シナプス認知アーキ v3 / schema v10） | src/rust_synapse/*（独立 Rust crate）, services/synapseEngine.ts, services/synapseExtractor.ts, services/metrics.ts, db/synapseRepo.ts, db/toolOutcomeRepo.ts |
 | 統合 | gemini.ts, bot.ts, index.ts, server.ts, functions/index.ts, db/botRepo.ts, db/inviteRepo.ts, db/systemSettingsRepo.ts, db/database.ts, db/redis.ts, utils/embeds.ts, server/routes/botRoutes.ts（Bot管理）, server/routes/integratedRoutes.ts（統合管理: Bot起動/停止/再起動・リソース許可・Google複数アカウント）, server/routes/adminRoutes.ts, public/* |

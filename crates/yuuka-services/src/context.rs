@@ -10,6 +10,7 @@ use yuuka_core::CrossUserAccess;
 use yuuka_web::Db;
 
 use crate::backup::{BackupRunner, NullBackupRunner};
+use crate::instagram::InstagramSettings;
 use crate::metrics::MetricsRegistry;
 use crate::notifier::Notifier;
 use crate::turn::PlaybookRunner;
@@ -27,6 +28,9 @@ pub struct ServiceContext {
     pub playbook_runner: Arc<dyn PlaybookRunner>,
     /// 定期バックアップの実行ポート（未配線時は [`NullBackupRunner`]・[`crate::backup::BackupService`] が使う）。
     pub backup: Arc<dyn BackupRunner>,
+    /// Instagram 連携設定（§3.15）。`INSTAGRAM_CHANNEL_ID` 未設定時は `None` で、
+    /// [`crate::build_services`] は Instagram サービス自体を登録しない。
+    pub instagram: Option<Arc<InstagramSettings>>,
     /// 横断（全ユーザー跨ぎ）アクセス証憑。cron の起点はここに限定される。
     pub cross: CrossUserAccess,
 }
@@ -47,6 +51,7 @@ impl ServiceContext {
             metrics,
             playbook_runner,
             backup: Arc::new(NullBackupRunner),
+            instagram: None,
             cross: CrossUserAccess::for_scheduled_task(),
         }
     }
@@ -55,6 +60,14 @@ impl ServiceContext {
     #[must_use]
     pub fn with_backup(mut self, backup: Arc<dyn BackupRunner>) -> Self {
         self.backup = backup;
+        self
+    }
+
+    /// Instagram 連携設定を注入する（main が `Config` + `SystemCrypto` から組み立てる）。
+    /// 未注入（`None`）なら Instagram サービスは登録されない。
+    #[must_use]
+    pub fn with_instagram(mut self, instagram: Arc<InstagramSettings>) -> Self {
+        self.instagram = Some(instagram);
         self
     }
 }

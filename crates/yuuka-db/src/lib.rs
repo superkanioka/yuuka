@@ -166,6 +166,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(channel_col, 1, "V19: message_logs.channel_id 再追加");
+
+        // V21: Instagram 連携（§3.15）。CREATE TABLE IF NOT EXISTS のため再走しても衝突しない。
+        let instagram: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='instagram_account'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(instagram, 1, "V21: instagram_account 作成");
+        // 単一アカウント運用の番人（CHECK(id = 1)）が効いている。
+        conn.execute(
+            "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
+             VALUES (1, 'e', 'i', 't')",
+            [],
+        )
+        .unwrap();
+        let second = conn.execute(
+            "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
+             VALUES (2, 'e', 'i', 't')",
+            [],
+        );
+        assert!(second.is_err(), "V21: id = 1 以外の行は CHECK 制約で拒否される");
     }
 
     #[tokio::test]

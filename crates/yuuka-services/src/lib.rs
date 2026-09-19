@@ -23,6 +23,7 @@ use std::sync::Arc;
 pub mod backup;
 pub mod context;
 pub mod cron_util;
+pub mod instagram;
 pub mod metrics;
 pub mod notifier;
 pub mod schedule;
@@ -43,6 +44,7 @@ mod test_support;
 
 pub use backup::{BackupRunner, NullBackupRunner};
 pub use context::ServiceContext;
+pub use instagram::{InstagramFeedService, InstagramSettings};
 pub use metrics::MetricsRegistry;
 pub use notifier::{Notification, Notifier, NotifyTarget, NullNotifier};
 pub use schedule::{run_cron, CronService, Schedule};
@@ -52,9 +54,12 @@ pub use turn::{NullPlaybookRunner, PlaybookRunner};
 ///
 /// backup は実行ポート（[`backup::BackupRunner`]）を [`ServiceContext`] から得る。未配線時は
 /// [`backup::NullBackupRunner`] へ縮退し、走査はするが実行は失敗（Node の Google 未連携と同じ非致命）。
+///
+/// Instagram 連携（§3.15）は設定が注入されている場合のみ登録する（`INSTAGRAM_CHANNEL_ID`
+/// 未設定なら [`ServiceContext::instagram`] が `None`＝サービス自体を持たない）。
 #[must_use]
-pub fn build_services() -> Vec<Arc<dyn CronService>> {
-    vec![
+pub fn build_services(ctx: &ServiceContext) -> Vec<Arc<dyn CronService>> {
+    let mut services: Vec<Arc<dyn CronService>> = vec![
         Arc::new(reminder::ReminderService),
         Arc::new(todo_recurrence::TodoRecurrenceService),
         Arc::new(payment_recurrence::PaymentRecurrenceService),
@@ -65,5 +70,9 @@ pub fn build_services() -> Vec<Arc<dyn CronService>> {
         Arc::new(briefing::BriefingService),
         Arc::new(report::ReportService),
         Arc::new(backup::BackupService),
-    ]
+    ];
+    if let Some(settings) = ctx.instagram.clone() {
+        services.push(Arc::new(instagram::InstagramFeedService::new(settings)));
+    }
+    services
 }
