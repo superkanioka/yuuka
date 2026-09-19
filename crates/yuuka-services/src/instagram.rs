@@ -690,7 +690,6 @@ mod tests {
 
     const DDL: &str = "CREATE TABLE instagram_account (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        ig_user_id TEXT, username TEXT,
         access_token_encrypted TEXT NOT NULL, access_token_iv TEXT NOT NULL,
         access_token_tag TEXT NOT NULL, token_expires_at TEXT, last_refreshed_at TEXT,
         last_post_id TEXT, last_post_timestamp TEXT, last_checked_at TEXT,

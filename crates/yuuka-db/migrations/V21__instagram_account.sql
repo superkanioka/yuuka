@@ -15,8 +15,6 @@
 -- 場合や取得件数を超える投稿があった場合に位置を見失い、過去投稿の一斉再送や取りこぼしを起こす。
 CREATE TABLE IF NOT EXISTS instagram_account (
   id                     INTEGER PRIMARY KEY CHECK (id = 1), -- 単一アカウント運用の番人
-  ig_user_id             TEXT,
-  username               TEXT,
   access_token_encrypted TEXT NOT NULL,
   access_token_iv        TEXT NOT NULL,
   access_token_tag       TEXT NOT NULL,
