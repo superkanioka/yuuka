@@ -18,7 +18,19 @@ pub enum NotifyTarget {
     Channel(String),
 }
 
-/// 1 通の通知（現行 `NotifyPayload` の text 経路）。埋め込み/ファイルは report/briefing 実装時に拡張する。
+/// 添付ファイル（discord の `FileAttachment` へ写像される provider 中立記述）。
+///
+/// services は discord に依存しない（DAG: `services → core`）ため本 crate 側で型を持ち、
+/// 実配信時に notify_bridge が Discord の型へ変換する。
+#[derive(Debug, Clone)]
+pub struct NotifyFile {
+    /// Discord 上での表示ファイル名（拡張子を含めること）。
+    pub name: String,
+    /// ファイル本体。
+    pub bytes: Vec<u8>,
+}
+
+/// 1 通の通知（現行 `NotifyPayload` の text 経路 + ファイル添付）。埋め込みは未対応。
 #[derive(Debug, Clone)]
 pub struct Notification {
     /// 宛先ユーザー。
@@ -29,6 +41,8 @@ pub struct Notification {
     pub content: String,
     /// 送信先の解決方針。
     pub target: NotifyTarget,
+    /// 添付ファイル（Instagram 転送の写真等）。空なら添付なし。
+    pub files: Vec<NotifyFile>,
 }
 
 impl Notification {
@@ -40,7 +54,15 @@ impl Notification {
             bot_id,
             content: content.into(),
             target: NotifyTarget::Default,
+            files: Vec::new(),
         }
+    }
+
+    /// 添付ファイルを付ける（Instagram 転送の写真等）。
+    #[must_use]
+    pub fn with_files(mut self, files: Vec<NotifyFile>) -> Self {
+        self.files = files;
+        self
     }
 
     /// 送信先を差し替える（reminder のチャンネル指定用）。

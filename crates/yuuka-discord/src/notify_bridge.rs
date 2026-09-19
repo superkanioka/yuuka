@@ -11,6 +11,8 @@
 use async_trait::async_trait;
 use yuuka_services::{Notification, Notifier as ServicesNotifier, NotifyTarget};
 
+use crate::ports::FileAttachment;
+
 use crate::manager::DiscordMessenger;
 use crate::ports::{DeliverTarget, Notifier as DiscordNotifierPort, TurnReply};
 
@@ -29,12 +31,22 @@ fn to_deliver_target(target: NotifyTarget) -> DeliverTarget {
 #[async_trait]
 impl ServicesNotifier for DiscordMessenger {
     async fn send(&self, notification: Notification) -> bool {
-        // 空本文は配信しない（Node `sendToUser` / `Notifier` 契約・呼び出し側は false で次 tick 再試行）。
-        if notification.content.trim().is_empty() {
+        // 空本文かつ添付も無い通知は配信しない
+        // （Node `sendToUser` / `Notifier` 契約・呼び出し側は false で次 tick 再試行）。
+        if notification.content.trim().is_empty() && notification.files.is_empty() {
             return false;
         }
         let target = to_deliver_target(notification.target);
-        let reply = TurnReply::text(notification.content);
+        let mut reply = TurnReply::text(notification.content);
+        // 添付（Instagram 転送の写真等）を discord の型へ写す。送信は send_channel_reply が担う。
+        reply.files = notification
+            .files
+            .into_iter()
+            .map(|f| FileAttachment {
+                name: f.name,
+                bytes: f.bytes,
+            })
+            .collect();
         // discord ポートへ委譲: クライアント解決（bot_id 本人→default フォールバック）・
         // チャンネル露出ガード（第三者チャンネルへの流入防止）・分割送信は委譲先が担う。
         DiscordNotifierPort::send_to_user(

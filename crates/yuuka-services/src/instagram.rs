@@ -30,7 +30,7 @@ use yuuka_crypto::SystemCrypto;
 use yuuka_db::map_sqlite;
 
 use crate::context::ServiceContext;
-use crate::notifier::{Notification, NotifyTarget};
+use crate::notifier::{Notification, NotifyFile, NotifyTarget};
 use crate::schedule::{CronService, Schedule};
 
 const GRAPH_BASE: &str = "https://graph.instagram.com";
@@ -49,6 +49,9 @@ const REFRESH_THRESHOLD_DAYS: i64 = 10;
 
 /// リフレッシュ失敗時の再試行間隔（失効予定が不明なトークンでの試行過多を防ぐ）。
 const REFRESH_RETRY_INTERVAL: chrono::Duration = chrono::Duration::hours(1);
+
+/// 添付画像の上限（Discord の非 Nitro アップロード上限 10MB に余裕を持たせる）。
+const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// キャプションの転送上限（Discord の 1 メッセージ 2000 文字に対し URL 分の余裕を残す）。
 const MAX_CAPTION_CHARS: usize = 1500;
@@ -218,12 +221,25 @@ async fn run(ctx: &ServiceContext, cfg: &InstagramSettings) -> Result<(), DbErro
     }
 
     for post in new_posts.iter().take(batch_len) {
+        // 写真はファイル添付で送る。取得できなければ URL 併記へフォールバックする。
+        let image_url = primary_image_url(post);
+        let attachment = match image_url.as_deref() {
+            Some(url) => fetch_attachment(post, url).await,
+            None => None,
+        };
+        let inline_url = if attachment.is_some() {
+            None
+        } else {
+            image_url.as_deref()
+        };
+
         let notification = Notification::text(
             UserId::new(cfg.owner_user_id.clone()),
             BotId::new(cfg.bot_id.clone()),
-            render_post(post),
+            render_post(post, inline_url),
         )
-        .with_target(NotifyTarget::Channel(cfg.channel_id.clone()));
+        .with_target(NotifyTarget::Channel(cfg.channel_id.clone()))
+        .with_files(attachment.into_iter().collect());
 
         if !ctx.notifier.send(notification).await {
             // 配信できなければカーソルを進めず、次 tick で再試行する。
@@ -308,8 +324,11 @@ fn child_image_url(child: &MediaChild) -> Option<String> {
 ///
 /// 文面は秘書（早瀬ユウカ）の業務報告調。固定文言なので LLM 呼び出しは行わない
 /// （cron 経路での API コスト・遅延・失敗を持ち込まない）。
+///
+/// 写真は原則ファイル添付で送る（`inline_image_url` は `None`）。添付用のダウンロードに
+/// 失敗したときだけ、従来どおり画像 URL を本文へ併記してプレビュー展開に委ねる。
 #[must_use]
-pub fn render_post(post: &Media) -> String {
+pub fn render_post(post: &Media, inline_image_url: Option<&str>) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     lines.push("📸 新規投稿を1件確認しました。".to_owned());
@@ -336,11 +355,56 @@ pub fn render_post(post: &Media) -> String {
         lines.push(String::new());
         lines.push(permalink.to_owned());
     }
-    if let Some(image) = primary_image_url(post) {
-        lines.push(image);
+    if let Some(image) = inline_image_url {
+        lines.push(image.to_owned());
     }
 
     lines.join("\n")
+}
+
+/// 添付用に画像を取得する。
+///
+/// Instagram CDN の URL は署名付きで数日後に失効するため、取得したバイト列を Discord へ
+/// 添付して永続化する（本文に長い署名 URL を載せずに済む副次効果もある）。
+/// 失敗・サイズ超過は `None` を返し、呼び出し側は URL 併記へフォールバックする。
+async fn fetch_attachment(post: &Media, url: &str) -> Option<NotifyFile> {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        tracing::warn!(status = %resp.status(), "[Instagram] 画像の取得に失敗しました");
+        return None;
+    }
+    // Content-Length が分かる場合は読み込む前に弾く。
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_ATTACHMENT_BYTES {
+            tracing::warn!(len, "[Instagram] 画像が上限を超えるため添付しません");
+            return None;
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        tracing::warn!(len = bytes.len(), "[Instagram] 画像が上限を超えるため添付しません");
+        return None;
+    }
+    Some(NotifyFile {
+        name: attachment_name(post, url),
+        bytes: bytes.to_vec(),
+    })
+}
+
+/// 添付ファイル名。URL のパス末尾から拡張子を拾い、無ければ `.jpg`。
+#[must_use]
+pub fn attachment_name(post: &Media, url: &str) -> String {
+    let ext = url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .filter(|e| (2..=4).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map_or("jpg", |e| e);
+    format!("instagram-{}.{ext}", post.id)
 }
 
 /// 文字数（バイトではなく char）で切り詰める。
@@ -854,13 +918,39 @@ mod tests {
 
     #[test]
     fn rendered_post_carries_caption_permalink_and_image() {
-        let body = render_post(&post("P", "2026-09-19T12:00:00+0000"));
+        let body = render_post(&post("P", "2026-09-19T12:00:00+0000"), None);
         assert!(body.starts_with("📸 新規投稿を1件確認しました。"));
         assert!(body.contains("投稿 P"));
         assert!(body.contains("内容は以上です。共有しておきますね。"));
         assert!(body.contains("https://instagram.com/p/P"));
-        // 画像 URL を本文に置くことで Discord がプレビュー展開する。
+        // 写真はファイル添付で送るため、既定では署名付き CDN URL を本文に載せない。
+        assert!(!body.contains("https://cdn.example/P.jpg"));
+    }
+
+    #[test]
+    fn inline_url_is_used_only_as_fallback() {
+        // 添付のダウンロードに失敗したときだけ URL を併記する。
+        let p = post("P", "2026-09-19T12:00:00+0000");
+        let body = render_post(&p, Some("https://cdn.example/P.jpg"));
         assert!(body.contains("https://cdn.example/P.jpg"));
+    }
+
+    #[test]
+    fn attachment_name_uses_extension_from_url() {
+        let p = post("P", "2026-09-19T12:00:00+0000");
+        assert_eq!(
+            attachment_name(&p, "https://cdn.example/a/b.jpg?oh=sig&oe=123"),
+            "instagram-P.jpg"
+        );
+        assert_eq!(
+            attachment_name(&p, "https://cdn.example/a/b.mp4"),
+            "instagram-P.mp4"
+        );
+        // 拡張子が読めない URL は jpg にフォールバックする。
+        assert_eq!(
+            attachment_name(&p, "https://cdn.example/no-extension"),
+            "instagram-P.jpg"
+        );
     }
 
     #[test]
@@ -868,9 +958,10 @@ mod tests {
         let mut p = post("V", "2026-09-19T12:00:00+0000");
         p.media_type = "VIDEO".to_owned();
         p.thumbnail_url = Some("https://cdn.example/V.jpg".to_owned());
-        let body = render_post(&p);
+        let body = render_post(&p, None);
         assert!(body.contains("🎬 動画です。"));
-        assert!(body.contains("https://cdn.example/V.jpg"));
+        // サムネイルは添付で送るため本文には載らない（選択自体は primary_image_url のテストで担保）。
+        assert!(!body.contains("https://cdn.example/V.jpg"));
     }
 
     #[test]
@@ -889,14 +980,14 @@ mod tests {
                 thumbnail_url: None,
             },
         ];
-        assert!(render_post(&p).contains("🖼 写真2枚の投稿です。"));
+        assert!(render_post(&p, None).contains("🖼 写真2枚の投稿です。"));
     }
 
     #[test]
     fn long_caption_is_truncated() {
         let mut p = post("L", "2026-09-19T12:00:00+0000");
         p.caption = Some("あ".repeat(MAX_CAPTION_CHARS + 500));
-        let body = render_post(&p);
+        let body = render_post(&p, None);
         assert!(body.contains('…'));
         // 切り詰め後もパーマリンクは残る（Discord の 2000 文字上限内に収める）。
         assert!(body.contains("https://instagram.com/p/L"));

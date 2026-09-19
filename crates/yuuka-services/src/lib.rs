@@ -46,7 +46,7 @@ pub use backup::{BackupRunner, NullBackupRunner};
 pub use context::ServiceContext;
 pub use instagram::{InstagramFeedService, InstagramSettings};
 pub use metrics::MetricsRegistry;
-pub use notifier::{Notification, Notifier, NotifyTarget, NullNotifier};
+pub use notifier::{Notification, Notifier, NotifyFile, NotifyTarget, NullNotifier};
 pub use schedule::{run_cron, CronService, Schedule};
 pub use turn::{NullPlaybookRunner, PlaybookRunner};
 
