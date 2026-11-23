@@ -138,6 +138,11 @@ deploy() {
   pnpm install --frozen-lockfile --silent
   # dev の Vite も同じ node_modules を使っているので、消さずに lock に合わせる（ci は消してから入れ直す）。
   npm --prefix clients/pwa install --no-audit --no-fund --silent
+  # npm は package.json の字下げ（タブ）に合わせて package-lock.json を書き直す。lock は 2 スペースで
+  # 管理しているので、空白だけの差分なら戻す（残すと次回のデプロイが「未コミットの変更」で止まる）。
+  if git diff --ignore-all-space --quiet -- clients/pwa/package-lock.json; then
+    git checkout -q -- clients/pwa/package-lock.json
+  fi
   cargo build --release --bin yuuka
   # 本番が配信中の dist/public には書かず、別の場所に作ってから入れ替える。
   stage="$ROOT/target/prod-stage-$ts"
