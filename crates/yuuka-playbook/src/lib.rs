@@ -7,8 +7,8 @@
 //! スコープ = コア CRUD（list/save/delete、name キーの upsert）＋定期実行スケジュール
 //! （schedules の CRUD/toggle）と実行履歴（runs）＋ cron 横断走査 [`cron`]（全ユーザーの有効
 //! スケジュール列挙・run 記録・last_run 更新）。cron 式の due 判定と `executePlaybook` 本体は
-//! croner と会話エンジンを持つ `yuuka-services` の `PlaybookScheduleService` が担う（本 crate は
-//! croner 非依存を保つ）。route 層の cron 式の妥当性検証は依然 deferred（後述の routes.rs 参照）。
+//! 会話エンジンを持つ `yuuka-services` の `PlaybookScheduleService` が担う（本 crate は
+//! 会話エンジン非依存を保つ）。route 層の cron 式の妥当性検証は `yuuka_core::cron_util::is_valid`（実行側と同じ parser）。
 
 pub mod cron;
 pub mod dto;
@@ -55,6 +55,7 @@ mod tests {
     use tower::ServiceExt;
     use yuuka_core::{AuthError, BotId, UserId, UserScope};
     use yuuka_types::{Role, SessionUser};
+    use yuuka_web::test_support::{with_bot_query, TEST_BOT_ID};
     use yuuka_web::{AppState, AuthBackend, Db, WebConfig};
 
     use crate::dto::{NewPlaybook, NewSchedule};
@@ -71,12 +72,12 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    // V17__baseline.sql と同一スキーマ（schedules/runs は enabled 0/1・UNIQUE(user_id,
-    // playbook_name)・bot_id 列・FK CASCADE を含む）。
-    const PLAYBOOKS_DDL: &str = "CREATE TABLE playbooks (
+    // playbook の FK 無し単体fixture（enabled 0/1・UNIQUE(user_id,playbook_name)・
+    // bot_id 列は保持し、DEFAULT は置かない）。
+    const PLAYBOOKS_DDL: &str = "DROP TABLE IF EXISTS playbooks; CREATE TABLE playbooks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         name TEXT NOT NULL,
         title TEXT NOT NULL,
         keywords TEXT DEFAULT '[]',
@@ -86,10 +87,10 @@ mod tests {
         updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
         UNIQUE(user_id, bot_id, name)
     );
-    CREATE TABLE playbook_schedules (
+    DROP TABLE IF EXISTS playbook_schedules; CREATE TABLE playbook_schedules (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         playbook_name TEXT NOT NULL,
         cron_expression TEXT NOT NULL,
         description TEXT DEFAULT '',
@@ -100,7 +101,7 @@ mod tests {
         updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
         UNIQUE(user_id, playbook_name)
     );
-    CREATE TABLE playbook_runs (
+    DROP TABLE IF EXISTS playbook_runs; CREATE TABLE playbook_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         schedule_id INTEGER NOT NULL,
         user_id TEXT NOT NULL,
@@ -109,7 +110,7 @@ mod tests {
         output TEXT DEFAULT '',
         started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
         finished_at TEXT,
-        bot_id TEXT NOT NULL DEFAULT 'system_default'
+        bot_id TEXT NOT NULL
     );";
 
     fn seed_db_with_path() -> (Db, std::path::PathBuf) {
@@ -119,7 +120,9 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(PLAYBOOKS_DDL).expect("create playbooks");
         }
         let db = Db::open(&path).expect("open db");
@@ -409,7 +412,7 @@ mod tests {
         }
     }
 
-    fn app() -> axum::Router {
+    async fn app() -> axum::Router {
         let auth = Arc::new(FakeAuth {
             user: SessionUser {
                 discord_id: "u".to_owned(),
@@ -417,13 +420,15 @@ mod tests {
                 role: Role::User,
             },
         });
-        let state = AppState::new(auth, WebConfig::default(), seed_db());
-        super::routes().with_state(state)
+        let db = seed_db();
+        yuuka_web::test_support::seed_bot(&db, TEST_BOT_ID, "u").await;
+        let state = AppState::new(auth, WebConfig::default(), db);
+        with_bot_query(super::routes().with_state(state), TEST_BOT_ID)
     }
 
     #[tokio::test]
     async fn route_save_then_list() {
-        let app = app();
+        let app = app().await;
         let save = app
             .clone()
             .oneshot(
@@ -469,6 +474,7 @@ mod tests {
     #[tokio::test]
     async fn route_requires_auth() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/api/playbooks")
@@ -510,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_schedule_save_list_toggle_delete() {
-        let app = app();
+        let app = app().await;
         // playbook を先に作らないと schedule save は 400（マクロが見つかりません）。
         let pb = post_json(
             &app,
@@ -584,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_schedule_save_missing_fields_400() {
-        let app = app();
+        let app = app().await;
         let resp = post_json(
             &app,
             "/api/playbooks/schedules/save",
@@ -602,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_schedule_save_unknown_playbook_400() {
-        let app = app();
+        let app = app().await;
         let resp = post_json(
             &app,
             "/api/playbooks/schedules/save",
@@ -618,8 +624,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_schedule_save_invalid_cron_400() {
+        // 5 フィールドでも実行時 parser が解釈できない式は保存させない（playbook 不在より先に判定）。
+        let app = app().await;
+        let resp = post_json(
+            &app,
+            "/api/playbooks/schedules/save",
+            r#"{"playbook_name":"ghost","cron_expression":"99 99 * * *"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let j = body_json(resp).await;
+        assert_eq!(j["message"], serde_json::json!("無効なcron式です。"));
+    }
+
+    #[tokio::test]
     async fn route_toggle_missing_id_400() {
-        let app = app();
+        let app = app().await;
         let resp = post_json(
             &app,
             "/api/playbooks/schedules/toggle",
@@ -633,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_delete_missing_id_400() {
-        let app = app();
+        let app = app().await;
         let resp = post_json(&app, "/api/playbooks/schedules/delete", r#"{}"#).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let j = body_json(resp).await;
@@ -642,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_toggle_unknown_id_400() {
-        let app = app();
+        let app = app().await;
         let resp = post_json(
             &app,
             "/api/playbooks/schedules/toggle",
@@ -659,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_runs_empty_ok() {
-        let app = app();
+        let app = app().await;
         let resp = app
             .oneshot(
                 Request::builder()

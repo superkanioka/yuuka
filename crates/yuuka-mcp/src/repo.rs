@@ -1,8 +1,8 @@
 //! MCP サーバー拡張リポジトリ（Node `src/db/mcpRepo.ts` パリティ・自己完結）。
 //!
 //! `user_id = NULL` の行はシステムレベル登録（Admin のみ管理・全ユーザー利用可）。owner（`user_id`）
-//! 所有のまま「使わせる Bot を許可リスト（`bot_mcp_access`）で選ぶ」共有モデル。`bot_id` 列は退役
-//! （NOT NULL DEFAULT `'system_default'` が入るのみ・参照しない）。
+//! 所有のまま「使わせる Bot を許可リスト（`bot_mcp_access`）で選ぶ」共有モデル。
+//! 退役した `mcp_servers.bot_id` 列は V27 で削除済み。
 
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
@@ -146,10 +146,15 @@ pub fn parse_tools_cache_full(server: &McpServerRecord) -> Vec<crate::McpTool> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let input_schema = obj.get("inputSchema").filter(|s| s.is_object()).cloned();
+            let ui = obj
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(crate::ui_meta_from_meta);
             Some(crate::McpTool {
                 name: name.to_owned(),
                 description,
                 input_schema,
+                ui,
             })
         })
         .collect()
@@ -281,8 +286,7 @@ pub async fn list_system_servers(db: &Db) -> Result<Vec<McpServerRecord>, DbErro
 /// 当該 Bot に許可された MCP サーバー一覧（Node `listServersGrantedToBot`）。
 ///
 /// = `bot_mcp_access` で許可されたサーバー（owner 所有）+ システムレベル登録（`user_id IS NULL`・全 Bot 利用可）。
-/// 単一所有 Bot のランタイム解決に使う（共有秘書 `system_default` では
-/// [`list_servers_granted_to_bot_scoped`] を使いクロステナント露出を防ぐ）。
+/// MCP 動的ツールのランタイム解決に使う（`system_default` は案内役のため呼ばれない）。
 ///
 /// # Errors
 /// 読み取り失敗時 [`DbError`]。
@@ -304,44 +308,6 @@ pub async fn list_servers_granted_to_bot(
                 .map_err(map_sqlite)?;
             let rows = stmt
                 .query_map(params![bot_id], McpServerRecord::from_row)
-                .map_err(map_sqlite)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(map_sqlite)?);
-            }
-            Ok(out)
-        })
-        .await
-}
-
-/// 発話者スコープの MCP サーバー一覧（Node `listServersGrantedToBotScoped`・ランタイムのセキュリティゲート）。
-///
-/// 当該 Bot に「発話者（`speaker_user_id`）が付与した」許可分（`owner_id = speaker_user_id`）と、
-/// システムレベル登録（`user_id IS NULL`・全 Bot 利用可）の和。共有秘書（`system_default`）は全ユーザーが
-/// 会話するため、他人が付与した許可（他人の認証情報を抱えた MCP サーバー）が発話者の会話へ注入されない
-/// ように発話者所有分のみへ限定する。
-///
-/// # Errors
-/// 読み取り失敗時 [`DbError`]。
-pub async fn list_servers_granted_to_bot_scoped(
-    db: &Db,
-    bot_id: &str,
-    speaker_user_id: &str,
-) -> Result<Vec<McpServerRecord>, DbError> {
-    let (bot_id, speaker) = (bot_id.to_owned(), speaker_user_id.to_owned());
-    db.read
-        .read(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT s.* FROM mcp_servers s \
-                     JOIN bot_mcp_access a ON a.mcp_server_id = s.id AND a.bot_id = ?1 AND a.owner_id = ?2 \
-                     UNION \
-                     SELECT s.* FROM mcp_servers s WHERE s.user_id IS NULL \
-                     ORDER BY created_at ASC",
-                )
-                .map_err(map_sqlite)?;
-            let rows = stmt
-                .query_map(params![bot_id, speaker], McpServerRecord::from_row)
                 .map_err(map_sqlite)?;
             let mut out = Vec::new();
             for row in rows {
@@ -495,6 +461,111 @@ pub async fn delete_server(
         .await
 }
 
+// ─── OAuth 資格情報（mcp_oauth_credentials・V38） ───────────────────────────────
+
+/// 暗号化済みの OAuth 資格情報（`[暗号文, IV, authTag]`）。中身は rmcp の `StoredCredentials` の JSON。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedOAuthCredentials {
+    /// 暗号文。
+    pub encrypted: String,
+    /// IV。
+    pub iv: String,
+    /// authTag。
+    pub tag: String,
+}
+
+/// OAuth 資格情報を読む。未保存は `None`。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn load_oauth_credentials(
+    db: &Db,
+    server_id: i64,
+) -> Result<Option<EncryptedOAuthCredentials>, DbError> {
+    db.read
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT credentials_encrypted, credentials_iv, credentials_tag \
+                 FROM mcp_oauth_credentials WHERE server_id = ?1",
+                params![server_id],
+                |r| {
+                    Ok(EncryptedOAuthCredentials {
+                        encrypted: r.get(0)?,
+                        iv: r.get(1)?,
+                        tag: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite)
+        })
+        .await
+}
+
+/// OAuth 資格情報を保存する（あれば置き換える）。サーバーが削除済みなら何もしない。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn save_oauth_credentials(
+    db: &Db,
+    server_id: i64,
+    creds: EncryptedOAuthCredentials,
+) -> Result<(), DbError> {
+    db.writer
+        .transaction(move |tx| {
+            // 認可の途中でサーバーが削除された場合に外部キー違反で失敗させず、保存しないだけにする。
+            tx.execute(
+                "INSERT INTO mcp_oauth_credentials \
+                 (server_id, credentials_encrypted, credentials_iv, credentials_tag) \
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM mcp_servers WHERE id = ?1) \
+                 ON CONFLICT(server_id) DO UPDATE SET \
+                   credentials_encrypted = excluded.credentials_encrypted, \
+                   credentials_iv = excluded.credentials_iv, \
+                   credentials_tag = excluded.credentials_tag, \
+                   updated_at = datetime('now', 'localtime')",
+                params![server_id, creds.encrypted, creds.iv, creds.tag],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        })
+        .await
+}
+
+/// OAuth 資格情報を消す（認可の解除・資格情報の失効時）。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn delete_oauth_credentials(db: &Db, server_id: i64) -> Result<(), DbError> {
+    db.writer
+        .transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM mcp_oauth_credentials WHERE server_id = ?1",
+                params![server_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(())
+        })
+        .await
+}
+
+/// OAuth 資格情報を持っているサーバー ID の一覧（一覧画面の表示用）。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn list_oauth_server_ids(db: &Db) -> Result<Vec<i64>, DbError> {
+    db.read
+        .read(move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT server_id FROM mcp_oauth_credentials")
+                .map_err(map_sqlite)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, i64>(0))
+                .map_err(map_sqlite)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -525,8 +596,8 @@ mod tests {
     fn seed_user(path: &PathBuf, discord_id: &str, role: &str) {
         raw(path)
             .execute(
-                "INSERT INTO users (discord_id, username, password_hash, salt, role) \
-                 VALUES (?1, ?1, 'h', 'deadbeef', ?2)",
+                "INSERT INTO users (discord_id, username, salt, role) \
+                 VALUES (?1, ?1, 'deadbeef', ?2)",
                 params![discord_id, role],
             )
             .expect("seed user");
@@ -555,6 +626,56 @@ mod tests {
         let fetched = get_server_by_id(&db, rec.id).await.unwrap().unwrap();
         assert_eq!(fetched.endpoint_url, "https://mcp.example/mcp");
         assert!(get_server_by_id(&db, 9999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_credentials_save_replace_and_cascade() {
+        let (db, path) = fresh_db();
+        seed_user(&path, "alice", "user");
+        let rec = add_server(
+            &db,
+            Some("alice".to_owned()),
+            "a",
+            "https://x/mcp",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let creds = |s: &str| EncryptedOAuthCredentials {
+            encrypted: format!("enc-{s}"),
+            iv: "iv".to_owned(),
+            tag: "tag".to_owned(),
+        };
+        assert_eq!(load_oauth_credentials(&db, rec.id).await.unwrap(), None);
+        save_oauth_credentials(&db, rec.id, creds("1"))
+            .await
+            .unwrap();
+        save_oauth_credentials(&db, rec.id, creds("2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            load_oauth_credentials(&db, rec.id).await.unwrap(),
+            Some(creds("2"))
+        );
+        assert_eq!(list_oauth_server_ids(&db).await.unwrap(), vec![rec.id]);
+
+        // 存在しないサーバーには保存しない（外部キー違反で失敗もしない）。
+        save_oauth_credentials(&db, 9999, creds("x")).await.unwrap();
+        assert_eq!(load_oauth_credentials(&db, 9999).await.unwrap(), None);
+
+        // サーバー削除で資格情報も消える。
+        assert!(delete_server(&db, rec.id, "alice", false).await.unwrap());
+        assert_eq!(load_oauth_credentials(&db, rec.id).await.unwrap(), None);
+
+        let rec2 = add_server(&db, None, "s", "https://y/mcp", None, true)
+            .await
+            .unwrap();
+        save_oauth_credentials(&db, rec2.id, creds("3"))
+            .await
+            .unwrap();
+        delete_oauth_credentials(&db, rec2.id).await.unwrap();
+        assert_eq!(load_oauth_credentials(&db, rec2.id).await.unwrap(), None);
     }
 
     #[tokio::test]

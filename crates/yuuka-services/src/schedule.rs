@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Local;
 
 use crate::context::ServiceContext;
-use crate::cron_util;
+use yuuka_core::cron_util;
 
 /// cron スケジュール。cron 整列（分境界で発火）と固定間隔（metrics の setInterval）を区別する。
 #[derive(Debug, Clone)]
@@ -25,10 +25,8 @@ pub enum Schedule {
     Hourly,
     /// 毎日 `hour:minute`（ローカル）。
     DailyAt { hour: u32, minute: u32 },
-    /// 任意の 5-field cron 式（ユーザー由来ではなくサービス定義の固定式）。
-    Cron(&'static str),
-    /// 設定由来の 5-field cron 式（`INSTAGRAM_POLL_CRON` 等・起動時に検証済みの値を渡す）。
-    CronExpr(String),
+    /// 任意の 5-field cron 式（ユーザー由来ではなくサービス定義の式、または起動時に検証済みの設定値）。
+    Cron(String),
     /// 固定間隔（秒）。cron 非整列（現行 metrics の `setInterval`）。
     FixedSecs(u64),
 }
@@ -40,8 +38,7 @@ impl Schedule {
             Schedule::EveryMinute => Some("* * * * *".to_owned()),
             Schedule::Hourly => Some("0 * * * *".to_owned()),
             Schedule::DailyAt { hour, minute } => Some(format!("{minute} {hour} * * *")),
-            Schedule::Cron(expr) => Some((*expr).to_owned()),
-            Schedule::CronExpr(expr) => Some(expr.clone()),
+            Schedule::Cron(expr) => Some(expr.clone()),
             Schedule::FixedSecs(_) => None,
         }
     }

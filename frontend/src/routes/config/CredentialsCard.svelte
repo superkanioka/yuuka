@@ -1,47 +1,45 @@
 <script lang="ts">
-	// 利用可能なAI認証情報カード（読み取り専用。旧 fetchCredentialsSettings）。
-	// 登録・管理は「Bot統合管理」ページ（他グループ）へ誘導するのみ。
-	import { credentialApi } from "$lib/api/services";
-	import type { CredentialRow, CredentialsResp } from "./configTypes";
+// このBotが使える認証情報カード（読み取り専用。旧 fetchCredentialsSettings）。
+// 登録・Bot別の許可は「連携サービス › 認証情報」（IntegratedOverlay）へ誘導するのみ。
+import { credentialApi } from "$lib/api/services";
+import { withBasePath } from "$lib/router";
+import type { CredentialRow, CredentialsResp } from "./configTypes";
 
-	interface Props {
-		/** botId 変更で付与状況を再取得（/api/credentials は bot-scoped） */
-		botId: string;
+interface Props {
+	/** botId 変更で付与状況を再取得（/api/credentials は bot-scoped） */
+	botId: string;
+}
+let { botId }: Props = $props();
+
+let rows = $state<CredentialRow[]>([]);
+
+$effect(() => {
+	void botId;
+	void load();
+});
+
+async function load() {
+	try {
+		const res = (await credentialApi.list()) as CredentialsResp;
+		rows = res.success ? (res.credentials ?? []) : [];
+	} catch {
+		rows = [];
 	}
-	let { botId }: Props = $props();
+}
 
-	let rows = $state<CredentialRow[]>([]);
-
-	$effect(() => {
-		void botId;
-		void load();
-	});
-
-	async function load() {
-		try {
-			const res = (await credentialApi.list()) as CredentialsResp;
-			rows = res.success ? (res.credentials ?? []) : [];
-		} catch {
-			rows = [];
-		}
-	}
-
-	function serviceOf(c: CredentialRow): string {
-		return c.service_name ?? c.serviceName ?? "";
-	}
-	function updatedOf(c: CredentialRow): string {
-		return c.updated_at ?? c.updatedAt ?? "";
-	}
+function serviceOf(c: CredentialRow): string {
+	return c.service_name ?? c.serviceName ?? "";
+}
+function updatedOf(c: CredentialRow): string {
+	return c.updated_at ?? c.updatedAt ?? "";
+}
 </script>
 
-<details class="config-card card">
-	<summary class="column-header badge-right">
-		<h3><span class="material-symbols-outlined header-icon-symbol">lock</span>利用可能なAI認証情報</h3>
+<section class="config-card card">
+	<div class="column-header badge-right">
+		<h3><span class="material-symbols-outlined header-icon-symbol">lock</span>認証情報</h3>
 		<span class="badge badge-accent">読み取り専用</span>
-	</summary>
-	<p class="description-text">
-		このBotがAIエージェントの自動ブラウジング等で利用できる認証情報の一覧です。パスワードはAES-256-GCMで暗号化保存され、ここには表示されません。認証情報の登録・管理は「Bot統合管理」で行います。
-	</p>
+	</div>
 
 	<div class="table-responsive">
 		<table class="expense-table">
@@ -75,10 +73,10 @@
 	</div>
 
 	<div class="cred-footer">
-		<span class="field-sub">認証情報の登録・管理は「Bot統合管理」で行います。</span>
-		<a href="/integrated" class="btn btn-secondary btn-sm">Bot統合管理へ</a>
+		<span class="field-sub">登録と、使わせるBotの切り替えは「連携サービス › 認証情報」で行います。</span>
+		<a href={withBasePath("/integrated/credentials")} class="btn btn-secondary btn-sm">連携サービスへ</a>
 	</div>
-</details>
+</section>
 
 <style>
 	.table-responsive {

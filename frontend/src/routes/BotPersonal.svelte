@@ -1,148 +1,176 @@
 <script lang="ts">
-	// ─────────────────────────────────────────────────────────────────────────
-	// パーソナル タブ（旧 app.js の context-note / clipboard / contacts + index.html
-	// #tab-personal を移植）。activeBot 変更で3本 fetch（fetchContextNote /
-	// fetchClipboardList / fetchContactsList）。personalApi 使用（scope:'bot'）。
-	// ─────────────────────────────────────────────────────────────────────────
-	import { activeBot } from "$lib/stores/activeBot";
-	import { personalApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { confirmDialog } from "$lib/components/ui";
-	import { Button, Icon, CharCounter, TagChip } from "$lib/components/ui";
-	import type { ContactView, ClipboardEntry } from "$lib/api/types";
-	import ContactModal from "./personal/ContactModal.svelte";
+import { onDestroy } from "svelte";
+import { asyncState } from "$lib/asyncState";
+// ─────────────────────────────────────────────────────────────────────────
+// パーソナル タブ（旧 app.js の context-note / clipboard / contacts + index.html
+// #tab-personal を移植）。activeBot 変更で3本 fetch（fetchContextNote /
+// fetchClipboardList / fetchContactsList）。personalApi 使用（scope:'bot'）。
+// ─────────────────────────────────────────────────────────────────────────
 
-	// ── コンテキストノート ──
-	let noteContent = $state("");
-	let noteMaxLength = $state(10000);
+import { personalApi } from "$lib/api/services";
+import type { ClipboardEntry, ContactView } from "$lib/api/types";
+import {
+	Button,
+	CharCounter,
+	confirmDialog,
+	Icon,
+	TagChip,
+} from "$lib/components/ui";
+import { activeBot } from "$lib/stores/activeBot";
+import { pushToast, toastError } from "$lib/stores/toast";
+import HelpTip from "./delivery/HelpTip.svelte";
+import ContactModal from "./personal/ContactModal.svelte";
 
-	// ── クリップボード ──
-	let clipboard = $state<ClipboardEntry[]>([]);
+// ── コンテキストノート ──
+let noteContent = $state("");
+let noteMaxLength = $state(10000);
 
-	// ── 連絡先 ──
-	let contacts = $state<ContactView[]>([]);
+// ── クリップボード ──
+let clipboard = $state<ClipboardEntry[]>([]);
 
-	// ── 連絡先モーダル ──
-	let contactOpen = $state(false);
-	let editingContact = $state<ContactView | null>(null);
+// ── 連絡先 ──
+let contacts = $state<ContactView[]>([]);
 
-	function reportError(e: unknown) {
-		pushToast(e instanceof ApiError ? e.message : "エラーが発生しました", "error");
-	}
+// ── 連絡先モーダル ──
+let contactOpen = $state(false);
+let editingContact = $state<ContactView | null>(null);
 
-	async function loadContextNote() {
-		try {
-			const res = await personalApi.getContextNote();
+// 誕生日（"YYYY-MM-DD" / "--MM-DD"）を一覧では "YYYY/MM/DD" / "MM/DD" で見せる。
+function formatBirthday(birthday: string | null): string {
+	if (!birthday) return "—";
+	return birthday.replace(/^--/, "").replaceAll("-", "/");
+}
+
+async function loadContextNote() {
+	await loadContextNoteRequest.run(
+		async () => await personalApi.getContextNote(),
+		(res) => {
 			noteMaxLength = res.max_length || 10000;
 			noteContent = res.content ?? "";
-		} catch (e) {
-			reportError(e);
-		}
-	}
+		},
+		(e) => {
+			toastError(e);
+		},
+	);
+}
 
-	async function loadClipboard() {
-		try {
-			const res = await personalApi.clipboard();
+async function loadClipboard() {
+	await loadClipboardRequest.run(
+		async () => await personalApi.clipboard(),
+		(res) => {
 			clipboard = res.entries ?? [];
-		} catch (e) {
-			reportError(e);
+		},
+		(e) => {
+			toastError(e);
 			clipboard = [];
-		}
-	}
+		},
+	);
+}
 
-	async function loadContacts() {
-		try {
-			const res = await personalApi.contacts();
+async function loadContacts() {
+	await loadContactsRequest.run(
+		async () => await personalApi.contacts(),
+		(res) => {
 			contacts = res.contacts ?? [];
-		} catch (e) {
-			reportError(e);
+		},
+		(e) => {
+			toastError(e);
 			contacts = [];
-		}
-	}
+		},
+	);
+}
 
-	// activeBot（bot-scoped）変更で3本再取得。
-	$effect(() => {
-		void $activeBot?.id;
-		void loadContextNote();
-		void loadClipboard();
-		void loadContacts();
+// activeBot（bot-scoped）変更で3本再取得。
+$effect(() => {
+	void $activeBot?.id;
+	void loadContextNote();
+	void loadClipboard();
+	void loadContacts();
+});
+
+async function saveNote(e: SubmitEvent) {
+	e.preventDefault();
+	if (noteContent.length > noteMaxLength) {
+		pushToast(
+			`コンテキストノートは最大 ${noteMaxLength.toLocaleString()} 文字までです。`,
+			"error",
+		);
+		return;
+	}
+	try {
+		const res = await personalApi.saveContextNote(noteContent);
+		pushToast(res.message ?? "保存しました。", "success");
+	} catch (e) {
+		toastError(e);
+	}
+}
+
+async function deleteClip(id: number) {
+	const ok = await confirmDialog({
+		message: "このメモを削除しますか？",
+		danger: true,
+		confirmLabel: "削除",
 	});
+	if (!ok) return;
+	try {
+		await personalApi.deleteClipboard(id);
+		await loadClipboard();
+	} catch (e) {
+		toastError(e);
+	}
+}
 
-	async function saveNote(e: SubmitEvent) {
-		e.preventDefault();
-		if (noteContent.length > noteMaxLength) {
-			pushToast(
-				`コンテキストノートは最大 ${noteMaxLength.toLocaleString()} 文字までです。`,
-				"error",
-			);
-			return;
-		}
-		try {
-			const res = await personalApi.saveContextNote(noteContent);
-			pushToast(res.message ?? "保存しました。", "success");
-		} catch (e) {
-			reportError(e);
-		}
-	}
+function openNewContact() {
+	editingContact = null;
+	contactOpen = true;
+}
+function openEditContact(c: ContactView) {
+	editingContact = c;
+	contactOpen = true;
+}
 
-	async function deleteClip(id: number) {
-		const ok = await confirmDialog({
-			message: "このメモを削除しますか？",
-			danger: true,
-			confirmLabel: "削除",
-		});
-		if (!ok) return;
-		try {
-			await personalApi.deleteClipboard(id);
-			await loadClipboard();
-		} catch (e) {
-			reportError(e);
-		}
+async function saveContact(payload: {
+	id?: number;
+	name: string;
+	birthday: string;
+	relationship: string;
+	contactInfo: string;
+	notes: string;
+	tags: string[];
+}) {
+	try {
+		const res = await personalApi.saveContact(payload);
+		pushToast(res.message ?? "保存しました。", "success");
+		contactOpen = false;
+		await loadContacts();
+	} catch (e) {
+		toastError(e);
 	}
+}
 
-	function openNewContact() {
-		editingContact = null;
-		contactOpen = true;
+async function deleteContactRow(c: ContactView) {
+	const ok = await confirmDialog({
+		message: `連絡先「${c.name}」を削除しますか？`,
+		danger: true,
+		confirmLabel: "削除",
+	});
+	if (!ok) return;
+	try {
+		await personalApi.deleteContact(c.id);
+		await loadContacts();
+	} catch (e) {
+		toastError(e);
 	}
-	function openEditContact(c: ContactView) {
-		editingContact = c;
-		contactOpen = true;
-	}
+}
 
-	async function saveContact(payload: {
-		id?: number;
-		name: string;
-		birthday: string;
-		relationship: string;
-		contactInfo: string;
-		notes: string;
-		tags: string[];
-	}) {
-		try {
-			const res = await personalApi.saveContact(payload);
-			pushToast(res.message ?? "保存しました。", "success");
-			contactOpen = false;
-			await loadContacts();
-		} catch (e) {
-			reportError(e);
-		}
-	}
-
-	async function deleteContactRow(c: ContactView) {
-		const ok = await confirmDialog({
-			message: `連絡先「${c.name}」を削除しますか？`,
-			danger: true,
-			confirmLabel: "削除",
-		});
-		if (!ok) return;
-		try {
-			await personalApi.deleteContact(c.id);
-			await loadContacts();
-		} catch (e) {
-			reportError(e);
-		}
-	}
+const loadContextNoteRequest = asyncState();
+const loadClipboardRequest = asyncState();
+const loadContactsRequest = asyncState();
+onDestroy(() => {
+	loadContextNoteRequest.cancel();
+	loadClipboardRequest.cancel();
+	loadContactsRequest.cancel();
+});
 </script>
 
 <section class="tab-view">
@@ -155,9 +183,6 @@
 			</h3>
 			<CharCounter value={noteContent} max={noteMaxLength} class="hud-tag" />
 		</div>
-		<p class="description-text">
-			AIが会話のたびに参照する長期メモです。好み・習慣・覚えておいてほしいことを自由に記述できます。
-		</p>
 		<form class="context-note-form" onsubmit={saveNote}>
 			<textarea
 				class="context-note-textarea"
@@ -165,7 +190,7 @@
 				bind:value={noteContent}
 			></textarea>
 			<Button type="submit" variant="primary" class="context-note-save"
-				>ノートを保存</Button
+				>保存</Button
 			>
 		</form>
 	</div>
@@ -178,9 +203,6 @@
 				(一時メモ)
 			</h3>
 		</div>
-		<p class="description-text">
-			Discordで「メモして」と頼んだ一時メモです。期限が切れると自動削除されます。
-		</p>
 		<div class="clipboard-list">
 			{#if clipboard.length > 0}
 				{#each clipboard as item (item.id)}
@@ -211,11 +233,13 @@
 	<div class="card personal-card-spacer">
 		<div class="column-header action-right">
 			<h3><Icon name="contacts" class="header-icon-symbol" />連絡先</h3>
+			<HelpTip
+				id="contacts-help"
+				label="誕生日の通知"
+				text="誕生日を登録すると、当日にお祝いリマインドが自動配信されます。"
+			/>
 			<Button variant="primary" small onclick={openNewContact}>＋ 連絡先追加</Button>
 		</div>
-		<p class="description-text">
-			誕生日を登録すると、当日にお祝いリマインドが自動配信されます。
-		</p>
 		<div class="table-responsive contacts-table-wrap">
 			<table class="expense-table">
 				<thead>
@@ -233,7 +257,7 @@
 						{#each contacts as c (c.id)}
 							<tr>
 								<td class="contacts-name">{c.name}</td>
-								<td class="contacts-mono">{c.birthday || "—"}</td>
+								<td class="contacts-mono">{formatBirthday(c.birthday)}</td>
 								<td>{c.relationship || "—"}</td>
 								<td class="contacts-info">{c.contact_info || "—"}</td>
 								<td>
@@ -248,16 +272,19 @@
 								<td class="contacts-actions-td">
 									<button
 										type="button"
-										class="btn btn-secondary btn-sm contacts-mini-btn"
-										onclick={() => openEditContact(c)}>編集</button
+										class="icon-plain"
+										aria-label="編集"
+										onclick={() => openEditContact(c)}
 									>
+										<Icon name="edit" />
+									</button>
 									<button
 										type="button"
-										class="btn btn-secondary btn-sm contacts-mini-btn"
+										class="icon-plain danger"
 										aria-label="削除"
 										onclick={() => deleteContactRow(c)}
 									>
-										<Icon name="delete" size={13} />
+										<Icon name="delete" />
 									</button>
 								</td>
 							</tr>
@@ -288,7 +315,7 @@
 		line-height: 1.6;
 	}
 	:global(.context-note-save) {
-		align-self: flex-start;
+		align-self: flex-end;
 	}
 	.personal-card-spacer {
 		margin-top: 24px;
@@ -342,9 +369,6 @@
 	.contacts-actions-td {
 		text-align: right;
 		white-space: nowrap;
-	}
-	.contacts-mini-btn {
-		font-size: 0.72rem;
 	}
 	.contacts-empty {
 		text-align: center;

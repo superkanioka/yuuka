@@ -4,8 +4,10 @@
 //! `{success, message}`・日本語 verbatim）。想定内の業務エラー（400/401/404/409）は明示的な JSON
 //! レスポンス、想定外の [`DbError`](yuuka_core::DbError) のみ `?` で [`ApiError`] に写像（500）。
 //!
-//! プロフィール/パスワード変更は Node と同じく**セッションを再発行**して継続ログインさせる
-//! （プロフィールは現在のセッションを失効→新規発行、パスワードは全セッション失効→新規発行）。
+//! プロフィール変更は Node と同じく**セッションを再発行**して継続ログインさせる
+//! （現在のセッションを失効→新規発行）。
+
+use yuuka_web::error::{bad_request, conflict, not_found};
 
 use std::sync::Arc;
 
@@ -15,12 +17,12 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::{json, Value};
-use yuuka_auth::{build_session_cookie, revoke_all_desktop_tokens, SessionCookieToken};
+use yuuka_auth::{build_session_cookie, SessionCookieToken};
 use yuuka_core::WebError;
 use yuuka_types::SessionUser;
 use yuuka_web::{ApiError, AppState, AuthenticatedUser};
 
-use crate::dto::{BackupInput, DeleteAccountInput, GeminiInput, PasswordInput, ProfileInput};
+use crate::dto::{BackupInput, GeminiInput, ProfileInput};
 use crate::repo::{self, UserSettingsPatch};
 use crate::SettingsRuntime;
 
@@ -58,82 +60,17 @@ pub(crate) async fn profile(
     ))
 }
 
-// ─── パスワード変更（変更時に全セッション + デスクトップトークンを即時失効） ─────
-
-pub(crate) async fn password(
-    user: AuthenticatedUser,
-    Extension(rt): Extension<Arc<SettingsRuntime>>,
-    State(state): State<AppState>,
-    Json(body): Json<PasswordInput>,
-) -> Result<Response, ApiError> {
-    let current_pw = body.current_password.unwrap_or_default();
-    let new_pw = body.new_password.unwrap_or_default();
-    if current_pw.is_empty() || new_pw.is_empty() {
-        return Ok(bad_request(
-            "現在のパスワードと新しいパスワードを入力してください。",
-        ));
-    }
-    let Some(u) = yuuka_auth::users::get_user_by_discord_id(&state.db, &user.0.discord_id).await?
-    else {
-        return Ok(unauthorized("現在のパスワードが正しくありません。"));
-    };
-    if !yuuka_auth::users::verify_password_constant_time(current_pw, Some(u.password_hash)).await {
-        return Ok(unauthorized("現在のパスワードが正しくありません。"));
-    }
-    if let Err(reason) = yuuka_auth::password_policy::validate_password(&new_pw) {
-        return Ok(bad_request(reason));
-    }
-
-    repo::update_password(&state.db, &user.0.discord_id, &new_pw).await?;
-    // 全セッション失効 + デスクトップトークン全失効（各端末は次回 401 で再ログイン）。
-    rt.sessions.destroy_all_for_user(&user.0.discord_id).await;
-    revoke_all_desktop_tokens(&state.db, &user.0.discord_id).await?;
-    yuuka_auth::audit::add_audit_log(
-        &state.db,
-        &user.0.discord_id,
-        "auth.password_change",
-        None,
-        None,
-    )
-    .await;
-
-    // 継続ログイン用に新しいセッションを発行する（全失効の後）。
-    let su = SessionUser {
-        discord_id: user.0.discord_id.clone(),
-        username: u.username,
-        role: user.0.role,
-    };
-    let cookie = reissue_cookie(&rt, &state, &su).await?;
-    Ok(json_with_cookie(
-        json!({
-            "success": true,
-            "message": "パスワードを変更しました。他の端末のセッションは無効化されました。",
-        }),
-        cookie,
-    ))
-}
-
 // ─── アカウント削除（本人による退会・最後の管理者は不可） ──────────────────────
 
 pub(crate) async fn delete_account(
     user: AuthenticatedUser,
     Extension(rt): Extension<Arc<SettingsRuntime>>,
     State(state): State<AppState>,
-    Json(body): Json<DeleteAccountInput>,
 ) -> Result<Response, ApiError> {
-    let password = body.password.unwrap_or_default();
-    if password.is_empty() {
-        return Ok(bad_request(
-            "削除を確定するには現在のパスワードを入力してください。",
-        ));
-    }
     let Some(u) = yuuka_auth::users::get_user_by_discord_id(&state.db, &user.0.discord_id).await?
     else {
-        return Ok(unauthorized("パスワードが正しくありません。"));
+        return Ok(not_found("アカウントが見つかりません。"));
     };
-    if !yuuka_auth::users::verify_password_constant_time(password, Some(u.password_hash)).await {
-        return Ok(unauthorized("パスワードが正しくありません。"));
-    }
     // 唯一の管理者ガード（管理者 0 人化を防ぐ・409）。
     if u.role.eq_ignore_ascii_case("admin") && repo::count_admins(&state.db).await? <= 1 {
         return Ok(conflict(
@@ -161,7 +98,22 @@ pub(crate) async fn delete_account(
     ))
 }
 
-// ─── ユーザー設定更新（リッチ返信・リマインド既定・通知先） ────────────────────
+// ─── ユーザー設定の取得・更新（リッチ返信・リマインド既定・通知先・タイムゾーン） ─
+
+/// 現在値の取得（Bot スコープの `/api/status` を通さずに読む・「あなたの設定」用）。
+pub(crate) async fn user_settings_get(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let p = repo::user_preferences(&state.db, &user.0.discord_id).await?;
+    Ok(json_ok(json!({
+        "success": true,
+        "richReplyEnabled": p.rich_reply_enabled,
+        "remindDefaultMinutes": p.remind_default_minutes,
+        "notifyTarget": { "type": p.notify_target_type, "id": p.notify_target_id },
+        "timezone": p.timezone,
+    })))
+}
 
 pub(crate) async fn user_settings(
     user: AuthenticatedUser,
@@ -205,6 +157,38 @@ pub(crate) async fn user_settings(
 
 // ─── Gemini 設定更新（ユーザー単位） ──────────────────────────────────────────
 
+pub(crate) async fn gemini_get(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    use rusqlite::OptionalExtension;
+    let uid = user.0.discord_id;
+    // API キーは本体を返さず、登録済みか（hasApiKey）だけを返す。
+    let (model, has_api_key) = state
+        .db
+        .read
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT gemini_model, \
+                 COALESCE(gemini_api_key_encrypted, '') != '' \
+                 FROM users WHERE discord_id = ?1",
+                rusqlite::params![uid],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .optional()
+            .map_err(yuuka_db::map_sqlite)
+        })
+        .await?
+        .unwrap_or((None, false));
+    let model = model
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| yuuka_gemini::LlmSettings::default().model);
+    Ok(json_ok(
+        json!({ "success": true, "provider": "gemini", "model": model, "hasApiKey": has_api_key,
+        "models": yuuka_gemini::ALLOWED_MODELS, "defaults": yuuka_gemini::LlmSettings::default() }),
+    ))
+}
+
 pub(crate) async fn gemini(
     user: AuthenticatedUser,
     Extension(rt): Extension<Arc<SettingsRuntime>>,
@@ -217,6 +201,12 @@ pub(crate) async fn gemini(
         return Ok(bad_request("モデル名は必須項目です。"));
     }
     let model = model_raw.trim();
+    if let Err(e) = yuuka_gemini::LlmSettings::validate(
+        body.provider.as_deref().unwrap_or("gemini").trim(),
+        model,
+    ) {
+        return Ok(bad_request(&e.to_string()));
+    }
 
     let api_key = body.api_key.unwrap_or_default();
     let (encrypted, iv, tag): (Option<String>, Option<String>, Option<String>);
@@ -224,7 +214,7 @@ pub(crate) async fn gemini(
         let key = api_key.trim();
         if !is_likely_gemini_key(key) {
             return Ok(bad_request(
-                "Gemini APIキーの形式が正しくありません。「AIza」で始まるキーを入力してください（Google AI Studio で取得）。",
+                "Gemini APIキーの形式が正しくありません。Google AI Studio で取得したキー（「AIzaSy」または「AQ.」で始まるもの）をそのまま入力してください。",
             ));
         }
         let Some(crypto) = rt.crypto.as_ref() else {
@@ -244,7 +234,24 @@ pub(crate) async fn gemini(
     Ok(ok_message("Gemini 設定を更新しました。"))
 }
 
-// ─── バックアップ設定更新 ─────────────────────────────────────────────────────
+// ─── バックアップ設定の取得・更新 ─────────────────────────────────────────────
+
+/// 現在値の取得。フォルダ ID は本人の Drive フォルダの識別子で秘密情報ではないため、編集できるよう
+/// マスクせずに返す（`/api/status` はマスク済みの値を返す）。
+pub(crate) async fn backup_get(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let p = repo::user_preferences(&state.db, &user.0.discord_id).await?;
+    Ok(json_ok(json!({
+        "success": true,
+        "enabled": p.backup_enabled,
+        "folderId": p.backup_folder_id,
+        "intervalHours": p.backup_interval_hours,
+        "generations": p.backup_generations,
+        "lastRunAt": p.backup_last_run_at,
+    })))
+}
 
 pub(crate) async fn backup(
     user: AuthenticatedUser,
@@ -310,30 +317,6 @@ fn ok_message(message: &str) -> Response {
     json_ok(json!({ "success": true, "message": message }))
 }
 
-fn status_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-fn bad_request(message: &str) -> Response {
-    status_json(StatusCode::BAD_REQUEST, message)
-}
-
-fn unauthorized(message: &str) -> Response {
-    status_json(StatusCode::UNAUTHORIZED, message)
-}
-
-fn conflict(message: &str) -> Response {
-    status_json(StatusCode::CONFLICT, message)
-}
-
-fn not_found(message: &str) -> Response {
-    status_json(StatusCode::NOT_FOUND, message)
-}
-
 /// JS `Number(x) || fallback` 相当（0/NaN/非数は fallback）。`intervalHours`/`generations` 用。
 fn js_number_or(value: Option<&Value>, fallback: f64) -> f64 {
     let n = value.map_or(f64::NAN, js_number);
@@ -362,16 +345,16 @@ fn js_number(value: &Value) -> f64 {
     }
 }
 
-/// Gemini API キーらしさ（Node `isLikelyGeminiKey` = `^AIza[0-9A-Za-z_-]{30,}$`）。
+/// Gemini API キーの形式検証（`^(AIzaSy[A-Za-z0-9_-]{33}|AQ\.[A-Za-z0-9_-]{35,})$`）。
+/// 旧形式（`AIzaSy` + 33 文字）と新形式（`AQ.` + 35 文字以上）の両方を受け付ける。
 fn is_likely_gemini_key(value: &str) -> bool {
-    match value.strip_prefix("AIza") {
-        Some(rest) => {
-            rest.len() >= 30
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        }
-        None => false,
+    let is_key_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    if let Some(rest) = value.strip_prefix("AIzaSy") {
+        rest.len() == 33 && rest.bytes().all(is_key_char)
+    } else if let Some(rest) = value.strip_prefix("AQ.") {
+        rest.len() >= 35 && rest.bytes().all(is_key_char)
+    } else {
+        false
     }
 }
 
@@ -426,13 +409,23 @@ mod tests {
 
     #[test]
     fn gemini_key_shape() {
-        // AIza + 30文字以上の [A-Za-z0-9_-]。
-        assert!(is_likely_gemini_key("AIza0123456789012345678901234567890"));
-        assert!(is_likely_gemini_key(&format!("AIza{}", "a".repeat(35))));
-        assert!(!is_likely_gemini_key("AIzaShort"));
-        assert!(!is_likely_gemini_key(&format!("BIza{}", "a".repeat(35))));
-        // 記号（`.`）は不可。
-        assert!(!is_likely_gemini_key(&format!("AIza{}", "a.".repeat(20))));
+        let old = format!("AIzaSy{}", "A0b_-".repeat(6) + "c1d");
+        let new = format!("AQ.{}", "Ab8_-".repeat(7));
+        // 旧形式（AIzaSy + 33 文字ちょうど）。
+        assert!(is_likely_gemini_key(&old));
+        assert!(!is_likely_gemini_key(&format!("{old}x")));
+        assert!(!is_likely_gemini_key(&old[..old.len() - 1]));
+        // 新形式（AQ. + 35 文字以上）。
+        assert!(is_likely_gemini_key(&new));
+        assert!(is_likely_gemini_key(&format!("{new}{}", "z".repeat(100))));
+        assert!(!is_likely_gemini_key(&new[..new.len() - 1]));
+        // 接頭辞違い・本体に `.` や空白・非 ASCII を含むものは不可（コピペ事故の検出）。
+        assert!(!is_likely_gemini_key(&format!("AIzaSz{}", &old[6..])));
+        assert!(!is_likely_gemini_key(&format!("BQ.{}", &new[3..])));
+        assert!(!is_likely_gemini_key(&format!("AQ.{}.", &new[3..])));
+        assert!(!is_likely_gemini_key(&format!("AQ.{} x", &new[3..])));
+        assert!(!is_likely_gemini_key(&format!("AQ.{}あ", &new[3..])));
+        assert!(!is_likely_gemini_key(""));
     }
 
     #[test]

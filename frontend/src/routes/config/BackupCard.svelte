@@ -1,106 +1,109 @@
 <script lang="ts">
-	// Google Drive バックアップ設定カード（旧 backup-config-form + btn-trigger-backup）。
-	import { settingsApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { Button } from "$lib/components/ui";
-	import type { StatusConfig } from "./configTypes";
+// Google Drive バックアップ設定カード（旧 backup-config-form + btn-trigger-backup）。
+// 「あなたの設定」は Bot を選ばずに開くため、現在値は GET /api/settings/backup から読む
+// （/api/status は bot-scoped で、フォルダ ID もマスクされている）。
 
-	interface Props {
-		config: StatusConfig | null;
-		/** 保存後に /api/status を再取得して最終実行時刻等を反映 */
-		onsaved?: () => void;
+import { onMount } from "svelte";
+import { settingsApi } from "$lib/api/services";
+import { Button } from "$lib/components/ui";
+import { pushToast, toastError } from "$lib/stores/toast";
+import HelpTip from "../delivery/HelpTip.svelte";
+
+let loaded = $state(false);
+let enabled = $state(false);
+let folderId = $state("");
+let intervalHours = $state(24);
+let generations = $state(7);
+let lastRun = $state<string | null>(null);
+let triggering = $state(false);
+
+async function load() {
+	try {
+		const c = await settingsApi.getBackup();
+		enabled = !!c.enabled;
+		folderId = c.folderId ?? "";
+		intervalHours = c.intervalHours ?? 24;
+		generations = c.generations ?? 7;
+		lastRun = c.lastRunAt ?? null;
+		loaded = true;
+	} catch (err) {
+		toastError(err, "バックアップ設定を読み込めませんでした。");
 	}
-	let { config, onsaved }: Props = $props();
+}
 
-	let enabled = $state(false);
-	let folderId = $state("");
-	let intervalHours = $state(24);
-	let generations = $state(7);
-	let lastRun = $state<string | null>(null);
-	let triggering = $state(false);
+onMount(() => {
+	void load();
+});
 
-	$effect(() => {
-		const c = config;
-		if (!c) return;
-		enabled = !!c.backupEnabled;
-		folderId = c.backupFolderId === "未設定" ? "" : (c.backupFolderId ?? "");
-		intervalHours = c.backupIntervalHours ?? 24;
-		generations = c.backupGenerations ?? 7;
-		lastRun = c.backupLastRunAt ?? null;
-	});
-
-	async function submit(e: SubmitEvent) {
-		e.preventDefault();
-		const hours = Math.min(Math.max(Number(intervalHours) || 24, 1), 720);
-		const gens = Math.max(Number(generations) || 7, 1);
-		try {
-			const res = await settingsApi.updateBackup({
-				enabled,
-				folderId: folderId.trim(),
-				intervalHours: hours,
-				generations: gens,
-			});
-			if (res.success) {
-				pushToast("バックアップ設定を保存しました。", "success");
-				onsaved?.();
-			} else {
-				pushToast(`設定の保存に失敗しました: ${res.message ?? ""}`, "error");
-			}
-		} catch (err) {
-			pushToast(
-				err instanceof ApiError ? err.message : "通信エラーが発生しました。",
-				"error",
-			);
+async function submit(e: SubmitEvent) {
+	e.preventDefault();
+	const hours = Math.min(Math.max(Number(intervalHours) || 24, 1), 720);
+	const gens = Math.max(Number(generations) || 7, 1);
+	try {
+		const res = await settingsApi.updateBackup({
+			enabled,
+			folderId: folderId.trim(),
+			intervalHours: hours,
+			generations: gens,
+		});
+		if (res.success) {
+			pushToast("バックアップ設定を保存しました。", "success");
+			await load();
+		} else {
+			pushToast(`設定の保存に失敗しました: ${res.message ?? ""}`, "error");
 		}
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
 	}
+}
 
-	async function trigger() {
-		if (!enabled) {
-			pushToast(
-				"手動バックアップを実行するには、先にバックアップを有効にして設定を保存してください。",
-				"error",
-			);
-			return;
-		}
-		triggering = true;
-		try {
-			const res = (await settingsApi.triggerBackup()) as {
-				success: boolean;
-				message?: string;
-				url?: string;
-			};
-			if (res.success) {
-				pushToast(`バックアップが完了しました！${res.url ? ` URL: ${res.url}` : ""}`, "success");
-			} else {
-				pushToast(`バックアップ失敗: ${res.message ?? ""}`, "error");
-			}
-		} catch (err) {
-			pushToast(
-				err instanceof ApiError ? err.message : "バックアップ処理中にエラーが発生しました。",
-				"error",
-			);
-		} finally {
-			triggering = false;
-		}
+async function trigger() {
+	if (!enabled) {
+		pushToast(
+			"手動バックアップを実行するには、先にバックアップを有効にして設定を保存してください。",
+			"error",
+		);
+		return;
 	}
+	triggering = true;
+	try {
+		const res = (await settingsApi.triggerBackup()) as {
+			success: boolean;
+			message?: string;
+			url?: string;
+		};
+		if (res.success) {
+			pushToast(
+				`バックアップが完了しました！${res.url ? ` URL: ${res.url}` : ""}`,
+				"success",
+			);
+			await load();
+		} else {
+			pushToast(`バックアップ失敗: ${res.message ?? ""}`, "error");
+		}
+	} catch (err) {
+		toastError(err, "バックアップ処理中にエラーが発生しました。");
+	} finally {
+		triggering = false;
+	}
+}
 </script>
 
-<details class="config-card card">
-	<summary class="column-header badge-right">
+<section class="config-card card">
+	<div class="column-header badge-right">
 		<h3><span class="material-symbols-outlined header-icon-symbol">cloud_sync</span>Google Drive バックアップ</h3>
 		<span class="badge badge-accent">Beta</span>
-	</summary>
-	<p class="description-text">
-		データベースや設定ファイル、プレイブックのデータをGoogle Driveへ安全にバックアップします。
-	</p>
+	</div>
 	<form onsubmit={submit} class="backup-form">
 		<div class="form-group checkbox-inline">
 			<input type="checkbox" id="backup-enable" bind:checked={enabled} />
 			<label for="backup-enable">自動バックアップを有効にする</label>
 		</div>
 		<div class="form-group">
-			<label for="backup-folder-id">バックアップ先フォルダID または フォルダURL (空の場合はマイドライブ直下に保存)</label>
+			<div class="label-row">
+				<label for="backup-folder-id">バックアップ先フォルダID または フォルダURL</label>
+				<HelpTip id="backup-folder-help" label="空の場合" text="空の場合はマイドライブ直下に保存" />
+			</div>
 			<input
 				type="text"
 				id="backup-folder-id"
@@ -120,13 +123,13 @@
 		</div>
 		<div class="field-sub last-run">最終実行: {lastRun || "—"}</div>
 		<div class="backup-actions">
-			<Button type="submit" variant="primary" block>設定を保存</Button>
+			<Button type="submit" variant="primary" block disabled={!loaded}>設定を保存</Button>
 			<Button variant="secondary" block onclick={trigger} disabled={triggering}>
 				{triggering ? "バックアップ実行中..." : "今すぐバックアップ実行"}
 			</Button>
 		</div>
 	</form>
-</details>
+</section>
 
 <style>
 	.backup-form {
@@ -134,15 +137,6 @@
 		flex-direction: column;
 		gap: 12px;
 		margin-top: 16px;
-	}
-	.checkbox-inline {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-	.checkbox-inline input {
-		width: 20px;
-		height: 20px;
 	}
 	.last-run {
 		margin-top: 4px;

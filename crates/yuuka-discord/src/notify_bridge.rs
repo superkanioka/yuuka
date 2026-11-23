@@ -11,42 +11,68 @@
 use async_trait::async_trait;
 use yuuka_services::{Notification, Notifier as ServicesNotifier, NotifyTarget};
 
-use crate::ports::FileAttachment;
-
 use crate::manager::DiscordMessenger;
-use crate::ports::{DeliverTarget, Notifier as DiscordNotifierPort, TurnReply};
+use crate::ports::{
+    DeliverTarget, EmbedField, FileAttachment, Notifier as DiscordNotifierPort, RichEmbed,
+    TurnReply,
+};
 
 /// services の [`NotifyTarget`] を discord の [`DeliverTarget`] へ写す。
 ///
-/// `Default`（ユーザー既定送信先）は DM 配信に落とす。チャンネル ID 指定は透過。
-/// 注: ユーザーの `notify_target_type`/`notify_target_id`（DB）に基づく既定の解決は services 側の
-/// 責務（`Notification` 生成時に `Channel(..)` を積む）。本ブリッジは Target の型写像のみを担う。
+/// `Dm` は DM、チャンネル ID 指定は透過。
+/// 注: ユーザーの `notify_target_type`/`notify_target_id`（DB）に基づく `Default` の解決は services 側の
+/// 責務（`ServiceContext` の notifier が `Dm` / `Channel(..)` へ解決してから渡す）。本ブリッジは Target の
+/// 型写像のみを担い、未解決の `Default` が届いた場合は DM に落とす。
 fn to_deliver_target(target: NotifyTarget) -> DeliverTarget {
     match target {
-        NotifyTarget::Default => DeliverTarget::Dm,
+        NotifyTarget::Default | NotifyTarget::Dm => DeliverTarget::Dm,
         NotifyTarget::Channel(id) => DeliverTarget::Channel(id),
+    }
+}
+
+fn to_rich_embed(embed: yuuka_core::EmbedPart) -> RichEmbed {
+    RichEmbed {
+        title: embed.title,
+        description: embed.description,
+        color: Some(embed.color),
+        fields: embed
+            .fields
+            .into_iter()
+            .map(|field| EmbedField {
+                name: field.name,
+                value: field.value,
+                inline: field.inline,
+            })
+            .collect(),
+        footer: embed.footer,
     }
 }
 
 #[async_trait]
 impl ServicesNotifier for DiscordMessenger {
     async fn send(&self, notification: Notification) -> bool {
-        // 空本文かつ添付も無い通知は配信しない
-        // （Node `sendToUser` / `Notifier` 契約・呼び出し側は false で次 tick 再試行）。
-        if notification.content.trim().is_empty() && notification.files.is_empty() {
+        // 本文も Embed も添付も無い通知は配信しない（Node `sendToUser` / `Notifier` 契約）。
+        if notification.content.trim().is_empty()
+            && notification.embeds.is_empty()
+            && notification.files.is_empty()
+        {
             return false;
         }
         let target = to_deliver_target(notification.target);
-        let mut reply = TurnReply::text(notification.content);
-        // 添付（Instagram 転送の写真等）を discord の型へ写す。送信は send_channel_reply が担う。
-        reply.files = notification
-            .files
-            .into_iter()
-            .map(|f| FileAttachment {
-                name: f.name,
-                bytes: f.bytes,
-            })
-            .collect();
+        let reply = TurnReply {
+            text: notification.content,
+            embeds: notification.embeds.into_iter().map(to_rich_embed).collect(),
+            // 添付（Instagram 転送の写真等）を discord の型へ写す。送信は send_channel_reply が担う。
+            files: notification
+                .files
+                .into_iter()
+                .map(|f| FileAttachment {
+                    name: f.name,
+                    bytes: f.bytes,
+                })
+                .collect(),
+            ..TurnReply::default()
+        };
         // discord ポートへ委譲: クライアント解決（bot_id 本人→default フォールバック）・
         // チャンネル露出ガード（第三者チャンネルへの流入防止）・分割送信は委譲先が担う。
         DiscordNotifierPort::send_to_user(
@@ -73,10 +99,41 @@ mod tests {
     }
 
     #[test]
+    fn dm_maps_to_dm() {
+        assert!(matches!(
+            to_deliver_target(NotifyTarget::Dm),
+            DeliverTarget::Dm
+        ));
+    }
+
+    #[test]
     fn channel_id_passes_through() {
         assert!(matches!(
             to_deliver_target(NotifyTarget::Channel("123456".to_owned())),
             DeliverTarget::Channel(id) if id == "123456"
         ));
+    }
+
+    #[test]
+    fn service_embed_maps_to_discord_embed() {
+        let embed = to_rich_embed(yuuka_core::EmbedPart {
+            title: Some("朝報".to_owned()),
+            description: Some("本文".to_owned()),
+            color: 0x00_B0_F4,
+            fields: vec![yuuka_core::EmbedFieldPart {
+                name: "天気".to_owned(),
+                value: "晴れ".to_owned(),
+                inline: false,
+            }],
+            footer: Some("提供元".to_owned()),
+        });
+
+        assert_eq!(embed.title.as_deref(), Some("朝報"));
+        assert_eq!(embed.description.as_deref(), Some("本文"));
+        assert_eq!(embed.color, Some(0x00_B0_F4));
+        assert_eq!(embed.fields.len(), 1);
+        assert_eq!(embed.fields[0].name, "天気");
+        assert!(!embed.fields[0].inline);
+        assert_eq!(embed.footer.as_deref(), Some("提供元"));
     }
 }

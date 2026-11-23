@@ -13,16 +13,19 @@
 //! # 実装済み
 //! - metrics / clipboard / reminder / todo-recurrence / payment-recurrence / birthday /
 //!   **playbook-schedule**（マクロ定期実行・[`turn::PlaybookRunner`] ポート経由で会話エンジンを起動）/
-//!   **briefing**（朝報の天気/RSS 定時配信・`yuuka-briefing` の生成プリミティブを再利用）/
-//!   **report**（日報/週報の活動データ集約 + 定時配信・LLM 要約は未配線＝Node 自前の生データ
-//!   フォールバックを実装）/ **backup**（ユーザー別 Google Drive バックアップの定期実行・実 Drive
-//!   アップロードは [`backup::BackupRunner`] ポート経由＝main で `GoogleBackupClient` へ橋渡し）
+//!   **periodic-report**（定期報告＝天気・ニュース・タスク等を組み合わせた報告の定時配信・
+//!   生成は `yuuka-briefing` の `build_report_embed` を再利用）/ **backup**（ユーザー別 Google Drive
+//!   バックアップの定期実行・実 Drive アップロードは [`backup::BackupRunner`] ポート経由＝main で
+//!   `GoogleBackupClient` へ橋渡し）
+//! - 定期報告の**テスト配信**（[`NotifierDeliveryRunner`]・`yuuka_briefing::DeliveryRunner` の実装。
+//!   定時配信と同じ `deliver` を本人・選択中 Bot の定期報告で 1 回呼ぶ）
 
 use std::sync::Arc;
 
+pub mod auto_tags;
 pub mod backup;
+pub mod calendar_sync;
 pub mod context;
-pub mod cron_util;
 pub mod instagram;
 pub mod metrics;
 pub mod notifier;
@@ -30,20 +33,22 @@ pub mod schedule;
 pub mod turn;
 
 mod birthday;
-mod briefing;
 mod clipboard;
+mod delivery;
 mod payment_recurrence;
+mod periodic_report;
 mod planned_payment;
 mod playbook_schedule;
 mod reminder;
-mod report;
 mod todo_recurrence;
 
 #[cfg(test)]
 mod test_support;
 
 pub use backup::{BackupRunner, NullBackupRunner};
+pub use calendar_sync::{CalendarSyncRunner, NullCalendarSyncRunner};
 pub use context::ServiceContext;
+pub use delivery::NotifierDeliveryRunner;
 pub use instagram::{InstagramFeedService, InstagramSettings};
 pub use metrics::MetricsRegistry;
 pub use notifier::{Notification, Notifier, NotifyFile, NotifyTarget, NullNotifier};
@@ -55,22 +60,30 @@ pub use turn::{NullPlaybookRunner, PlaybookRunner};
 /// backup は実行ポート（[`backup::BackupRunner`]）を [`ServiceContext`] から得る。未配線時は
 /// [`backup::NullBackupRunner`] へ縮退し、走査はするが実行は失敗（Node の Google 未連携と同じ非致命）。
 ///
-/// Instagram 連携（§3.15）は設定が注入されている場合のみ登録する（`INSTAGRAM_CHANNEL_ID`
-/// 未設定なら [`ServiceContext::instagram`] が `None`＝サービス自体を持たない）。
+/// `reminder_cron` はリマインドエンジンの実行周期（config `REMINDER_CRON`・起動時に検証済みの値）。
 #[must_use]
-pub fn build_services(ctx: &ServiceContext) -> Vec<Arc<dyn CronService>> {
-    let mut services: Vec<Arc<dyn CronService>> = vec![
-        Arc::new(reminder::ReminderService),
+pub fn build_services(reminder_cron: &str) -> Vec<Arc<dyn CronService>> {
+    vec![
+        Arc::new(reminder::ReminderService::new(reminder_cron)),
         Arc::new(todo_recurrence::TodoRecurrenceService),
         Arc::new(payment_recurrence::PaymentRecurrenceService),
         Arc::new(birthday::BirthdayReminderService),
         Arc::new(clipboard::ClipboardCleanupService),
         Arc::new(metrics::MetricsLogService),
         Arc::new(playbook_schedule::PlaybookScheduleService),
-        Arc::new(briefing::BriefingService),
-        Arc::new(report::ReportService),
+        Arc::new(periodic_report::PeriodicReportService),
         Arc::new(backup::BackupService),
-    ];
+        Arc::new(calendar_sync::CalendarSyncService),
+    ]
+}
+
+/// 設定があるときだけ登録する fork 独自のサービス（[`build_services`] とは分けて upstream との衝突を避ける）。
+///
+/// Instagram 連携（§3.16）は `INSTAGRAM_CHANNEL_ID` 未設定なら [`ServiceContext::instagram`] が
+/// `None` で、サービス自体を持たない。
+#[must_use]
+pub fn build_optional_services(ctx: &ServiceContext) -> Vec<Arc<dyn CronService>> {
+    let mut services: Vec<Arc<dyn CronService>> = Vec::new();
     if let Some(settings) = ctx.instagram.clone() {
         services.push(Arc::new(instagram::InstagramFeedService::new(settings)));
     }

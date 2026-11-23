@@ -1,7 +1,8 @@
 # シナプス駆動 認知アーキテクチャ 設計方針書
 
 > **文書種別:** 設計方針書（提案 / RFC）。**Phase 0/1（R0/R1）実装済み** — schema v10 のシナプス記憶層・Rust シナプスエンジン・1st Hop 連想・経験統計の素地が実装され、実装規範 [`architecture/architecture_v2.md`](../architecture/architecture_v2.md) §13 へ昇格済み（R0/R1 コンポーネントは**常時有効**。エンジンバイナリ不在・未起動・タイムアウト時のみ現行挙動〔直近15件の生履歴注入〕へ自動デグレード）。Phase 2（2nd Hop 勝率提示）・Phase 3（ローカル SLM ハイブリッド）・Phase 4（投機/キャッシュ）は未実装。本書は設計思想の原典として維持する。
-> **位置づけ:** 本書は設計思想の原典（why/what）。実装済み部分（R0/R1）の現行規範は [`architecture/architecture_v2.md`](../architecture/architecture_v2.md) §13（現 schema v16）が正であり、矛盾時は architecture_v2 が優先。未実装の Phase 2 以降は本書を指針とし、着手時に architecture_v2 へ昇格する。実装着手時に本書の内容を architecture_v2 へ昇格・統合する。矛盾した場合、現時点では architecture_v2 が優先。
+> **位置づけ:** 本書は設計思想の原典（why/what）。実装済み部分（R0/R1）の現行の実装は `crates/yuuka-synapse`（インプロセス）と `crates/yuuka-orchestrator` の `synapse_*.rs` で、**矛盾する場合は現行コードが正**。旧 Node 実装時点の規範である [`architecture/architecture_v2.md`](../architecture/architecture_v2.md) §13（schema v16）は履歴資料で、優先されない。未実装の Phase 2 以降は本書を指針とし、着手時は現行の Rust 実装・マイグレーション（`crates/yuuka-db/migrations/`）に合わせて具体化する。
+> **⚠️ 旧 Node 実装時点の記述を含みます:** 本文が参照する `src/*.ts`・`src/rust_synapse/` 等は Node 実装（[#68](https://github.com/kawaii-music-moe/yuuka/pull/68) で撤去済み）のファイルで、現行リポジトリには存在しません（リンク切れを含む）。撤去前のソースは `git show 390df39^:<path>` で参照できます。詳細は [docs/index.md](../index.md)。
 > **対象読者:** 設計判断を行う開発者・実装エージェント。
 > **決定済みの前提（本書の3つの軸）:**
 > 1. **ハイブリッドLLM構成** — 重い推論は Gemini、ルーティング/前処理/分類はローカル軽量LLM。
@@ -33,10 +34,10 @@
 
 | 要素 | ベースライン実装（改善対象） | 出典 |
 |---|---|---|
-| 文脈の与え方 | **直近 15 件**（ギルドは 30 件）の生の会話履歴をそのまま注入 | [`messageLogRepo.ts`](../../src/db/messageLogRepo.ts) `CONTEXT_LIMIT=15` / `getRecentContext(userId, botId, 15)`（[`gemini.ts:629`](../../src/gemini.ts#L629)） |
-| システムプロンプト | ペルソナ＋コンテキストノート＋検索スキル仕様＋ツール説明を**毎回ほぼ全文**組み立て | [`gemini.ts`](../../src/gemini.ts) `buildSystemInstruction` |
+| 文脈の与え方 | **直近 15 件**（ギルドは 30 件）の生の会話履歴をそのまま注入 | `messageLogRepo.ts` `CONTEXT_LIMIT=15` / `getRecentContext(userId, botId, 15)`（`gemini.ts:629`） |
+| システムプロンプト | ペルソナ＋コンテキストノート＋検索スキル仕様＋ツール説明を**毎回ほぼ全文**組み立て | `gemini.ts` `buildSystemInstruction` |
 | 過去会話の参照 | LLM が `searchConversationLogs` を**明示的に呼んだ時だけ** FTS5 全文検索（**R1 で廃止 → L2 連想想起へ置換**。時系列要約 `summarizeConversationTopic` は維持） | `message_logs_fts`（FTS5） |
-| 操作履歴 | `actionRecorder` が直近30件の Function 呼び出しを **Redis に TTL 2時間**で保持（秘匿系は除外） | [`actionRecorder.ts`](../../src/services/actionRecorder.ts) `MAX_ACTIONS=30 / TTL=2h` |
+| 操作履歴 | `actionRecorder` が直近30件の Function 呼び出しを **Redis に TTL 2時間**で保持（秘匿系は除外） | `actionRecorder.ts` `MAX_ACTIONS=30 / TTL=2h` |
 | ベクトル検索 | **なし** | — |
 | 成功/失敗の学習 | **なし**（fc_history は揮発、統計化されない） | — |
 
@@ -103,7 +104,7 @@
 
 ### 3.3 Yuuka への含意
 
-- 既存の [`llmClient.ts`](../../src/services/llmClient.ts)（`getUserGenAI` / `getBotGenAI` / `generateAuxText`）を**本推論側**としてそのまま使い、**前処理側にローカル SLM クライアントを新設**して二段化する。Gemini 鍵まわりの分離（ユーザー鍵 / Bot 専用鍵）は不変条件（architecture_v2 §5）なので踏襲する。
+- 既存の `llmClient.ts`（`getUserGenAI` / `getBotGenAI` / `generateAuxText`）を**本推論側**としてそのまま使い、**前処理側にローカル SLM クライアントを新設**して二段化する。Gemini 鍵まわりの分離（ユーザー鍵 / Bot 専用鍵）は不変条件（architecture_v2 §5）なので踏襲する。
 - ルーターのコスト指標は「Gemini API 呼び出し回数・トークン」。**ローカル前処理で easy を吸収するほど Gemini 課金が下がる**のが直接の便益。
 - ローカル SLM の品質下限がリスク（§12）。前処理の各タスクは**構造化出力（§6）**でレールを敷き、ブレを抑える。
 
@@ -132,7 +133,7 @@
 | 統計集計（勝率） | per-user 規模なら十分高速 | 列指向で大規模集計が速い（per-userでは過剰） |
 | 書込み一貫性 | 会話ログと**同一書込み経路**（二重書込みなし） | OLTPを別管理にすると二重書込み/同期が発生 |
 | データ分離との相性 | 既存 `user_id` スコープをそのまま継承 | 別ストアにするとスコープ実装を再構築 |
-| 運用 | 既存バックアップ（[`backupService.ts`](../../src/services/backupService.ts)）に乗る | バックアップ・移行を別途設計 |
+| 運用 | 既存バックアップ（`backupService.ts`）に乗る | バックアップ・移行を別途設計 |
 
 ### 4.3 推奨：段階併用（SQLite を正、DuckDB は分析サイドカー）
 
@@ -173,7 +174,7 @@ tool_outcomes
   status                         -- success | error
   latency_ms, created_at
 ```
-- **種は既存 [`actionRecorder.ts`](../../src/services/actionRecorder.ts)**。現状 Redis に TTL 2h で揮発しているものを、**秘匿除外規約はそのまま**に SQLite へ永続化し統計の素地にする。
+- **種は既存 `actionRecorder.ts`**。現状 Redis に TTL 2h で揮発しているものを、**秘匿除外規約はそのまま**に SQLite へ永続化し統計の素地にする。
 
 ### 5.3 トピック別効率（中間ビュー＝勝率）
 
@@ -236,7 +237,7 @@ Yuuka は機能群＋MCP 動的ツールでツール数が増え続ける。**�
 - ツール数が増えると「正しいツールを大集合から検索・選択できるか」が正答率を律速する。素朴な全載せの限界は概ね 10〜15。([The Tool Selection Problem](https://tianpan.co/blog/2026-04-09-tool-selection-problem-agent-tool-routing-at-scale))
 - **ToolGen**（検索と呼び出しを生成に統合、47k ツール規模）/ **AnyTool**（階層ディレクトリで段階フィルタ）/ **Toolshed**（RAG-Tool Fusion）は、いずれも「**事前に候補を絞ってから LLM に渡す**」設計。本書の 2nd Hop はこの一種。([ToolGen, arXiv:2410.03439](https://arxiv.org/html/2410.03439v2) / [Toolshed, arXiv:2410.14594](https://arxiv.org/pdf/2410.14594))
 
-> **設計含意:** 既存の MCP 動的ツール（[`mcpDynamic.ts`](../../src/functions/mcpDynamic.ts)）は数が読めない。2nd Hop による**トピック→候補ツール絞り込み**を MCP ツールにも適用し、提示ツール数を物理的に削る。
+> **設計含意:** 既存の MCP 動的ツール（`mcpDynamic.ts`）は数が読めない。2nd Hop による**トピック→候補ツール絞り込み**を MCP ツールにも適用し、提示ツール数を物理的に削る。
 
 ---
 

@@ -1,44 +1,43 @@
 <script lang="ts">
-	// 汎用モード（mcp_assistant）のAPI使用量ダッシュボード（旧 renderUsageDashboard 群）。
-	// 手描きSVGは innerHTML 廃止し {#each} で <path>/<line> をバインド描画。
-	import { Icon } from "$lib/components/ui";
-	import type { UsageDashboardData } from "./dashboardTypes";
-	import {
-		usageChart,
-		usageYAxis,
-		usageXAxis,
-		usageSummary,
-	} from "./dashboardCharts";
-	import { peakDateLabel } from "./dashboardUtils";
+// 汎用モード（mcp_assistant）のAPI使用量ダッシュボード（旧 renderUsageDashboard 群）。
+// 手描きSVGは innerHTML 廃止し {#each} で <path>/<line> をバインド描画。
+import { Icon } from "$lib/components/ui";
+import {
+	usageChart,
+	usageSummary,
+	usageXAxis,
+	usageYAxis,
+} from "./dashboardCharts";
+import type { UsageDashboardData } from "./dashboardTypes";
 
-	interface Props {
-		data: UsageDashboardData;
-	}
+interface Props {
+	data: UsageDashboardData;
+}
 
-	let { data }: Props = $props();
+let { data }: Props = $props();
 
-	const series = $derived(data.series ?? []);
-	const totals = $derived(data.totals ?? { requests: 0, responses: 0 });
-	const days = $derived(data.days ?? series.length ?? 14);
-	const summary = $derived(usageSummary(series, totals, days));
-	const chart = $derived(usageChart(series));
-	const yAxis = $derived(usageYAxis(series));
-	const xAxis = $derived(usageXAxis(series));
+const series = $derived(data.series ?? []);
+const totals = $derived(data.totals ?? { requests: 0, responses: 0 });
+const days = $derived(data.days ?? series.length ?? 14);
+const summary = $derived(usageSummary(series, totals, days));
+const chart = $derived(usageChart(series));
+const yAxis = $derived(usageYAxis(series));
+const xAxis = $derived(usageXAxis(series));
 
-	const rateLimits = $derived(data.rate_limits);
-	const rlItems = $derived(
-		rateLimits
-			? [
-					{ label: "ユーザー1人 / 分", value: rateLimits.userPerMinute },
-					{ label: "ユーザー1人 / 日", value: rateLimits.userPerDay },
-					{ label: "サーバー1つ / 日", value: rateLimits.guildPerDay },
-				]
-			: [],
-	);
+const rateLimits = $derived(data.rate_limits);
+const rlItems = $derived(
+	rateLimits
+		? [
+				{ label: "ユーザー1人 / 分", value: rateLimits.userPerMinute },
+				{ label: "ユーザー1人 / 日", value: rateLimits.userPerDay },
+				{ label: "サーバー1つ / 日", value: rateLimits.guildPerDay },
+			]
+		: [],
+);
 
-	function fmtVal(v: number | undefined | null): string {
-		return v === undefined || v === null ? "—" : v.toLocaleString();
-	}
+function fmtVal(v: number | undefined | null): string {
+	return v === undefined || v === null ? "—" : v.toLocaleString();
+}
 </script>
 
 <!-- 使用量サマリカード -->
@@ -47,25 +46,21 @@
 		<div class="stat-card-badge-trend">TODAY</div>
 		<div class="stat-card-header"><span class="stat-label">本日のリクエスト</span></div>
 		<div class="stat-value">{summary.today.toLocaleString()}</div>
-		<div class="stat-footer-text">本日の受信メッセージ数</div>
 	</div>
 	<div class="stat-card card">
 		<div class="stat-card-badge-trend">{days} DAYS</div>
 		<div class="stat-card-header"><span class="stat-label">期間合計</span></div>
 		<div class="stat-value">{summary.totalReq.toLocaleString()}</div>
-		<div class="stat-footer-text">集計期間の総リクエスト数</div>
 	</div>
 	<div class="stat-card card">
 		<div class="stat-card-badge-trend">AVG</div>
 		<div class="stat-card-header"><span class="stat-label">日次平均</span></div>
 		<div class="stat-value">{summary.avg.toLocaleString()}</div>
-		<div class="stat-footer-text">1日あたりの平均リクエスト</div>
 	</div>
 	<div class="stat-card card">
 		<div class="stat-card-badge-trend">PEAK</div>
 		<div class="stat-card-header"><span class="stat-label">ピーク</span></div>
 		<div class="stat-value">{summary.peak.toLocaleString()}</div>
-		<div class="stat-footer-text">{peakDateLabel(summary.peakDate)}</div>
 	</div>
 </div>
 
@@ -147,10 +142,4 @@
 			<div class="usage-empty-note">レート制限の設定情報を取得できませんでした。</div>
 		{/if}
 	</div>
-	<p class="usage-ratelimit-note">
-		※ 上のリクエスト数は Bot 全体（全サーバー・全ユーザーの合算）の集計です。一方この上限は
-		<strong>ユーザー1人ごと</strong>・<strong>サーバー1つごと</strong>に個別判定されるため、Bot
-		全体の合計がこれらの数値を上回っていても、各ユーザー・各サーバーが上限内であれば正常に応答します。
-		上限値の変更は管理者が「管理 → Bot属性設定」から行えます。
-	</p>
 </div>

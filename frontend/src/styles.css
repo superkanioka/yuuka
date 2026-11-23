@@ -44,6 +44,14 @@
 	--border-divider: rgba(255, 255, 255, 0.12);
 	--border-focus: var(--color-primary);
 	--radius: 4px;
+	/* 入力欄の背景。フォーカス時は、ダークでは白・ライトでは黒を 4% 混ぜて周りから浮かせる */
+	--field-bg: var(--surface-1dp);
+	--field-focus-tint: #fff;
+	--field-bg-focus: color-mix(
+		in srgb,
+		var(--field-bg),
+		var(--field-focus-tint) 4%
+	);
 
 	--color-white: rgba(255, 255, 255, 0.87);
 	--color-zinc-light: rgba(255, 255, 255, 0.6);
@@ -62,7 +70,8 @@
 
 	--transition-smooth: all 0.15s ease-in-out;
 	--font-family-sans:
-		"Inter", "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+		"Roboto", "Zen Kaku Gothic New", -apple-system, BlinkMacSystemFont,
+		"Segoe UI", sans-serif;
 	--font-family-mono: "JetBrains Mono", Consolas, monospace;
 }
 
@@ -106,6 +115,7 @@
 	--border-matte: rgba(0, 0, 0, 0.12);
 	--border-divider: rgba(0, 0, 0, 0.12);
 	--border-focus: var(--color-primary);
+	--field-focus-tint: #000;
 
 	--color-white: rgba(0, 0, 0, 0.87);
 	--color-zinc-light: rgba(0, 0, 0, 0.6);
@@ -261,6 +271,7 @@ body {
 		"opsz" 24;
 	vertical-align: middle;
 	line-height: 1;
+	user-select: none;
 }
 
 /* Sidebar navigation adjustments */
@@ -412,6 +423,21 @@ textarea {
 	animation: tab-fade-in 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* Bot設定の各ページ（設定ハブ配下）。カードの縦間隔は gap に集約する。 */
+.settings-page {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+.settings-page .config-card {
+	margin-top: 0 !important;
+}
+/* 読み込み中・権限が無いときの 1 行の案内 */
+.settings-page-note {
+	padding: 24px 0;
+	color: var(--text-secondary);
+}
+
 /* ==============================================================================
    OVERLAY & LOGIN WINDOW (Sleek Matte HUD)
    ============================================================================== */
@@ -522,6 +548,9 @@ textarea {
 	.management-overlay-card {
 		width: 100vw;
 		height: 100vh;
+		/* biome-ignore lint/suspicious/noDuplicateProperties: 100vh above is an
+		   intentional fallback for browsers without dvh support; this overrides it
+		   where supported. */
 		height: 100dvh;
 		max-height: 100dvh;
 		border-radius: 0;
@@ -599,12 +628,15 @@ textarea {
 	max-height: 60vh;
 	overflow-y: auto;
 	margin-top: 16px;
-	padding-right: 12px;
 	text-align: left;
 	background-color: var(--surface-1dp);
 	border: 1px solid var(--border-matte);
 	border-radius: 4px;
+	/* padding-right stays smaller than the shorthand to leave room for the
+	   scrollbar from overflow-y: auto above; declare the shorthand first so it
+	   doesn't blow away this longhand override (was previously a no-op). */
 	padding: 20px;
+	padding-right: 12px;
 }
 
 /* Custom Scrollbar for usage content to match the theme */
@@ -750,46 +782,78 @@ textarea {
 }
 
 /* Discord連携タブ（.discord-tab）配下のみ、注釈サイズ（0.72〜0.75rem）で描かれていた
-   見出し・説明・登録行の「名前」を本文サイズへ底上げする（IDは注釈サイズのmonoのまま）。
+   登録行の「名前」を本文サイズへ底上げする（IDは注釈サイズのmonoのまま）。
    他タブと共有のクラス自体は変えず、スコープ付き上書きに留める。 */
-.discord-tab .collapsible-group > summary {
-	font-size: 0.9rem;
-	letter-spacing: 0.02em;
-}
-.discord-tab .description-text {
-	font-size: 0.8rem;
-	line-height: 1.6;
-}
 .discord-tab .row-label {
 	font-size: 0.9rem;
 	color: var(--text-primary);
+}
+/* ギルド選択と、チャンネル・メンバー・ロールの入力を 1 つの枠（.joined-field）に並べる。 */
+.discord-tab .joined-field {
+	flex: 1;
+}
+.discord-tab .joined-field .guild-select {
+	flex-shrink: 0;
+	max-width: 40%;
+}
+/* 各セクション（discord/*Section.svelte）の本文: 追加行 + 登録済みの行の一覧。 */
+.discord-tab .section-body {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	margin-top: 12px;
+}
+.discord-tab .add-row {
+	display: flex;
+	gap: 12px;
+	flex-wrap: wrap;
+}
+.discord-tab .row-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 8px;
+}
+.discord-tab .list-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+.discord-tab .mono {
+	font-family: var(--font-family-mono);
 }
 .discord-tab .row-label .mono {
 	font-size: 0.8rem;
 	color: var(--color-zinc-muted);
 }
 
-/* Base input, select, textarea styling */
+/* Base input, select, textarea styling
+   外枠は通常時なし（透明の 1px で場所だけ取る）。フォーカス時に 1px の枠を出し、背景を少し浮かせる。 */
 input[type="text"],
 input[type="password"],
 input[type="number"],
 input[type="url"],
 input[type="email"],
+input[type="search"],
+input[type="tel"],
 input[type="date"],
 input[type="time"],
 input[type="datetime-local"],
+input[type="month"],
 select,
 textarea {
 	padding: 12px;
-	background-color: var(--surface-1dp);
-	border: 1px solid var(--border-divider);
+	background-color: var(--field-bg);
+	border: 1px solid transparent;
 	border-radius: 4px;
 	outline: none;
+	box-shadow: none;
 	font-size: 0.95rem;
 	color: var(--text-high);
 	transition:
 		border-color 0.15s ease,
-		box-shadow 0.15s ease;
+		background-color 0.15s ease;
 }
 
 input[type="text"]:focus,
@@ -797,13 +861,42 @@ input[type="password"]:focus,
 input[type="number"]:focus,
 input[type="url"]:focus,
 input[type="email"]:focus,
+input[type="search"]:focus,
+input[type="tel"]:focus,
 input[type="date"]:focus,
 input[type="time"]:focus,
 input[type="datetime-local"]:focus,
+input[type="month"]:focus,
 select:focus,
 textarea:focus {
-	border-color: var(--color-primary);
-	box-shadow: 0 0 0 1px var(--color-primary);
+	border-color: var(--border-focus);
+	background-color: var(--field-bg-focus);
+	box-shadow: none;
+}
+
+/* 数値欄のブラウザ標準の増減ボタン（▲▼）を出さない（Chrome / Safari / Firefox） */
+input[type="number"] {
+	appearance: textfield;
+	-moz-appearance: textfield;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+	-webkit-appearance: none;
+	margin: 0;
+}
+
+/* 日付・時刻の欄は文字では打たせず、押すとピッカーを開く（lib/datePicker.ts） */
+input[type="date"],
+input[type="time"],
+input[type="datetime-local"],
+input[type="month"] {
+	cursor: pointer;
+}
+input[type="date"]::-webkit-datetime-edit,
+input[type="time"]::-webkit-datetime-edit,
+input[type="datetime-local"]::-webkit-datetime-edit,
+input[type="month"]::-webkit-datetime-edit {
+	cursor: pointer;
 }
 
 .form-group input,
@@ -2489,8 +2582,13 @@ input[type="checkbox"]:disabled,
 		max-width: 100%;
 		width: 100%;
 		height: 100vh;
+		/* biome-ignore lint/suspicious/noDuplicateProperties: 100vh above is an
+		   intentional fallback for browsers without dvh support; this overrides it
+		   where supported. */
 		height: 100dvh;
 		max-height: 100vh;
+		/* biome-ignore lint/suspicious/noDuplicateProperties: same dvh fallback
+		   pattern as height above. */
 		max-height: 100dvh;
 		padding: 12px;
 		border: 0;
@@ -3119,56 +3217,20 @@ details.admin-section[open] > summary > .admin-section-title::before {
 	transform: rotate(90deg);
 }
 
-/* 設定タブ：config-card を details 化したアコーディオン。
-   summary（.column-header）をクリック行にし、タイトル左にシェブロンを付ける。
-   閉時は説明文・本文が隠れ、同時に1つだけ展開（name="config-acc"）。 */
-details.config-card > summary.column-header {
-	cursor: pointer;
-	user-select: none;
-	list-style: none; /* Firefox の三角を消す */
-}
-details.config-card > summary.column-header::-webkit-details-marker {
-	display: none; /* WebKit/Blink の三角を消す */
-}
-details.config-card:not([open]) > summary.column-header {
-	margin-bottom: 0;
-}
-/* h3 の左にシェブロン（開閉で回転）。h3 内の material icon の前に出る */
-details.config-card > summary.column-header > h3::before {
-	content: "▸";
-	display: inline-block;
-	font-size: 0.85rem;
-	line-height: 1;
-	margin-right: 6px;
-	color: var(--text-secondary);
-	transition: transform 0.18s ease;
-	vertical-align: middle;
-}
-details.config-card[open] > summary.column-header > h3::before {
-	transform: rotate(90deg);
-}
-/* バッジをヘッダ右端（タイトルの反対側）へ寄せるバリアント */
-summary.column-header.badge-right {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	flex-wrap: wrap;
-}
-summary.column-header.badge-right > .badge {
-	margin-left: auto;
-}
-summary.column-header.badge-right > h3 {
-	margin: 0;
-}
-/* バッジをヘッダ右端へ寄せるバリアント（div.column-header でも有効） */
+/* 個別設定ページの見出し。バッジはタイトルの反対側へ寄せる。 */
 .column-header.badge-right {
 	display: flex;
 	align-items: center;
 	gap: 8px;
 	flex-wrap: wrap;
 }
-.column-header.badge-right > .badge {
+.column-header.badge-right > .badge,
+.column-header.badge-right > .scope-badge {
 	margin-left: auto;
+}
+/* 適用範囲バッジの後ろに続くバッジは、右端で隣に並べる */
+.column-header.badge-right > .scope-badge ~ .badge {
+	margin-left: 0;
 }
 .column-header.badge-right > h3 {
 	margin: 0;
@@ -3392,21 +3454,6 @@ summary.column-header.badge-right > h3 {
 .admin-btn-action.btn-promote:hover {
 	background-color: rgba(234, 179, 8, 0.12);
 	border-color: rgba(234, 179, 8, 0.7);
-}
-
-/* Invite Code Status */
-.invite-status-available {
-	color: #22c55e;
-	font-weight: 700;
-}
-
-.invite-status-used {
-	color: var(--color-zinc-muted);
-}
-
-.invite-status-revoked {
-	color: #ef4444;
-	font-weight: 700;
 }
 
 /* Discord ID masking style */
@@ -3705,348 +3752,6 @@ summary.column-header.badge-right > h3 {
 }
 
 /* ==============================================================================
-   BLUE ARCHIVE LIGHT THEME TOKENS
-   実際のゲームUI配色を再現
-   Sources: Blue Archive Wiki (#02D3FB), MomoTalk Discord theme
-            (#F2F7F8 sidebar / #E7F0F7 header / #DDE6ED border)
-   ============================================================================== */
-/* :root に限定: テーマ切替ボタン自身の data-theme への漏れを防ぐ (light テーマ同様) */
-:root[data-theme="blue-archive"] {
-	/* BA公式シアン (#02D3FB は wiki confirmed, #00AED8 は hover用) */
-	--ba-cyan: #02d3fb;
-	--ba-cyan-hover: #00aed8;
-	--ba-cyan-dim: rgba(2, 211, 251, 0.12);
-	--ba-cyan-faint: rgba(2, 211, 251, 0.06);
-
-	/* 追加アクセント — ゲーム本編の MomoTalk / 優先度 / 警告色を再現 */
-	--ba-pink: #fb90a4; /* MomoTalk バナー・優先度高 */
-	--ba-pink-dim: rgba(251, 144, 164, 0.15);
-	--ba-lavender: #a3baff; /* ゲーム内リンク色 */
-	--ba-yellow: #ffd966; /* 警告/注意 */
-	--ba-yellow-dim: rgba(255, 217, 102, 0.15);
-
-	/* 背景 — 公式ゲーム画面に近い色 */
-	--bg-primary: #fbfcff; /* ほぼ白・微青みがかった main content */
-	--bg-secondary: #fbfcff;
-	--bg-sidebar: #f2f7f8; /* MomoTalkソース sidebar 値そのまま */
-	--bg-body: #fbfcff;
-
-	--surface-0dp: #ffffff;
-	--surface-1dp: #f5fafe;
-	--surface-2dp: #eff6fb;
-	--surface-3dp: #e9f2f9;
-	--surface-4dp: #e7f0f7;
-	--surface-6dp: #dfebf4;
-	--surface-8dp: #dbe8f2;
-	--surface-12dp: #d5e4ef;
-	--surface-16dp: #d0e0ec;
-	--surface-24dp: #c8dcea;
-
-	--color-primary: var(--ba-cyan);
-	--color-primary-variant: var(--ba-cyan-hover);
-	--color-secondary: var(--ba-pink);
-	--color-error: #dc2626;
-
-	--color-on-primary: #ffffff;
-	--color-on-secondary: #1b2b3a;
-	--color-on-error: #ffffff;
-
-	/* テキスト — ダークネイビー系 */
-	--text-high: #1b2b3a;
-	--text-medium: #5a7a95;
-	--text-disabled: #9db4c6;
-
-	--card-matte: transparent;
-	--card-matte-hover: rgba(2, 211, 251, 0.04);
-	--border-matte: #dde6ed; /* MomoTalkソース値そのまま */
-	--border-divider: #dde6ed;
-	--border-focus: var(--ba-cyan);
-
-	--color-white: #1b2b3a;
-	--color-zinc-light: #2e4a62;
-	--color-zinc-muted: #7a9bb0;
-	--color-green: #16a34a;
-	--color-red: var(--color-error);
-
-	--text-primary: #1b2b3a;
-	--text-secondary: #5a7a95;
-
-	--discord-blurple: var(--ba-cyan);
-	--discord-blurple-hover: var(--ba-cyan-hover);
-	--discord-blurple-active: #0095bd;
-	--discord-grey-secondary: var(--surface-4dp);
-	--discord-grey-secondary-hover: var(--surface-8dp);
-}
-
-/* BA component overrides (ライトテーマ同様、ハードコードされたダーク値の上書き) */
-[data-theme="blue-archive"] ::-webkit-scrollbar-track {
-	background: var(--bg-primary);
-}
-[data-theme="blue-archive"] ::-webkit-scrollbar-thumb {
-	background: #c8dcea;
-}
-[data-theme="blue-archive"] ::-webkit-scrollbar-thumb:hover {
-	background: var(--ba-cyan);
-}
-
-[data-theme="blue-archive"] .checkbox-custom {
-	border-color: #9db4c6;
-}
-[data-theme="blue-archive"] .checkbox-custom:checked {
-	background-color: var(--ba-cyan);
-	border-color: var(--ba-cyan);
-}
-
-[data-theme="blue-archive"] .badge-normal {
-	background-color: #eff6fb;
-	color: var(--ba-lavender);
-	border-color: #c8dcea;
-}
-
-[data-theme="blue-archive"] .spinner {
-	border-color: rgba(2, 211, 251, 0.18);
-	border-top-color: var(--ba-cyan);
-}
-
-[data-theme="blue-archive"] .btn-primary:hover {
-	background-color: var(--ba-cyan-hover);
-}
-[data-theme="blue-archive"] .btn-primary:active {
-	background-color: #0095bd;
-}
-[data-theme="blue-archive"] .btn-secondary:hover {
-	background-color: var(--ba-cyan-faint);
-}
-[data-theme="blue-archive"] .btn-filter:hover {
-	background-color: var(--ba-cyan-faint);
-}
-[data-theme="blue-archive"] .btn-filter.active {
-	background-color: var(--ba-cyan);
-	border-color: var(--ba-cyan);
-	color: #ffffff;
-}
-[data-theme="blue-archive"] .btn-icon:hover {
-	background-color: var(--ba-cyan-faint);
-	border-color: var(--ba-cyan);
-}
-
-[data-theme="blue-archive"] .menu-item:hover {
-	background-color: var(--ba-cyan-faint);
-	color: #1b2b3a;
-}
-[data-theme="blue-archive"] .menu-item.active {
-	color: var(--ba-cyan);
-	background-color: var(--ba-cyan-dim);
-	font-weight: 700;
-}
-
-[data-theme="blue-archive"] .stat-card-badge-trend {
-	color: var(--ba-cyan);
-	border-color: #c8dcea;
-}
-[data-theme="blue-archive"] .stat-card-badge-trend.positive {
-	color: var(--ba-cyan-hover);
-	border-color: rgba(2, 211, 251, 0.3);
-}
-
-/* SVG チャート */
-[data-theme="blue-archive"] #trend-area-path {
-	fill: rgba(2, 211, 251, 0.08) !important;
-}
-[data-theme="blue-archive"] #donut-segment {
-	stroke: var(--ba-cyan) !important;
-}
-[data-theme="blue-archive"] #trend-line-path {
-	stroke: var(--ba-cyan) !important;
-}
-[data-theme="blue-archive"] #dashboard-trend-chart line {
-	stroke: #c8dcea;
-}
-[data-theme="blue-archive"] .donut-chart circle:not(#donut-segment) {
-	stroke: #dde6ed;
-}
-[data-theme="blue-archive"] #schedules-sparkline-path,
-[data-theme="blue-archive"] #expenses-sparkline-path {
-	stroke: var(--ba-cyan);
-}
-
-[data-theme="blue-archive"] .urgent-item:hover {
-	color: var(--ba-cyan-hover);
-}
-[data-theme="blue-archive"] .bot-item-card:hover {
-	border-color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .bot-item-card.default-bot {
-	border-color: rgba(2, 211, 251, 0.3);
-}
-[data-theme="blue-archive"] .sidebar {
-	box-shadow: none;
-}
-
-/* ハードコードされた白系ホバーはライト背景では見えないため置き換え */
-[data-theme="blue-archive"] .expense-table tr:hover td {
-	background-color: var(--ba-cyan-faint);
-}
-[data-theme="blue-archive"] .sidebar-back-button:hover {
-	background-color: var(--ba-cyan-faint);
-}
-[data-theme="blue-archive"] .btn-trash:hover,
-[data-theme="blue-archive"] .btn-credential-delete:hover {
-	background-color: rgba(0, 0, 0, 0.04);
-}
-[data-theme="blue-archive"] .admin-btn-action:hover {
-	background-color: var(--ba-cyan-faint);
-}
-
-[data-theme="blue-archive"] .modal {
-	background-color: rgba(211, 232, 245, 0.8);
-}
-[data-theme="blue-archive"] .modal-content {
-	background-color: var(--surface-0dp);
-	box-shadow: 0 10px 25px rgba(27, 43, 58, 0.12);
-}
-
-/* ヘッダーエリア: ゲームのパネル上部の薄青を再現 */
-[data-theme="blue-archive"] .top-header {
-	background-color: #e7f0f7; /* MomoTalkソース channeltopbar 値 */
-	border-bottom-color: #c8dcea;
-	margin: -40px -40px 30px -40px;
-	padding: 20px 40px;
-}
-
-@media (max-width: 1024px) and (min-width: 769px) {
-	[data-theme="blue-archive"] .top-header {
-		margin: -28px -24px 30px -24px;
-		padding: 16px 24px;
-	}
-}
-
-@media (max-width: 768px) {
-	[data-theme="blue-archive"] .top-header {
-		margin: -18px -14px 16px -14px;
-		padding: 12px 14px;
-	}
-
-	/* ドロワー式サイドバー（旧ボトムナビ用の border-top/上向き影は撤去） */
-	[data-theme="blue-archive"] .sidebar {
-		background-color: var(--bg-sidebar);
-	}
-
-	[data-theme="blue-archive"] .menu-item.active {
-		color: var(--ba-cyan);
-		background-color: var(--ba-cyan-dim);
-	}
-}
-
-/* フルブリードヘッダーのネガティブマージンを .main-content のパディング縮小に追従させる
-   （ずれると横スクロールが発生する） */
-@media (max-width: 420px) {
-	[data-theme="blue-archive"] .top-header {
-		margin: -16px -12px 16px -12px;
-		padding: 12px;
-	}
-}
-
-@media (max-width: 360px) {
-	[data-theme="blue-archive"] .top-header {
-		margin: -16px -10px 16px -10px;
-		padding: 12px 10px;
-	}
-}
-
-/* 各種パーツ */
-[data-theme="blue-archive"] .budget-progress-bar {
-	background-color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .hud-pulse-dot {
-	background-color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .avatar-badge {
-	background-color: var(--ba-cyan);
-	color: #ffffff;
-}
-[data-theme="blue-archive"] .hud-tag {
-	color: var(--ba-cyan);
-	border-color: #c8dcea;
-	background-color: #f2f7f8;
-}
-
-[data-theme="blue-archive"] .dropzone:hover,
-[data-theme="blue-archive"] .dropzone.dragover {
-	border-color: var(--ba-cyan);
-	background-color: var(--ba-cyan-faint);
-}
-
-[data-theme="blue-archive"] .text-highlight {
-	color: var(--ba-cyan-hover);
-}
-
-/* リンク色：ゲーム内リンク色 (ラベンダー) */
-[data-theme="blue-archive"] a:not(.menu-item):not(.btn) {
-	color: var(--ba-lavender);
-}
-[data-theme="blue-archive"] a:not(.menu-item):not(.btn):hover {
-	color: var(--ba-cyan);
-}
-
-/* 緊急/期限切れバッジ — ピンク */
-[data-theme="blue-archive"] .badge-urgent {
-	background-color: var(--ba-pink-dim);
-	color: var(--ba-pink);
-	border: 1px solid var(--ba-pink);
-}
-
-/* アクセントバッジ — シアン */
-[data-theme="blue-archive"] .badge-accent {
-	color: var(--ba-cyan);
-	border-color: var(--ba-cyan);
-	background-color: var(--ba-cyan-faint);
-}
-
-/* 警告ボックス — ウォームイエロー */
-[data-theme="blue-archive"] .alert-box {
-	border-left-color: var(--ba-yellow);
-	background-color: #fffbec;
-}
-
-/* フォームフォーカスリング */
-[data-theme="blue-archive"] .form-group input:focus,
-[data-theme="blue-archive"] .form-group select:focus,
-[data-theme="blue-archive"] .form-group textarea:focus {
-	border-color: var(--ba-cyan);
-	box-shadow: 0 0 0 2px rgba(2, 211, 251, 0.15);
-}
-
-/* ソースバッジを色分け */
-[data-theme="blue-archive"] .source-discord {
-	color: var(--ba-lavender);
-}
-[data-theme="blue-archive"] .source-manual {
-	color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .source-web {
-	color: var(--ba-pink);
-}
-
-/* 配信ステータスバッジ (ライトテーマと同値) */
-[data-theme="blue-archive"] .status-badge.status-pending,
-[data-theme="blue-archive"] .status-badge.status-delivery-received {
-	background-color: rgba(180, 130, 0, 0.1);
-	color: #9a6700;
-}
-
-[data-theme="blue-archive"] .status-badge.status-sent,
-[data-theme="blue-archive"] .status-badge.status-delivery-notified {
-	background-color: rgba(34, 134, 58, 0.1);
-	color: #1a7f37;
-}
-
-[data-theme="blue-archive"] .status-badge.status-delivery-failed {
-	background-color: rgba(180, 35, 24, 0.08);
-	color: #b42318;
-}
-
-/* ==============================================================================
    THEME SELECTOR UI (設定タブ)
    ============================================================================== */
 .theme-options {
@@ -4147,20 +3852,6 @@ summary.column-header.badge-right > h3 {
 	background-color: #6200ee;
 }
 
-/* Blue Archive theme preview */
-.ba-preview {
-	background-color: #fbfcff;
-}
-
-.ba-preview .preview-sidebar {
-	background-color: #f2f7f8;
-	border-right: 1px solid #dde6ed;
-}
-
-.ba-preview .preview-card {
-	background-color: #e7f0f7;
-}
-
 /* ==============================================================================
    HOME DASHBOARD — レスポンシブ
    ============================================================================== */
@@ -4192,38 +3883,6 @@ summary.column-header.badge-right > h3 {
 }
 [data-theme="light"] .home-dashboard {
 	background: transparent;
-}
-
-/* BAテーマ対応 */
-[data-theme="blue-archive"] .home-stat-card {
-	background: #f2f7f8;
-	border-color: #dde6ed;
-}
-[data-theme="blue-archive"] .home-greeting-title span {
-	color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .home-stat-card.stat-online .home-stat-value {
-	color: #10b981;
-}
-[data-theme="blue-archive"] .home-stat-card.stat-accent .home-stat-value {
-	color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .home-nav-logo {
-	color: var(--ba-cyan);
-}
-[data-theme="blue-archive"] .bot-item-card {
-	background: #f2f7f8;
-	border-color: #dde6ed;
-}
-[data-theme="blue-archive"] .bot-item-card:hover {
-	background: #e7f0f7;
-}
-[data-theme="blue-archive"] .bot-card-footer {
-	border-top-color: #dde6ed;
-}
-
-.ba-preview .preview-card:first-child {
-	background-color: #02d3fb;
 }
 
 /* ==============================================================================
@@ -4525,7 +4184,9 @@ summary.column-header.badge-right > h3 {
 	gap: 12px;
 }
 @media (max-width: 700px) {
-	.tl-body { grid-template-columns: 1fr; }
+	.tl-body {
+		grid-template-columns: 1fr;
+	}
 }
 .tl-col {
 	display: flex;
@@ -4565,10 +4226,18 @@ summary.column-header.badge-right > h3 {
 	gap: 4px;
 	position: relative;
 }
-.tl-plan-card[data-type="transit"] { border-left-color: var(--color-amber, #f59e0b); }
-.tl-plan-card[data-type="task"]    { border-left-color: var(--color-green, #22c55e); }
-.tl-plan-card[data-type="free"]    { border-left-color: var(--color-zinc-muted); }
-.tl-plan-card[data-type="event"]   { border-left-color: var(--color-primary); }
+.tl-plan-card[data-type="transit"] {
+	border-left-color: var(--color-amber, #f59e0b);
+}
+.tl-plan-card[data-type="task"] {
+	border-left-color: var(--color-green, #22c55e);
+}
+.tl-plan-card[data-type="free"] {
+	border-left-color: var(--color-zinc-muted);
+}
+.tl-plan-card[data-type="event"] {
+	border-left-color: var(--color-primary);
+}
 
 .tl-plan-time {
 	font-family: var(--font-family-mono);
@@ -4592,7 +4261,9 @@ summary.column-header.badge-right > h3 {
 	opacity: 0;
 	transition: opacity 0.15s;
 }
-.tl-plan-card:hover .tl-plan-actions { opacity: 1; }
+.tl-plan-card:hover .tl-plan-actions {
+	opacity: 1;
+}
 
 /* 記録カード */
 .tl-record-card {
@@ -4606,10 +4277,18 @@ summary.column-header.badge-right > h3 {
 	gap: 4px;
 	position: relative;
 }
-.tl-record-card[data-type="expense"]   { border-left-color: var(--color-green, #22c55e); }
-.tl-record-card[data-type="task_done"] { border-left-color: var(--color-primary); }
-.tl-record-card[data-type="media"]     { border-left-color: var(--color-amber, #f59e0b); }
-.tl-record-card[data-type="location"]  { border-left-color: var(--color-zinc-muted); }
+.tl-record-card[data-type="expense"] {
+	border-left-color: var(--color-green, #22c55e);
+}
+.tl-record-card[data-type="task_done"] {
+	border-left-color: var(--color-primary);
+}
+.tl-record-card[data-type="media"] {
+	border-left-color: var(--color-amber, #f59e0b);
+}
+.tl-record-card[data-type="location"] {
+	border-left-color: var(--color-zinc-muted);
+}
 
 .tl-record-time {
 	font-family: var(--font-family-mono);
@@ -4639,7 +4318,9 @@ summary.column-header.badge-right > h3 {
 	opacity: 0;
 	transition: opacity 0.15s;
 }
-.tl-record-card:hover .tl-record-actions { opacity: 1; }
+.tl-record-card:hover .tl-record-actions {
+	opacity: 1;
+}
 
 /* タイプ選択ピル */
 .tl-type-pills {
@@ -4662,7 +4343,7 @@ summary.column-header.badge-right > h3 {
 .tl-type-pill:hover {
 	border-color: var(--color-primary);
 	color: var(--color-primary);
-	background: rgba(var(--color-primary-rgb, 99,102,241), 0.08);
+	background: rgba(var(--color-primary-rgb, 99, 102, 241), 0.08);
 }
 
 /* 空状態 */
@@ -4671,4 +4352,297 @@ summary.column-header.badge-right > h3 {
 	color: var(--color-zinc-muted);
 	text-align: center;
 	padding: 24px 0;
+}
+
+/* ==============================================================================
+   Bot設定ページの共通部品
+   各ページの scoped CSS に重複していた見た目をここへ集約する。
+   ファイル末尾に置き、同じ詳細度の基本スタイル（input[type="text"] や .card-item）より後に効かせる。
+   ============================================================================== */
+
+/* 入力欄の右に置くアイコンだけのボタン（✓ 保存・＋ 追加・開く）。 */
+.icon-action {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 40px;
+	flex-shrink: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--color-primary);
+	text-decoration: none;
+	cursor: pointer;
+}
+.icon-action:disabled {
+	color: var(--text-secondary);
+	opacity: 0.4;
+	cursor: default;
+}
+
+/* 入力欄の中（右端）に重ねるアイコンボタン（貼り付け・コピー・検索など）。 */
+.input-wrap {
+	position: relative;
+	flex: 1;
+	min-width: 0;
+}
+.input-wrap > input {
+	width: 100%;
+	box-sizing: border-box;
+	padding-right: 44px;
+}
+.inline-button {
+	position: absolute;
+	right: 4px;
+	top: 50%;
+	transform: translateY(-50%);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 36px;
+	height: 32px;
+	padding: 0;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text-secondary);
+	cursor: pointer;
+}
+
+/* 枠・背景なしのアイコンボタン（一覧の行の編集・コピー・削除）。.danger は赤いゴミ箱。 */
+.icon-plain {
+	display: inline-flex;
+	align-items: center;
+	flex-shrink: 0;
+	padding: 4px;
+	appearance: none;
+	border: none;
+	box-shadow: none;
+	background: transparent;
+	color: var(--text-secondary);
+	cursor: pointer;
+}
+.icon-plain:hover {
+	opacity: 0.75;
+}
+.icon-plain.danger {
+	color: var(--color-error);
+}
+
+/* 有効/無効を切り替える .btn-mini の「有効」状態 */
+.btn-mini.is-on {
+	color: var(--color-primary);
+	border-color: var(--color-primary);
+}
+
+/* 見出し行の右端に操作ボタンを寄せる（タイトルなしの見出し） */
+.column-header.actions-end {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+}
+
+/* 登録済みの一覧（Playbook・Webhook）: [本文] [操作] の行を縦に並べる。行は .card-item と併用する。 */
+.entry-list {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+.entry {
+	display: flex;
+	justify-content: space-between;
+	gap: 10px;
+	align-items: flex-start;
+}
+@media (max-width: 768px) {
+	/* 共通の .card-item は縦積みになるため、操作 UI を同じ行に戻す。 */
+	.entry {
+		padding-inline: 12px;
+		flex-direction: row;
+		align-items: flex-start;
+	}
+}
+.entry-body {
+	flex: 1;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.entry-title {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+.entry-name {
+	font-weight: 600;
+}
+.entry-actions {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+	flex-shrink: 0;
+}
+
+/* 実行・受信の履歴（Playbook・Webhook）。左の罫線の色で結果を表す。 */
+.run-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 8px;
+}
+.run-entry {
+	border-left: 3px solid var(--color-zinc-muted);
+	padding: 8px 12px;
+	border-radius: var(--radius);
+	background: var(--surface-1dp);
+}
+.run-entry.success {
+	border-left-color: var(--color-green, #22c55e);
+}
+.run-entry.failed {
+	border-left-color: var(--color-red, #ef4444);
+}
+
+/* プルダウンと入力欄を 1 つの枠に並べる。間の縦線は .divider。
+   枠は通常の入力欄と同じく、どこかにフォーカスがあるとき全体を 1px の枠で囲み、背景を浮かせる。 */
+.joined-field {
+	display: flex;
+	min-width: 0;
+	background-color: var(--field-bg);
+	border: 1px solid transparent;
+	border-radius: 4px;
+	transition:
+		border-color 0.15s ease,
+		background-color 0.15s ease;
+}
+.joined-field:focus-within {
+	border-color: var(--border-focus);
+	background-color: var(--field-bg-focus);
+}
+/* 中の入力欄・プルダウンは枠と背景を持たない（外側の .joined-field が受け持つ） */
+.joined-field input,
+.joined-field input:focus,
+.joined-field select,
+.joined-field select:focus,
+.joined-field textarea,
+.joined-field textarea:focus,
+.joined-field .inline-select,
+.joined-field .inline-select:focus-within {
+	border: 0;
+	background: transparent;
+	box-shadow: none;
+}
+.joined-field input {
+	flex: 1;
+	min-width: 0;
+}
+
+/* 独自のプルダウン（Select）を単独で置いたときは、通常の入力欄と同じ見た目にする */
+.inline-select {
+	background-color: var(--field-bg);
+	border: 1px solid transparent;
+	border-radius: 4px;
+	transition:
+		border-color 0.15s ease,
+		background-color 0.15s ease;
+}
+.inline-select:focus-within {
+	border-color: var(--border-focus);
+	background-color: var(--field-bg-focus);
+}
+.form-group > .inline-select {
+	width: 100%;
+}
+.joined-field .divider {
+	width: 1px;
+	flex-shrink: 0;
+	/* 左はプルダウンの ▼ との間隔 */
+	margin: 8px 0 8px 12px;
+	background-color: var(--border-divider);
+}
+
+/* ラベルの横に ? ヘルプや登録済みチェックを並べる行 */
+.label-row {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	margin-bottom: 8px;
+}
+.label-row label,
+.form-group .label-row label {
+	margin: 0;
+	line-height: 1;
+}
+
+/* 追加・編集フォーム（Playbook・Webhook・リマインダー）の縦並び */
+.form-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	margin-top: 8px;
+}
+.required-mark {
+	color: var(--color-error);
+}
+/* チェックボックス + 文言の 1 行 */
+.check-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	font-size: 0.85rem;
+}
+.checkbox-inline {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+.checkbox-inline input {
+	width: 20px;
+	height: 20px;
+}
+/* パスワード欄と誤認されて保存・提案が出ないよう、text 型を伏せ字表示にする。 */
+.secret-input {
+	-webkit-text-security: disc;
+}
+
+/* ペルソナの一覧（ペルソナページ・マーケットから追加）。行は .card-item と併用する。 */
+.persona-row {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 8px;
+}
+.persona-row:last-child {
+	border-bottom: none;
+}
+.persona-row-head {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+}
+.persona-row-meta {
+	font-size: 0.75rem;
+	color: var(--color-zinc-muted);
+	white-space: nowrap;
+}
+.persona-row-preview {
+	font-size: 0.82rem;
+	color: var(--color-zinc-muted);
+	line-height: 1.5;
+	word-break: break-word;
+}
+.persona-row-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+/* 伏せ字の値（トークン・API キー）が登録済みのときにラベル横へ出すチェック（SecretSetMark）。 */
+.secret-set-mark {
+	display: inline-flex;
+	vertical-align: middle;
+	margin-left: 6px;
+	color: var(--color-primary);
 }

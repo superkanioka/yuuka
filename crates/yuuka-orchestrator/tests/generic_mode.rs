@@ -23,6 +23,20 @@ use yuuka_web::Db;
 
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 事前計画（R06）の呼び出しか。計画は本編の応答・記録の対象にしない。
+fn is_planner_call(system_instruction: Option<&str>) -> bool {
+    system_instruction
+        .is_some_and(|s| s.starts_with(yuuka_orchestrator::turn_plan::PLANNER_INSTRUCTION))
+}
+
+/// 計画に失敗した応答（計画なし＝能力で絞ったツールのまま本編を進める）。
+fn no_plan() -> GenerateContentResponse {
+    serde_json::from_value(json!({
+        "candidates": [ { "content": { "role": "model", "parts": [ { "text": "{}" } ] } } ]
+    }))
+    .unwrap()
+}
+
 fn fresh_db() -> (Db, std::path::PathBuf) {
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
@@ -51,8 +65,8 @@ fn seed_guild_bot(
     // bots.user_id は users(discord_id) を FK 参照する → オーナーを先に seed。
     conn(path)
         .execute(
-            "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt, role) \
-             VALUES (?1, ?1, 'x', '00', 'user')",
+            "INSERT OR IGNORE INTO users (discord_id, username, salt, role) \
+             VALUES (?1, ?1, '00', 'user')",
             rusqlite::params![owner],
         )
         .expect("seed owner");
@@ -104,11 +118,14 @@ struct FakeBackend {
 impl GenerateBackend for FakeBackend {
     async fn generate(
         &self,
-        _system_instruction: Option<&str>,
+        system_instruction: Option<&str>,
         _declarations: &[FunctionDeclaration],
         _contents: &[Content],
         _tool_config: Option<ToolConfig>,
     ) -> Result<GenerateContentResponse, GeminiError> {
+        if is_planner_call(system_instruction) {
+            return Ok(no_plan());
+        }
         Ok(self
             .responses
             .lock()
@@ -120,14 +137,22 @@ impl GenerateBackend for FakeBackend {
 
 struct FakeFactory {
     text: String,
+    expected_model: Option<String>,
 }
 
 impl GeminiFactory for FakeFactory {
     fn build(
         &self,
-        _model: &str,
+        model: &str,
         _api_key: SecretString,
     ) -> Result<Arc<dyn GenerateBackend>, GeminiError> {
+        if self
+            .expected_model
+            .as_deref()
+            .is_some_and(|expected| model != expected)
+        {
+            return Err(GeminiError::Transport(format!("unexpected model: {model}")));
+        }
         let resp: GenerateContentResponse = serde_json::from_value(json!({
             "candidates": [ { "content": { "role": "model", "parts": [ { "text": self.text } ] } } ]
         }))
@@ -155,6 +180,7 @@ fn engine_with(db: Db, crypto: Arc<SystemCrypto>, text: &str) -> ChatEngine {
         ToolRegistry::new(),
         Arc::new(FakeFactory {
             text: text.to_owned(),
+            expected_model: None,
         }),
         None,
         Arc::new(yuuka_mcp::NullMcpClient),
@@ -171,6 +197,41 @@ fn speaker(user: &str, name: &str) -> Speaker {
         user_id: UserId::new(user),
         display_name: name.to_owned(),
     }
+}
+
+#[tokio::test]
+async fn guild_uses_saved_bot_model() {
+    let (db, path) = fresh_db();
+    let crypto = Arc::new(SystemCrypto::new(SecretString::from("gen-secret")).unwrap());
+    seed_guild_bot(&path, &crypto, "botG", "owner1", true);
+    conn(&path).execute("UPDATE bots SET llm_provider = 'gemini', llm_model = 'gemini-3.5-flash-lite' WHERE id = 'botG'", []).unwrap();
+    let engine = ChatEngine::new(
+        db,
+        Some(crypto),
+        ToolRegistry::new(),
+        Arc::new(FakeFactory {
+            text: "ok".to_owned(),
+            expected_model: Some("gemini-3.5-flash-lite".to_owned()),
+        }),
+        None,
+        Arc::new(yuuka_mcp::NullMcpClient),
+        None,
+    );
+    let reply = engine
+        .process_guild(
+            &BotId::new("botG"),
+            &GuildId::new("g1"),
+            speaker("mem1", "test"),
+            IncomingChat {
+                text: "hello".to_owned(),
+                ..IncomingChat::default()
+            },
+            null_sink(),
+            Arc::new(NoopDelivery),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.text, "ok");
 }
 
 #[tokio::test]
@@ -207,6 +268,52 @@ async fn process_guild_persists_prefixed_and_replies() {
         )
         .unwrap();
     assert!(logged.starts_with("[たろう]: "), "content={logged}");
+}
+
+/// #36: 汎用モード（ギルド）でも Embed のみの返信が復元後に空文字化してはならない。
+#[tokio::test]
+async fn embed_only_guild_reply_does_not_persist_empty_string() {
+    let (db, path) = fresh_db();
+    let crypto = Arc::new(SystemCrypto::new(SecretString::from("gen-secret".to_owned())).unwrap());
+    seed_guild_bot(&path, &crypto, "botG", "owner1", true);
+    let engine = engine_with(
+        db,
+        crypto,
+        "```json\n{\"title\":\"天気\",\"description\":\"晴れ\"}\n```",
+    );
+
+    let reply = engine
+        .process_guild(
+            &BotId::new("botG"),
+            &GuildId::new("g1"),
+            speaker("mem1", "たろう"),
+            IncomingChat {
+                text: "天気教えて".to_owned(),
+                ..IncomingChat::default()
+            },
+            null_sink(),
+            Arc::new(NoopDelivery),
+        )
+        .await
+        .expect("guild turn");
+
+    assert_eq!(reply.embeds.len(), 1, "Embed は復元される");
+    assert!(
+        !reply.text.trim().is_empty(),
+        "reply.text が空文字: {:?}",
+        reply.text
+    );
+    let logged: String = conn(&path)
+        .query_row(
+            "SELECT content FROM message_logs WHERE bot_id = 'botG' AND guild_id = 'g1' AND role = 'assistant'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !logged.trim().is_empty(),
+        "会話ログに空文字が保存されてはいけない: {logged:?}"
+    );
 }
 
 #[tokio::test]
@@ -248,11 +355,14 @@ struct CapturingBackend {
 impl GenerateBackend for CapturingBackend {
     async fn generate(
         &self,
-        _system_instruction: Option<&str>,
+        system_instruction: Option<&str>,
         _declarations: &[FunctionDeclaration],
         contents: &[Content],
         _tool_config: Option<ToolConfig>,
     ) -> Result<GenerateContentResponse, GeminiError> {
+        if is_planner_call(system_instruction) {
+            return Ok(no_plan());
+        }
         self.seen.lock().unwrap().push(contents.to_vec());
         Ok(serde_json::from_value(json!({
             "candidates": [ { "content": { "role": "model", "parts": [ { "text": self.text } ] } } ]

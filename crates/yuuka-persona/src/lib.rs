@@ -42,6 +42,7 @@ mod tests {
     use tower::ServiceExt;
     use yuuka_core::{AuthError, BotId, UserId, UserScope};
     use yuuka_types::{Role, SessionUser};
+    use yuuka_web::test_support::{with_bot_query, TEST_BOT_ID};
     use yuuka_web::{AppState, AuthBackend, Db, WebConfig};
 
     use crate::dto::SavePersona;
@@ -50,7 +51,7 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     // Node migrations の personas テーブル定義（owner_id スコープ・bot_id なし）。
-    const PERSONAS_DDL: &str = "CREATE TABLE personas (
+    const PERSONAS_DDL: &str = "DROP TABLE IF EXISTS personas; CREATE TABLE personas (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         owner_id TEXT NOT NULL,
         name TEXT NOT NULL,
@@ -67,7 +68,9 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(PERSONAS_DDL).expect("create personas");
         }
         Db::open(&path).expect("open db")
@@ -93,9 +96,10 @@ mod tests {
         UserScope::with_owner(UserId::new(user), BotId::new(bot), UserId::new(owner))
     }
 
-    const ACTIVE_DDL: &str = "CREATE TABLE bot_active_personas (
+    const ACTIVE_DDL: &str =
+        "DROP TABLE IF EXISTS bot_active_personas; CREATE TABLE bot_active_personas (
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         persona_id INTEGER NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
         PRIMARY KEY (user_id, bot_id)
@@ -108,9 +112,12 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(PERSONAS_DDL).expect("create personas");
-            conn.execute_batch(ACTIVE_DDL).expect("create bot_active_personas");
+            conn.execute_batch(ACTIVE_DDL)
+                .expect("create bot_active_personas");
         }
         Db::open(&path).expect("open db")
     }
@@ -336,11 +343,11 @@ mod tests {
         }
     }
 
-    fn app() -> axum::Router {
-        app_with(seed_db())
+    async fn app() -> axum::Router {
+        app_with(seed_db()).await
     }
 
-    fn app_with(db: Db) -> axum::Router {
+    async fn app_with(db: Db) -> axum::Router {
         let auth = Arc::new(FakeAuth {
             user: SessionUser {
                 discord_id: "u".to_owned(),
@@ -348,8 +355,9 @@ mod tests {
                 role: Role::User,
             },
         });
+        yuuka_web::test_support::seed_bot(&db, TEST_BOT_ID, "u").await;
         let state = AppState::new(auth, WebConfig::default(), db);
-        super::routes().with_state(state)
+        with_bot_query(super::routes().with_state(state), TEST_BOT_ID)
     }
 
     /// personas を手動作成した DB を開き、パスも返す（marketplace の公開行直挿し用）。
@@ -360,7 +368,9 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(PERSONAS_DDL).expect("create personas");
         }
         (Db::open(&path).expect("open db"), path)
@@ -387,8 +397,8 @@ mod tests {
     fn insert_user(path: &std::path::Path, discord_id: &str, username: &str) {
         let conn = rusqlite::Connection::open(path).expect("open");
         conn.execute(
-            "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-             VALUES (?1, ?2, 'x', 'x')",
+            "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+             VALUES (?1, ?2, 'x')",
             rusqlite::params![discord_id, username],
         )
         .expect("insert user");
@@ -426,7 +436,7 @@ mod tests {
         insert_user(&path, "alice", "Alice");
         let pub_id = insert_persona(&path, "alice", "Shared", "shared-prompt", 1);
         let priv_id = insert_persona(&path, "bob", "Secret", "secret", 0);
-        let app = app_with(db);
+        let app = app_with(db).await;
 
         // 一覧: 200・公開 1 件・owner_username 出力・owner_id 非露出。
         let list = app
@@ -524,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_save_then_list() {
-        let app = app();
+        let app = app().await;
         let save = app
             .clone()
             .oneshot(
@@ -607,7 +617,7 @@ mod tests {
         let (db, path) = seed_db_at();
         let pub_id = insert_persona(&path, "alice", "Shared", "shared-prompt", 1);
         let priv_id = insert_persona(&path, "bob", "Secret", "secret", 0);
-        let app = app_with(db);
+        let app = app_with(db).await;
 
         // 成功: 200 {persona, message}。応答 persona は自分の所有コピー（is_public=false）。
         let ok = app
@@ -752,7 +762,7 @@ mod tests {
         insert_user(&path, "u", "U"); // FakeAuth の user は "u"
         let mine = insert_persona(&path, "u", "Mine", "p", 0);
         let others = insert_persona(&path, "someone", "Theirs", "p2", 0);
-        let app = app_with(db);
+        let app = app_with(db).await;
 
         // 公開: 200 success:true・Node 文言。
         let (st, j) = send_post(
@@ -853,7 +863,7 @@ mod tests {
         insert_user(&path, "u", "U");
         let mine = insert_persona(&path, "u", "Mine", "p", 0);
         let others = insert_persona(&path, "other", "Theirs", "p2", 0);
-        let app = app_with(db.clone());
+        let app = app_with(db.clone()).await;
 
         // 適用: 200「…を適用しました。」・active が mine になる。
         let (st, j) = send_post(
@@ -867,7 +877,7 @@ mod tests {
         assert!(j["message"].as_str().unwrap().contains("適用しました"));
         assert_eq!(
             PersonaRepo::new(&db)
-                .active_persona_id(&scope("u"))
+                .active_persona_id(&UserScope::new(UserId::new("u"), BotId::new(TEST_BOT_ID)))
                 .await
                 .unwrap(),
             Some(mine)
@@ -891,7 +901,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert!(j["message"].as_str().unwrap().contains("デフォルト"));
         assert!(PersonaRepo::new(&db)
-            .active_persona_id(&scope("u"))
+            .active_persona_id(&UserScope::new(UserId::new("u"), BotId::new(TEST_BOT_ID)))
             .await
             .unwrap()
             .is_none());
@@ -905,6 +915,7 @@ mod tests {
     #[tokio::test]
     async fn route_requires_auth() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/api/personas")

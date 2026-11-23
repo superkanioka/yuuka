@@ -1,8 +1,9 @@
 <script lang="ts">
-	// 利用ガイド（旧 index.html #usage-overlay）。公開ルート・API 不要。
-	// App.svelte が /usage で本コンポーネントを描画する（.active は常時付与）。
-	import { goto } from "$lib/router";
-	import { Icon } from "$lib/components/ui";
+// 利用ガイド（旧 index.html #usage-overlay）。公開ルート・API 不要。
+// App.svelte が /usage で本コンポーネントを描画する（.active は常時付与）。
+
+import { Icon } from "$lib/components/ui";
+import { goto } from "$lib/router";
 </script>
 
 <div class="overlay active">
@@ -36,18 +37,24 @@
 					</li>
 					<li>
 						<strong>デフォルトBotの設定：</strong> 管理者登録後、Discord Developer Portal
-						で作成した Discord Bot トークンを登録します。
+						で作成した Discord Bot トークンを「管理者設定」で登録します。デフォルトBotはシステムの案内役で、Yuuka
+						の使い方や設定場所を案内し、利用申請などのシステム通知を送ります。タスクや予定などの個人データは扱いません。
+					</li>
+					<li>
+						<strong>自分の Bot を作る：</strong>
+						Bot 一覧の「新規作成」から、自分の Bot（パーソナル秘書・汎用モード）を作ります。タスク・予定・家計簿などはこの
+						Bot に記録されます。
 					</li>
 					<li>
 						<strong>一般ユーザー登録：</strong>
-						管理者が生成した「招待コード」を使用し、新規アカウントを作成します。
+						「sk-9 Accountでログイン」から sk-account でログインすると、初回ログイン時に Yuuka の利用者として登録されます。
 					</li>
 				</ul>
 			</div>
 
 			<div class="usage-section">
 				<h3>3. Discord での操作方法</h3>
-				<p>Bot にメンション、またはDMで話しかけて操作します。</p>
+				<p>自分の Bot にメンション、またはDMで話しかけて操作します。</p>
 				<ul>
 					<li>
 						<strong>タスク管理：</strong>
@@ -99,8 +106,8 @@
 						「明日9時に教えて」のような単発リマインドに加え、cron式による繰り返しリマインドをDMまたはチャンネルへ配信できます。
 					</li>
 					<li>
-						<strong>朝報・日報・週報：</strong>
-						天気・予定・ニュースをまとめた朝報や、活動サマリーの日報・週報を指定スケジュールで自動配信できます。
+						<strong>定期報告：</strong>
+						天気・ニュース・タスク・予定・支払い予定・家計・会話のトピックから内容を選び、朝報や日報のような報告に名前を付けて複数登録し、指定スケジュールで自動配信できます。
 					</li>
 					<li>
 						<strong>Webhook 連携：</strong>

@@ -50,10 +50,15 @@ impl SupervisedService for CronSupervised {
 ///
 /// 監督下 spawn は strangler カットオーバー時（Node cron 停止 → Rust cron 起動）にのみ行う。
 /// main は環境変数ゲートでこの登録を制御する（既定は無効＝Node が cron を所有・二重 writer 回避）。
+/// `reminder_cron` はリマインドエンジンの実行周期（config `REMINDER_CRON`）。
 #[must_use]
-pub fn build_supervised_services(ctx: &ServiceContext) -> Vec<Arc<dyn SupervisedService>> {
-    yuuka_services::build_services(ctx)
+pub fn build_supervised_services(
+    ctx: &ServiceContext,
+    reminder_cron: &str,
+) -> Vec<Arc<dyn SupervisedService>> {
+    yuuka_services::build_services(reminder_cron)
         .into_iter()
+        .chain(yuuka_services::build_optional_services(ctx))
         .map(|svc| Arc::new(CronSupervised::new(svc, ctx.clone())) as Arc<dyn SupervisedService>)
         .collect()
 }
@@ -91,21 +96,22 @@ mod tests {
 
     #[test]
     fn builds_all_services_with_cron_prefixed_names() {
-        let svcs = build_supervised_services(&ctx());
+        let svcs = build_supervised_services(&ctx(), "* * * * *");
         // 実装済み 10（reminder/todo-recurrence/payment-recurrence/birthday/clipboard/metrics/
-        // playbook-schedule/briefing/report/backup）。backup は deferred シームから live へ差し替え済み
-        // （実 Drive アップロードは BackupRunner ポート経由）で総数は据え置き。
+        // playbook-schedule/periodic_report/backup/google_calendar_sync）。backup・calendar sync の
+        // 実 Google 通信はそれぞれ BackupRunner / CalendarSyncRunner ポート経由。
         assert_eq!(svcs.len(), 10);
         let names: Vec<String> = svcs.iter().map(|s| s.name()).collect();
         assert!(names.iter().all(|n| n.starts_with("cron:")));
         assert!(names.contains(&"cron:reminder".to_owned()));
         assert!(names.contains(&"cron:metrics".to_owned()));
         assert!(names.contains(&"cron:backup".to_owned()));
+        assert!(names.contains(&"cron:google_calendar_sync".to_owned()));
     }
 
     #[test]
     fn adapter_name_is_prefixed() {
-        let svcs = yuuka_services::build_services(&ctx());
+        let svcs = yuuka_services::build_services("* * * * *");
         let first = svcs.into_iter().next().expect("at least one service");
         let name = first.name().to_owned();
         let adapter = CronSupervised::new(first, ctx());

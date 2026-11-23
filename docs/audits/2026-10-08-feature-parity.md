@@ -1,0 +1,168 @@
+# Node → Rust 機能差分・重複の棚卸し（2026-10-08）
+
+> 現在の対応状況は [2026-10-22の対応表](2026-10-22-feature-parity-status.md) を参照。以下の調査条件・未接続の記述は初回棚卸し時点の記録を含む。
+
+## 調査条件と結論
+
+旧Node実装のAPI **180組（HTTP method + path）**と、静的な会話ツール **85件**を列挙し、現行実装の入口と照合した。すべてに対応する入口がある。しかし、入口の存在は機能の同等性を意味しない。起動時の依存注入と処理内容を追うと、以下の **27項目の欠落・縮小・挙動後退**、**8項目の重複**が確認できる。件数は整理上の項目数であり、独立した原因の数ではない。
+
+- 旧版基準：Nodeソース撤去直前の `bb97bae5cb21a36fbddf6a700a7c76122d409b37`（`390df39^`）。以下の `旧 src/...` はこのコミットのファイルを指す。`git show bb97bae5:src/対象ファイル` で再確認できる。
+- 現行基準：`93ee446` に2026-10-08の作業ツリー変更を加えた状態。Googleカレンダー同期、家計更新ツール、PWA添付などの未コミット実装を含む。コミット済み・デプロイ済みとは区別する。
+- 対象：HTTP API、会話ツール、Discord、WebSocket、定期処理、通知、記憶、外部連携、設定、Svelte管理画面とVue PWA。
+- 方法：旧ソースの一覧抽出、現行登録箇所との対応付け、ハンドラ・サービス・起動時接続の静的確認。既存の「未実装」コメントだけでは判定していない。
+- 範囲の限界：実トークンを使う外部通信、本番稼働、ブラウザ操作、全入力組み合わせの実行検証は行っていない。これは全入口を対象にした静的棚卸しであり、未発見の差分がないことの証明ではない。
+- 調査中にもPWA関連ファイルが更新された。API・ツール対応表は調査開始時のコピーを基準にしており、作業中のPWA修正の完了判定には使わない。
+
+全件の入口対応表：
+
+- [HTTP API 180件](2026-10-08-http-route-coverage.tsv)
+- [会話ツール85件](2026-10-08-tool-coverage.tsv)
+
+「高」は通知・記録・共有・保護機能などの実用上の支障が大きい項目、「中」は一部動作・品質・設定の後退、「低」は表示・補助機能の後退を表す。
+
+## 確認済みの欠落・縮小・挙動後退
+
+### 起動時に実処理へ接続されていない機能
+
+| ID | 優先度 | 機能 | 旧Nodeの動作 → 現行の動作 | 根拠・復旧箇所 |
+|---|---|---|---|---|
+| R01 | 高 | Webhook受信後の処理一式 | 署名検証、リプレイ検出、キーワードフィルタ、ペイロード解釈、Discord通知、ToDo・リマインド化、受信履歴を実行していた。現在は200を返して空の処理を呼ぶ。管理画面の設定CRUDだけは残る。署名も読み取るだけで検証しない。ただし現在は通知などの副作用自体も起きない。 | 旧 `src/services/webhookProcessor.ts:110`。現行 `crates/yuuka-supervisor/src/main.rs:346` が `NullWebhookProcessor` を注入。`crates/yuuka-webhook/src/routes.rs:42,105`。 |
+| R02 | 高 | 朝報・日報・週報の「テスト配信」 | Webのテスト操作から実配信していた。現在は `NullDeliveryRunner` が常にfalseを返す。定期配信サービスが存在しても、テスト配信の経路には接続されていない。 | 旧 `src/server/routes/deliveryRoutes.ts`。現行 `crates/yuuka-supervisor/src/lib.rs:89` と `crates/yuuka-briefing/src/routes.rs:43`。 |
+| R03 | 高 | Bot共有招待DM | Webで共有招待を作ると承認・辞退ボタン付きDMを送っていた。現在はDB登録後のDM送信が常にfalse。共有データ自体の作成・一覧は残る。 | 旧 `src/server/routes/botRoutes.ts:441`。現行 `crates/yuuka-supervisor/src/lib.rs:92`、`crates/yuuka-orchestrator/src/share_routes.rs:40,54`。 |
+| R04 | 高 | Web経由のBot利用申請・承認結果DM | 申請時にオーナーへ、決定時に申請者へ通知していた。HTTPルートには `NullMemberDmSender` が設定されている。Discordのボタン経由では実DM senderが使われるので、入口によって通知の有無が違う。 | 旧 `src/services/memberRequest.ts:64,131`。現行 `crates/yuuka-supervisor/src/lib.rs:91`、`crates/yuuka-orchestrator/src/member_routes.rs:30,53`。Discord側は `crates/yuuka-discord/src/interaction.rs:119,158`。 |
+
+### 会話・記憶・生成処理
+
+| ID | 優先度 | 機能 | 旧Nodeの動作 → 現行の動作 | 根拠・復旧箇所 |
+|---|---|---|---|---|
+| R05 | 高 | ToDoの自動タグ付け | 追加やタイトル・説明変更後に補助LLMでタグを付け直していた。現在は自動タグ処理がなく、追加時は空タグ。それでもツール結果とプロンプトが「バックグラウンドで自動付与」と案内する。手動タグ編集は残る。**修正済み（#102）**：全作成経路・タイトル/説明の実変更をDBトリガーで予約し、本人の補助LLMで非同期付与する。由来を保存し、既存/明示タグを保護して自動タグだけ再生成。手動全削除で停止し、世代チェックで競合を防ぐ。[経路監査・決定・検証](2026-10-20-r05-todo-auto-tags.md)。 | 旧 `src/services/autoTagService.ts:87,129`、`src/functions/todoFunctions.ts`。現行 `crates/yuuka-todo/src/tools.rs:282,302`、`crates/yuuka-orchestrator/src/system_prompt.rs`。 |
+| R06 | 中 | ターンの事前計画・必要ツール選定 | **対応済み（#103）**。本編の FC ループの前に、能力で絞ったツールカタログだけを見せて手順・利用ツール・重さ（`weightMs`）を JSON で計画させ、計画を systemInstruction へ参考データとして入れる。旧 Node と同じく、ツールの宣言・実行はカタログ全体のまま絞らず、計画のツールは完了是正（mode=ANY）の `allowedFunctionNames` にだけ使う。時間切れ（4 秒）・不正な計画・カタログ外のツール名は計画なしで従来どおり。ツールが 1 つ以下のカタログは計画しない。秘書・汎用モードの全経路。計画できたターンを `plan_attempts` で数える。旧 Node との差は [ターンエンジン監査](2026-10-20-turn-engine.md)。 | 旧 `src/gemini.ts:883`、`src/services/turnPlanner.ts`。現行 `crates/yuuka-orchestrator/src/turn_plan.rs`、`crates/yuuka-orchestrator/src/engine.rs` の `ChatEngine::plan_turn`。 |
+| R07 | 中 | 重い処理の途中応答と後続配信 | **対応済み（#104）**。`TurnProcessor` の経路（Discord の秘書・レシート・ギルド・owner DM と、R09 で同じ経路になった WS）は、計画の推定が 8000ms 以上なら計画の直後に、そうでなくても 12 秒を過ぎたら途中応答を返して会話ログへ残す。本体は中断せずに続け、最終結果を `TurnDelivery::deliver_final` で 1 回配信する（失敗時と 180 秒の全体上限の超過時は定型文）。重い計画で途中応答へ回したターンを `async_predicted` で数える（R23 で対象外にした分）。PWA は従来の HTTP 202＋ポーリングのまま。 | 旧 `src/gemini.ts:901,946`。現行 `crates/yuuka-orchestrator/src/engine.rs` の `run_delivered_turn`、`crates/yuuka-discord/src/message_flow.rs` の `finish_reply`、`crates/yuuka-supervisor/src/ws.rs` の `WsDelivery`。 |
+| R08 | 中 | 返信元チェーンの文脈・想起への利用 | **対応済み（#105）**。返信先から Discord（受信チャンネル内の REST 取得）と会話ログ（`reply_to_msg_id`・同じ Bot と利用者またはギルド・チャンネル・リセット境界）の両方で遡り、メッセージ ID で重複を除いて時系列に並べ、最大 8 件・各 1200 文字を systemInstruction の参考データ節と想起クエリへ渡す。秘書・汎用モードの両方。アシスタント応答は入力へ紐づけて保存し、`log:<id>` を後の返信先として返す。 | 旧 `src/gemini.ts:1030,1406,1514`。現行 `crates/yuuka-orchestrator/src/message_log.rs` の `reply_chain`、`crates/yuuka-orchestrator/src/engine.rs` の `collect_reply_chain`・`merge_reply_chain`、`crates/yuuka-discord/src/message_flow.rs` の `resolve_reply_chain`。 |
+| R09 | 中 | デスクトップ/WSのボタン操作・メッセージ更新 | **対応済み（#106）**。旧版はWSの `interaction` を処理し、`update` や `push` を返していたが、移行後はinteractionフレームを無視し、返信のcomponentsも常に空だった。Discordのボタン判定を `interaction::decide_component` として共通化し、WSも同じDBポート・通知ポートで呼ぶ。返信のcomponentsをDiscord API JSONで送り、`update`（元のmessageId・本文更新・ボタン消去）と `push`（followup）を返す。押下は同じ接続へ実際に配信した最大128件のボタンに限り、IDのすり替えと再押下を拒否する。`TurnDelivery` を渡して `interim`/`push` を送る受け口も用意したが、実際に流れるのはR07（#104）の対応後。往復確認用の `DESKTOP_DEMO_COMPONENTS`（既定false）を追加。詳細は [R09監査](2026-10-20-ws-interactions.md)。 | 旧 `src/server/chatWebSocket.ts:174`、`src/services/componentInteractionService.ts`。現行 `crates/yuuka-supervisor/src/ws.rs`、`crates/yuuka-discord/src/interaction.rs`。 |
+| R10 | 中 | 朝報ニュースのLLM要約 | **対応済み（#107）**。RSSの配信元＋見出しを最大30件、ユーザー本人の設定モデルへ既存の補助生成経路で渡し、日本語で3～5件に要約する。キー未設定・復号失敗・LLM障害・空応答時は先頭5件のタイトル列挙へ縮退し、朝報全体を維持する。 | 旧 `src/services/briefingService.ts:221`。現行 `crates/yuuka-briefing/src/service.rs`、`crates/yuuka-supervisor/src/webhook.rs`。 |
+| R11 | 中 | 日報・週報のLLMまとめ | 活動・会話サンプルなどから自然文を生成し、失敗時のみ生データに戻していた。**修正済み（#108）**：旧 Node と同じ直近24時間/7日の活動（タスクのタグ・優先度、予定、支払い期日、カテゴリ別支出を含む）と会話素材を使い、日本語800文字以内の要約を指示する。会話は本人・同じBotのDM限定、最新40件からユーザー発言を最大20件・各100文字。既存 `GeminiAuxText` を、朝報ニュース要約（R10）・Webhook と共通の `yuuka_core::aux_text::AuxTextGenerator`（`ServiceContext` / `NotifierDeliveryRunner` の `aux_text`）経由で定時/テスト配信へ注入し、本人のキー・選択モデルを利用する。キー無し・生成失敗・空白応答・要約素材取得失敗時は既存の生データ本文/集計フィールド/送信先を維持する。本文4000文字上限。 | 旧 `src/services/reportService.ts:241`。現行 `crates/yuuka-services/src/report.rs`・`context.rs`・`delivery.rs`、`crates/yuuka-core/src/aux_text.rs`、`crates/yuuka-supervisor/src/main.rs`・`webhook.rs`。`report.rs` に生成成功/失敗/空応答、会話スコープ・件数・文字数、期間、出力上限の回帰テストを追加（非developでの `cargo test/build/run` は `CLAUDE.md` により禁止のため未実行。`cargo check --all-targets` でテストコードも検査）。 |
+| R12 | 中 | 検索スキル資料のプロンプト注入 | 資料が存在する環境では検索先・巡回方針を読み込んで注入していた。Rustには読み込み・埋め込み・注入がない。検索ツール自体は残る。旧Dockerイメージで資料が同梱されていたかは、この静的比較では確定していない。**修正済み（#109）**：旧 Node イメージは `COPY docs ./docs` で作業ディレクトリへ資料を同梱しており、本番でも常に注入されていたため復旧した。現行イメージは `docs/` を同梱しないので `include_str!` でビルド時に埋め込み、旧版と同じ位置（ファクトチェックと機能一覧の間）へ同じ見出し・前置きで注入する（Dockerfile の rust-builder 段に `COPY docs/skills` を追加）。資料内の存在しない `readCodeFile` への参照は削除した。 | 旧 `src/gemini.ts:80,223`。現行 `crates/yuuka-orchestrator/src/system_prompt.rs:142`、`docs/skills/search_skills.md`。 |
+| R13 | 中 | 会話からタイムラインへ写真・動画を保存 | `discord_attachment_url` / `discord_attachment_mime` を受け取り保存していた。**修正済み（#110）**：Discord・PWA・WebSocketの現在の本人添付をindexで選択し、本体と記録をV29で原子的に保存する。再試行はuser/Bot/送信元/添付で冪等、明示的再保存は別キー。元の添付順・既存API/UIを維持し、配信認可・削除・実体バックアップにも対応。任意URL取得は許可しない。詳細は [R13監査](2026-10-20-r13-attachments-timeline.md)。 | 旧 `src/functions/timelineFunctions.ts:195`。現行 `crates/yuuka-timeline/src/tools.rs:201`、`crates/yuuka-timeline/src/media.rs`。 |
+
+### 家計・通知・定期処理
+
+| ID | 優先度 | 機能 | 旧Nodeの動作 → 現行の動作 | 根拠・復旧箇所 |
+|---|---|---|---|---|
+| R14 | 高 | 既存支出を使う支払い予定の消込 | `settlePlannedPayment(plan_id, expense_id)` で既存の支出に紐付けられた。現在は `expense_id` を宣言・処理せず、常に新しい支出を作る。先にレシート等で記帳した支払いを消し込むと二重計上になり得る。 | 旧 `src/functions/financeFunctions.ts:952`。現行 `crates/yuuka-finance/src/tools.rs:1072,1111`。 |
+| R15 | 高 | 消込・キャンセル時の関連リマインド停止 | 支払い予定の消込または取消で `linked_reminder_id` の通知を止めていた。現在は連動取消をしない。支払済み・取消済みの予定の通知が残り得る。関連ToDoの消込時完了は実装済み。 | 旧 `src/functions/financeFunctions.ts:1018,1108`。現行 `crates/yuuka-finance/src/tools.rs:1111,1178`、`crates/yuuka-finance/src/repo.rs` の `settle_plan` / `cancel_plan`。 |
+| R16 | 中 | 支出記録後の予算消化率・消込候補提示 | `addExpense` が `budget_usage` と `settlement_candidates` を返し、ユーザーへの確認につなげていた。現在は記帳結果だけ。個別の予算照会・候補検索ツールは残るが、自動で返す経路がない。 | 旧 `src/functions/financeFunctions.ts:513,572`。現行 `crates/yuuka-finance/src/tools.rs:303`。 |
+| R17 | 高 | ユーザー既定の通知先 | 送信先省略時にユーザー設定のチャンネル/DMを解決していた。現在のservices→Discord変換は `NotifyTarget::Default` をDMに固定。ToDo期限・予定・誕生日などの既定通知先が設定に従わない。`addReminder` もユーザー設定の宛先を保存しない。明示チャンネルIDを持つ通知は別。 | 旧 `src/services/notifier.ts:78`、`src/functions/reminderFunctions.ts:246`。現行 `crates/yuuka-discord/src/notify_bridge.rs:22`、`crates/yuuka-reminder/src/tools.rs:262`、`crates/yuuka-services/src/reminder.rs:100`。 |
+| R18 | 中 | 過去日時のリマインド登録保護 | 単発の過去日時を拒否し、繰り返しの場合は次回時刻に補正していた。現在は日時の形式を確認するだけで保存するため、次の走査で即時通知される可能性がある。 | 旧 `src/functions/reminderFunctions.ts:230`。現行 `crates/yuuka-reminder/src/tools.rs:244`～登録処理。 |
+| R19 | 中 | cron式の厳密な登録時検証 | `cron-parser` / `node-cron` で検証していた。現在はToDo・支払い予定・リマインド・配信設定の一部が「空白区切り5個」だけ、PlaybookのWeb登録は非空だけ。保存成功後に実行側で不正式として停止・スキップする状態が起こり得る。 | 旧 `src/functions/todoFunctions.ts:105`、`financeFunctions.ts:894`、`reminderFunctions.ts:220`、`briefingFunctions.ts:120,222`、`src/services/playbookScheduleService.ts:77`。現行各 `tools.rs` の `is_valid_cron_basic`、`crates/yuuka-playbook/src/routes.rs:144`。 |
+| R20 | 中 | Botの名前・アバターの定期同期 | 稼働中のBotプロフィールを1時間ごとにDBへ同期していた。現在はReady時と手動同期の経路があり、定期同期タイマーはない。長時間接続中の変更反映が遅れる。**修正済み（#117）**：テナントの poll ループに1時間ごとの定期同期を戻した。READY 時と同じ同期処理を使い、テナント停止でタイマーも止まる。稼働中の変更は USER_UPDATE で保持し、次の周期で DB に反映する。周期・未接続時の抑止・停止後の停止を確かめる回帰テストを追加。 | 旧 `src/bot.ts:195,220,574`。現行 `crates/yuuka-discord/src/tenant.rs:235`、`crates/yuuka-supervisor/src/tenants.rs`。 |
+| R21 | 低 | Botが保持する一般ロールへのメンション検出 | 旧実装はdiscord.jsの `mentions.has(botClient.user)` を使用。現在は直接・everyone/here・Bot統合ロールに対応するが、Botへ手動付与した一般ロールを対象とするメンションは判定しない。 | 旧 `src/bot.ts` の `mentions.has`。現行 `crates/yuuka-discord/src/message_flow.rs:767`。一般ロールに対する実Discordイベントでの比較は未実施。 |
+
+### 観測・スコープ・外部通信・設定
+
+| ID | 優先度 | 機能 | 旧Nodeの動作 → 現行の動作 | 根拠・復旧箇所 |
+|---|---|---|---|---|
+| R22 | 中 | ツール実行実績の永続保存 | ツール名・引数ダイジェスト・成否・所要時間を `tool_outcomes` へ保存していた。現在はテーブルはあるがRustの実行処理に書き込みがない。操作履歴 `ActionRecorder` は別物で、成否・所要時間の永続記録を代替しない。 | 旧 `src/gemini.ts:724`、`src/db/toolOutcomeRepo.ts`。現行 `crates/yuuka-gemini/src/fc_loop.rs:237`、`crates/yuuka-db/migrations/V17__baseline.sql`。 |
+| R23 | 中 | 実利用メトリクスの計測 | 会話数、ツール数、想起ヒット、応答時間などを更新していた。現在はレジストリと定期ログはあるが、実処理から増加・記録しない。更新呼び出しはレジストリのテスト内にしか見つからない。**修正済み（#120）**：記録先のトレイト `yuuka_core::MetricsSink` を新設し、`MetricsRegistry` に実装した。supervisor が作る1つのレジストリを `ChatEngine::with_metrics` で注入し、cron の定期ログと共有させた。秘書・汎用モードのターンで、旧版と同じ時点に次を記録する：`messages` と成功時の `response` レイテンシ、FC ループの dispatch ごとの `tool_calls`、想起の `assemble` レイテンシと `recall_hit`/`recall_empty`。`plan_attempts`/`async_predicted` は、ターンプランナーと非同期配信が Rust では縮退シームのままのため対象外。実ターンでカウンタが増える回帰テストを追加（`yuuka-supervisor/tests/runtime_metrics.rs` ほか）。 | 旧 `src/gemini.ts:342,724,879,929`、`src/services/metrics.ts`。現行 `crates/yuuka-services/src/metrics.rs:6,35,42`。 |
+| R24 | 高 | 日報・週報の支払い予定のBot別分離 | 旧SQLは `user_id AND bot_id`。Rustの日報集計は `user_id` だけで、別Botの支払い予定が混ざる。同じユーザー内のBot分離の後退であり、別ユーザーへの漏洩を確認したわけではない。「bot_id列がない」という現行コメントは、V17の実スキーマと矛盾する。**修正済み（#121）**：支払い予定の集計を `user_id AND bot_id` に戻し、誤ったコメントを直した。別Botの支払い予定が混ざらない回帰テストを追加。 | 旧 `src/services/reportService.ts:110`。現行 `crates/yuuka-services/src/report.rs:240`付近、`crates/yuuka-db/migrations/V17__baseline.sql:169`。 |
+| R25 | 高 | RSS取得直前のDNS解決を含むSSRF検査 | Nodeは取得直前に `assertSafeOutboundUrl` でDNS解決先を確認していた。RustはURL文字列・IPリテラルの簡易検査だけで、ドメインを公開扱いにして通常のHTTPクライアントで取得する。内部IPへ解決されるホストの拒否機能が失われている。 | 旧 `src/services/briefingService.ts:132`、`src/utils/ssrfGuard.ts:167`。現行 `crates/yuuka-briefing/src/service.rs:200`、`crates/yuuka-briefing/src/tools.rs:46`。 |
+| R26 | 中 | 運用設定の反映 | `REMINDER_CRON` は読まれて画面表示に使われるが実行周期は毎分固定。`SYNAPSE_RECALL_K`・`SYNAPSE_RECENCY_WEIGHT`・`SYNAPSE_RECENCY_HALFLIFE_HOURS` は定数化。`DESKTOP_TOKEN_TTL_DAYS` は90日、`DESKTOP_DEVICE_CODE_TTL_SEC` は600秒固定。旧設定を渡しても調整できない。計画・返信関連の設定消失はR06～R08に含む。**修正済み（#123）**：6項目を旧Nodeと同じキー名・既定値で `config.yaml`／環境変数から読み、実処理へ反映した（`REMINDER_CRON` はリマインドエンジンの実行周期、`SYNAPSE_*` はL2想起、`DESKTOP_*` はトークン検証・デバイスフローの期限と応答の `expires_in`）。不正値（壊れたcron式、数値以外・負数、取得件数やTTLの0、TTLの上限超え）は起動を止めず、警告ログを出して既定値に戻す。設定の反映と既定値の維持を確かめる回帰テストを追加し、設定例を更新した。 | 旧 `src/config.ts:83,95,138,144,147,168,174`、`src/services/reminderEngine.ts:221`。現行 `crates/yuuka-services/src/reminder.rs:34`、`crates/yuuka-orchestrator/src/synapse_recall.rs:19`、`crates/yuuka-auth/src/lib.rs:42`、`crates/yuuka-auth/src/device_auth.rs:37`。 |
+| R27 | 低 | Googleサイト所有権確認metaの注入 | Nodeは設定値をHTMLのプレースホルダーへ差し込んでいた。Rustでは設定とプレースホルダーは残るが配信時に置換しない。 | 旧 `src/server.ts:230`。現行 `crates/yuuka-core/src/config.rs:37`、`crates/yuuka-web/src/static_files.rs:25`、`frontend/index.html:7`。 |
+
+## 重複している機能・実装
+
+重複があることだけを理由に削除するべきではない。用途別の画面・通信方式として必要なものと、同じ仕様を複数箇所で保守するため不一致を生むものがある。
+
+| ID | 重複箇所 | 現状・影響 | 整理の方向 |
+|---|---|---|---|
+| D01 | Svelte管理画面とVue PWAのタスク・予定・家計・ノート・設定 | **対応済み（#125）**。両UIを残し、領域ごとの役割・機能差と業務ルールの置き場所を[フロント契約監査](2026-10-20-frontend-contracts.md)に記録した。同じ業務データを別の画面で操作する。両方とも稼働する用途があり、PWAは機能を絞った個人画面。`frontend/src/routes/BotShell.svelte:36` と `clients/pwa/src/router.ts`。 | UIを残すなら業務ルールを共有し、機能差を明示する。画面が2つあるだけで不要とはしない。 |
+| D02 | ドメインHTTP API、`/api/client/*`、LLMツール | **対応済み（#126）**。ToDo・家計・ノートの登録・更新・取消を各ドメインの `service.rs`（`TodoService`・`FinanceService`・`ContextNoteService`）に集め、予定は `ScheduleService`（D03）に必須検証を移した。3つの入口は入力形式の解釈と応答形式への変換だけを持つ。重複APIは廃止せず共存とした（#161 のバックエンド側・[詳細記録](2026-10-20-domain-services.md)）。以下は調査時点の記録：同じToDo・家計・ノートに3つの入口がある。repoは共有するものが多いが、入力検証・既定値・レスポンスが別実装。例：`yuuka-todo/src/routes.rs`、`yuuka-client-api/src/routes.rs` の `todos_add`、`yuuka-todo/src/tools.rs`。 | repoだけでなく、登録・更新・取消の業務処理を共通サービスに集約する。 |
+| D03 | 予定登録・削除の経路 | PWA登録は `addSchedule` ツールを呼ぶ一方、管理APIは `ScheduleRepo::add/delete` を直接呼ぶ。作業中のGoogle同期はツール側にあるため、管理画面経由では同じ外部反映を行わない。旧NodeでもHTTPとツールの経路差があったため、新たな移植欠落とは数えない。**修正済み（#127）**：予定の登録・削除（Google同期込み）を `yuuka-schedule/src/service.rs` の `ScheduleService` にまとめ、ツール・管理API（`routes_with_calendar` で同期先を配線）・PWA の `calendar_add` をすべてそこへ通した。管理APIからの登録・削除が Google に反映される回帰テストを追加。 | Google同期を含む予定サービスを全入口から呼ぶ。根拠：`yuuka-client-api/src/routes.rs` の `calendar_add`、`yuuka-schedule/src/routes.rs:76`、`yuuka-schedule/src/tools.rs`。 |
+| D04 | cron式の検証 | `todo/finance/reminder/briefing` に簡易検証が重複し、実行時だけ `yuuka-services/src/cron_util.rs` が本物のパーサを使う。R19の原因。 | 循環依存を作らない共通層に検証・次回時刻計算を移し、登録時と実行時を揃える。 |
+| D05 | 日時の解釈・保存形式変換 | `yuuka-reminder/src/datetime.rs`、`yuuka-schedule/src/datetime.rs`、`yuuka-client-api` 内の日時変換、`yuuka-services/src/cron_util.rs` が並存。入力ISO、DBローカル時刻、PWA向けUTCという用途差もある。 | 用途差を保った名前付き関数として共通化し、受理形式・オフセットの差を管理する。 |
+| D06 | 外向きURL/IPのSSRF検査 | browser、MCP、briefingが個別実装。briefingの検査だけDNS確認がない（R25）。`yuuka-browser/src/ssrf.rs`、`yuuka-mcp/src/http_client.rs`、`yuuka-briefing/src/tools.rs`。 | 通信直前の検査を共有する。URL登録時の簡易検査と通信時検査を区別する。 |
+| D07 | API型・契約 | **対応済み（#131）**。管理画面の `types.ts` は Rust DTO がある契約を生成型から作り、i64 の表現差だけを `wire.ts` の `JsonWire<T>` で変換する。PWA は別契約として契約テストで固定した。Rust DTO＋ts-rs生成型、管理画面の手書き `frontend/src/lib/api/types.ts`、PWAの `api/contracts.ts` / `api/models.ts` が並存。管理画面では生成型からのimportが見つからず、生成だけではUIとの型ずれを検出できない。PWAは別wire契約なので単純に同一型にできない。 | 同じwire契約の型は生成物を利用し、PWA用viewは明示的な変換と契約管理を行う。`xtask/src/main.rs` に生成・差分比較処理あり。 |
+| D08 | レシート読み取りの2つのワークフロー | 管理画面の `/api/expenses/upload-receipt` は秘書ターンに渡す経路、PWAの `/api/client/finance/receipt` は登録前の下書き抽出。目的と保存のタイミングが違う。`yuuka-finance/src/routes.rs`、`yuuka-client-api/src/routes.rs` の `finance_receipt`、`yuuka-supervisor/src/main.rs` の `ReceiptParserAdapter`。 | OCR抽出の共通化は可能だが、下書きと実行の違いは維持し、同じ「読み取り」表示で副作用を混同させない。 |
+
+## 設計上の変更・縮小（復旧要否を判断する項目）
+
+| 項目 | 差分と影響 | 根拠 |
+|---|---|---|
+| 操作履歴のRedis保存 | NodeはRedisを通常経路、メモリをフォールバックにしていた。Rustの `ActionRecorder` はメモリのみ。取得・マクロ化機能はあるが、アプリ再起動を跨ぐ短期履歴の保持を失う。**仕様として受容（#133）**：TTL 2時間の揮発データで、本番 Redis も永続化なし（`deploy/prod/redis.conf` の `save ""`・`appendonly no`）のため、Node でも Redis 再起動で消えていた。差はアプリ再起動を跨ぐ直近2時間ぶんだけ。用途は「今の操作を覚えておいて」直後のマクロ化で、再起動を跨いで残す必要は低い。 | 旧 `src/services/actionRecorder.ts:85,122`、現行 `crates/yuuka-core/src/action_history.rs:121`。 |
+| レート制限カウンタのRedis共有 | NodeのTTL付きRedisカウンタがRustでは `InMemoryRateLimiter`。単一プロセス内の制限はあるが、再起動・複数プロセスでのカウンタ共有はない。**仕様として受容（#134）**：Discord ゲートウェイは `YUUKA_RUST_DISCORD` で単一プロセスに限られ、本番も1コンテナなので複数プロセス共有は不要。再起動で窓がリセットされるが、ユーザーが再起動を起こす手段はなく迂回経路にならない。再確認で、管理画面のレシート読み取りだけが別の `InMemoryRateLimiter` を作っており、Discord/PWA とユーザー単位の窓を共有していなかった（Node は全経路で共通の窓）。`crates/yuuka-supervisor/src/main.rs` で共有インスタンスを渡すよう修正した。 | 旧 `src/services/botRateLimit.ts:63`、現行 `crates/yuuka-orchestrator/src/discord_ports.rs:319`。 |
+| 会話履歴のRedisキャッシュ | RustはSQLiteを直接読む。履歴が失われたわけではないので機能欠落には数えない。性能上の違い。**仕様として受容（#135）**：Node も Redis ミス時は SQLite から再構築しており、Rust は「常にキャッシュミス」と同じ結果になる。読み出しは `(user_id, bot_id, source)` 等の索引に乗る `ORDER BY id DESC LIMIT 15/30` で、1ターンあたりの負荷は小さい。 | 旧 `src/db/messageLogRepo.ts`、現行 `crates/yuuka-orchestrator/src/message_log.rs:3`。 |
+| `runBriefingNow` の配信先 | Nodeは設定された通知先へ送る。Rustは呼び出した会話へのインラインEmbedとして返す。定期朝報とは独立した挙動変更で、設定先への手動配信は代替できない。**修正済み（#136）**：`deliver` 引数を追加した。既定（省略/false）は従来どおり会話へインラインEmbedで表示し、`deliver: true` のときは `/api/briefing/test`（#165）と同じ `NotifierDeliveryRunner` で設定した配信先へテスト配信する（Nodeの旧動作）。ツール説明とsystem_promptに使い分けを書き、配信先へ届く・送信失敗・未設定・既定はインラインのままの回帰テストを追加。 | 旧 `src/functions/briefingFunctions.ts`、現行 `crates/yuuka-briefing/src/tools.rs:365`。 |
+| 定期配信の見た目 | NodeのEmbed通知に対し、Rustのservices通知ポートはtext中心。朝報・日報の装飾や構造が簡略化されていた。**修正済み（#137）**：通知ポートへ provider 中立な Embed を追加し、朝報はタイトル・天気/ニュースフィールド・スカイブルー色・案内文・提供元フッタ、日報/週報はタイトル・生データ本文・完了/持ち越し/収支のインラインフィールド・ブルー色・フッタを復旧した。定期配信とWebのテスト配信は同じ生成経路を使う。 | 旧 `src/services/reportService.ts` / `briefingService.ts`、現行 `crates/yuuka-services/src/notifier.rs`・`briefing.rs`・`report.rs`、`crates/yuuka-discord/src/notify_bridge.rs`。 |
+
+## 失われた機能と誤判定しないもの
+
+- **会話ツールの入口は85件すべて存在**。現行で増えた `updateExpense` / `deleteExpense` を合わせ、検出した静的ツール名は87件。MCPの動的ツールはこの件数に含めない。
+- **Googleカレンダー同期**は作業ツリーに追加・削除・取り込み・定期取り込みの実装と起動時接続がある。`crates/yuuka-schedule/src/google_sync.rs`、`tools.rs`、`crates/yuuka-services/src/calendar_sync.rs`、`crates/yuuka-supervisor/src/main.rs`。未コミットなのでデプロイ済みとは扱わない。管理APIの経路差はD03（#127 で解消）。
+- **コンテキストノートとカレンダー情報のプロンプト注入、シナプス想起・抽出**は接続済み。engine冒頭の古い「空移植」コメントは現状と一致しない。返信チェーンはR08として残る。
+- **MCP探索・動的ツール実行、Google OAuth・Driveバックアップ、レシート解析、Bot起動停止**には実クライアントの接続経路がある。資格情報なしでNullに落ちること自体を未実装とは判定しない。
+- **通常のDiscord会話、音声・画像入力、共有・申請ボタン処理、登録コードDM**は実装あり。Web招待・申請のDMはR03/R04、WSボタンはR09として区別する。
+- **ToDo階層・進捗・手動タグ・優先度・ルーチン、支払い予定・予算・候補検索、タイムラインの家計/ToDo連動、Playbook定期実行、朝報/日報/バックアップの定期実行**は実装あり。古いコメントに残る一括「未移植」は根拠にしない。
+- **会話要約ツール**は旧版もログを返し、LLM本体にまとめさせる方式。Rust側が独立した要約LLMを呼ばないことは欠落ではない。
+- **PWAの会話分離、共有ノートのタイトル保存、ToDoのlist保存、レシート下書き抽出**は現行の追加・改善が含まれる。
+- **デスクトップの自動起動・トレイ・ホットキー等のTODO**はクライアント自体の未完了項目。Nodeバックエンドから失われた機能と断定する根拠がないので今回の後退件数に含めない。
+- **WASMプラグイン・ローカルSLM・ニューラル埋め込み等の設計案**を、Node版で稼働していた機能として数えない。
+
+## 確認した機能群
+
+| 機能群 | 入口・主経路 | 残る主な差分 |
+|---|---|---|
+| ログイン・招待・セッション・デバイス認証 | HTTP対応あり、発行/検証の接続あり | デスクトップTTL設定（R26） |
+| Bot管理・共有・利用申請・ペルソナ | HTTP対応あり、Discord側も実装あり | Web DM（R03/R04）、プロフィール同期（R20） |
+| 秘書会話・汎用Bot・Discord/WS/PWA | engineへの接続あり | 計画・途中応答・返信チェーン・WSボタン（R06～R09） |
+| ToDo・階層・ガント・タグ・ルーチン | ツール15件、HTTP対応あり | 自動タグは復旧（R05の詳細記録を参照）、cron（R19） |
+| 予定・Google Calendar | ツール3件、HTTP対応あり、作業中の同期あり | 経路重複（D03） |
+| リマインド・期限通知・誕生日 | ツール3件、定期サービスあり | 通知先・過去日時・cron（R17～R19） |
+| 家計・予算・支払い予定 | 旧ツール14件に更新/削除追加、HTTP対応あり | 消込・連動取消・補足結果（R14～R16） |
+| タイムライン・当日計画・メディア | ツール4件、HTTP対応あり。R13本人添付保存・配信認可・実体バックアップ対応済み | — |
+| 個人ノート・クリップボード・連絡先 | ツール3+3+5件、HTTP対応あり | 今回の比較では主要機能の欠落を確認せず |
+| 汎用Botノート等 | ツール9件、HTTP対応あり | 今回の比較では主要機能の欠落を確認せず |
+| Playbook・操作履歴 | ツール5件、HTTP/定期処理あり | cron（R19）、履歴のメモリ化 |
+| 朝報・日報・週報 | ツール4件、定期処理あり | 手動テスト・集計分離（R02/R24）。朝報ニュース要約はR10（#107）、日報/週報のLLM生成はR11（#108）で復旧済み。 |
+| Webhook | HTTP対応あり、管理CRUDあり | 実受信処理の全面未接続（R01） |
+| ブラウザ・資格情報・チャート・リッチ返信 | ツール9+5+1+1件、実装接続あり | 個々の外部サイト動作は未検証、WS componentsはR09 |
+| MCP・Google認可・バックアップ | HTTPと実クライアントの接続あり | 実サービスへの通信成功は未検証 |
+| 記憶・過去会話検索/要約 | シナプスと要約ツール1件あり | 返信文脈・実績保存・検索資料・設定（R08/R12/R22/R26） |
+| 運用・計測・静的配信 | 起動監督・メトリクス器・配信あり | 計測更新、設定、所有権meta（R23/R26/R27） |
+
+## 修正の推奨順
+
+1. R14/R15/R17/R24：記録の二重計上、誤通知、Bot間のデータ混在を防ぐ。
+2. R01/R02/R03/R04：存在する画面・APIが実処理を呼べるよう接続する。
+3. R25/R19/R18：外部通信と登録時の保護・入力検証を戻す。
+4. R05/R08/R09/R11：ユーザーに約束している会話・自動処理を復旧する。
+5. 残る生成補助・運用設定・計測を戻し、D02/D03/D04/D06/D07の共通化で経路間の再発を抑える。
+
+本調査では機能修正・削除・デプロイは行っていない。対応表とこの報告書を追加した。
+
+## 対応状況
+
+| ID | 状態 | 内容 |
+|---|---|---|
+| R06 | 対応済み（#103） | `crates/yuuka-orchestrator/src/turn_plan.rs` を新設し、秘書・汎用モードの本編の前に能力で絞ったカタログから計画を立てる。計画節の注入、完了是正の許可リスト（`TurnPlan::correction_tools`）、失敗時のデグレード、ツール 1 つ以下のカタログでは計画しないこと、`plan_attempts` の記録。宣言は絞らない（旧 Node と同じ）。詳細は [ターンエンジン監査](2026-10-20-turn-engine.md)。 |
+| R07 | 対応済み（#104） | `ChatEngine` の `TurnProcessor` 各メソッドが `delivery` を使う（`run_delivered_turn`）。予測（8000ms 以上）と実行時（12 秒）の切り替え、途中応答の保存、最終結果の 1 回配信、失敗時と 180 秒超過時の定型文、`async_predicted` の記録。WS（R09）では interim → `done(deferred:true)` → `push` の順。詳細は [ターンエンジン監査](2026-10-20-turn-engine.md)。 |
+| R08 | 対応済み（#105） | 会話ログ（`message_log::reply_chain`）と Discord（`message_flow::resolve_reply_chain`）の返信元チェーンを、メッセージ ID で重複を除いて時系列に合わせ（`merge_reply_chain`）、systemInstruction と想起クエリへ渡す。応答を入力へ紐づけて保存し（`add_linked_assistant_reply`）、`TurnReply.message_id` に `log:<id>` を返す。詳細は [ターンエンジン監査](2026-10-20-turn-engine.md)。 |
+| R10 | 対応済み（#107） | 補助生成ポート（#108 で日報・週報・Webhook と共通の `yuuka_core::aux_text::AuxTextGenerator` に統一）を朝報の手動表示・テスト配信・定期配信へ共通接続し、supervisor から既存 `GeminiClient::generate_aux`（ユーザー本人のキー・設定モデル、60秒タイムアウト、最大2リトライ）を注入した。旧Nodeと同じ最大30件の入力・日本語3～5件プロンプト・1024文字出力上限を維持し、補助生成を利用できない全ケースでは先頭5見出しへフォールバックする。 |
+| R09 | 対応済み（#106） | `crates/yuuka-discord/src/interaction.rs` のボタン判定を Discord REST に依存しない `decide_component`／`ComponentInteractionDeps` に切り出し、`crates/yuuka-supervisor/src/ws.rs` の `interaction` フレームから呼ぶ。supervisor は `ws_routes_with_interactions` で Discord と同じ `DbMembership`・`DbBotDirectory`・Messenger（申請 DM）を注入する。WS は components を Discord API JSON で送り、`update`／`push` を返す。接続内で配信したボタンだけを受け付け、偽装・再押下は `error`。`TurnReply.message_id` を追加し、エンジンが保存済みログ ID を返す場合は `done.messageId` に使う（値を入れるのは R07/R08）。`interim`/`push` の途中応答・後続配信は R07（#104）の対応後に流れる。往復確認用 `DESKTOP_DEMO_COMPONENTS`（既定 false）を `crates/yuuka-core/src/config.rs` に追加。詳細は [R09監査](2026-10-20-ws-interactions.md)。 |
+| R25 / D06 | 対応済み（#122 / #130） | R25 は #156（`893d792`）で RSS の DNS 解決先と各リダイレクト先の検査を復旧済み。D06 は `yuuka-outbound` へ browser / MCP / briefing の検査を集約し、登録時は #184 対応で `RegistrationPolicy::PublicHttp` に変更し、URL 正規化後に通信時と同じ内部/予約 IP 範囲を拒否する（DNS は通信時だけ解決）。DNS の全件検査・都度再検査・日本語エラー・RSS の最大5回の各ホップ検査を維持した。責務・全通信経路・既存の TOCTOU / redirect の制約・回帰確認は [詳細記録](2026-10-20-d06-ssrf-common.md) を参照。 |
+| D08 | 対応済み（#132） | レシート専用入口の OCR を明細＋税込合計の抽出に共通化し、PWA は単一ドラフトへ変換する。Discord／管理画面の秘書ターンと PWA の手動登録タイミングは維持。既存 addExpense／repo に receipt_ocr の保存を復旧した。仕様の承認手順との差、入口・検証・キー・スコープ・再送・失敗・副作用・回帰確認は [D08 個別監査](2026-10-20-d08-receipt-common.md) を参照。migration なし。 |
+| D02 | 対応済み（#126） | ToDo・家計・ノートの書き込みを `crates/yuuka-{todo,finance,personal}/src/service.rs` に集め、管理画面の `/api/*`・PWA の `/api/client/*`・会話ツールの3入口をそこへ通した。失敗は共通の `yuuka_web::DomainError`（入力不正／DB）で返し、各入口が従来の応答形式（`{success:false,message}`・`{message}`・ツールの `{success:false}`）へ変換する。予定は D03 の `ScheduleService` に必須検証を移した。PWA の共有ノートは orchestrator の別実装をやめて `ContextNoteService` に統合し、ノートの上限は全入口で UTF-16 で数える。家計の金額は管理画面の符号付き調整と利用者の取引登録（1円以上）をサービスの2メソッドで区別した。#161 の重複APIはすべて共存（廃止・非推奨なし）。入口ごとの差・振る舞いの変化・対象外（支払い予定・予算上限など）・回帰確認は [D02 個別監査](2026-10-20-domain-services.md) を参照。migration なし。 |
+| R19 / D04 | 対応済み（#116 / #128） | cron 式ユーティリティを `yuuka-services` から循環依存のない `crates/yuuka-core/src/cron_util.rs` へ移し、登録時検証 `cron_util::is_valid` を追加した。ToDo・支払い予定・リマインド・朝報/日報週報設定のツールと HTTP（`POST /api/tasks/add`・`POST /api/expenses/plans/add`・`POST /api/reminders/add` を含む）、Playbook スケジュールのWeb登録は、実行側と同じ croner parser で検証する（HTTP の不正式は 400、空の repeat_rule は単発扱い）。範囲外の値・発火日が実在しない式（例：`0 0 30 2 *`）は保存しない。Playbook は Node と同じく 400「無効なcron式です。」を返す。各ドメインに 5 フィールドだが不正な式の回帰テストを追加した。 |
+| D05 | 対応済み（#129） | 日時の解釈・保存形式変換を `crates/yuuka-core/src/datetime.rs` に集め、`yuuka-reminder/src/datetime.rs`・`yuuka-schedule/src/datetime.rs`・`yuuka-client-api` の日時変換・`cron_util::to_db_datetime` を置き換えた。用途差は関数名で残した：リマインド入力 `input_to_db_local`（オフセット付きはサーバーのローカル TZ へ換算・Node `toDbDateTime` パリティ）、予定入力 `input_to_db_jst`（JST 固定へ換算）、PWA の `datetime-local` 入力 `browser_local_to_db`（`T` 区切りのみ受理）、PWA 向け出力 `db_to_utc_iso`、実行時の時刻 `local_to_db`。前 2 つの受理形式（日付のみ／`T`・空白区切り／秒・小数秒は任意／RFC 3339）は同じ parser に揃えた。挙動は変えていない（本番は `TZ=Asia/Tokyo` なので Local と JST 固定は同じ結果になる）。対象外として残る個別変換：`yuuka-google/src/http.rs` の Google API ⇔ ローカル暦変換、`yuuka-services` の `playbook_schedule.rs` / `backup.rs` の DB 文字列パース。 |
+| X01 | 仕様として受容（#133） | 操作履歴はメモリ保持のまま。理由は「設計上の変更・縮小」表を参照。 |
+| X02 | 仕様として受容（#134）＋一部修正 | 複数プロセス・再起動を跨ぐカウンタ共有は持たない。レシート読み取り（`/api/expenses/upload-receipt`）が別インスタンスのレート制限を使っていたため、Discord/PWA と同じ共有インスタンスへ揃えた。 |
+| X03 | 仕様として受容（#135） | 会話履歴は SQLite 直読みのまま。理由は「設計上の変更・縮小」表を参照。 |
+| D01 | 対応済み（#125） | Svelte 管理画面と Vue PWA はどちらも残し、タスク・予定・家計・ノート・設定・チャットの役割と機能差、業務ルールを Rust の業務サービスに置く方針を [フロント契約監査](2026-10-20-frontend-contracts.md) に記録した。PWA 用 view への変換はサーバー（`yuuka-client-api`）で行い、PWA の `httpAdapter.contract.test.ts` が完了の PATCH・選択中 Bot・string ID・レシート下書きの契約を固定する。 |
+| D07 | 対応済み（#131） | `frontend/src/lib/api/types.ts` の Todo・予定・家計・リマインド・タイムライン・個人データ・ペルソナ・Playbook・認証情報・`/api/me` の型と一覧レスポンスを ts-rs 生成型から作り、i64 の `bigint` → `number` の変換だけを `wire.ts` の `JsonWire<T>` で行う。古かった生成型を develop の DTO に合わせて更新し、xtask で行末空白を除去、生成ディレクトリを biome の対象から外した。生成型に揃えて見つかったタスクのタグ・ペルソナの公開状態・タスク詳細 / 追加の応答・予定の Google 同期表示・認証情報一覧の型ずれを直した。#161 のフロント側（`botApi.ts` への endpoint 定義の集約と `decide` の `{ decision }` 統一）も同時に対応。Playbook のスケジュール一覧は生成型の同名衝突のため手書きで残す。 |
+| X05 | 対応済み（#137） | services の通知 payload に Embed を通し、朝報・日報・週報と同じ経路を使うテスト配信を旧 Node 相当のカード表示へ戻した。LLM 要約など別の監査差分には変更を加えていない。 |
+
+## システムBotの暗黙帰属（SD07 / #145）
+
+V27で17テーブルの `bot_id NOT NULL` を維持してDEFAULTを除去し、退役済みの
+`mcp_servers.bot_id` とその専用索引を削除した。既存行は再帰属・削除せず保持する。
+対象18テーブル、参照/INSERT経路、FK・索引・FTS・移行失敗時の扱いと検証範囲は
+[SD07監査](2026-10-20-sd07-bot-id-default.md)を参照。

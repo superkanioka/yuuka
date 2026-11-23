@@ -6,9 +6,11 @@
 //! `?` で [`ApiError`] に写像（500・内部詳細は丸められる）。ロール変更・ユーザー削除では
 //! `destroy_all_for_user` でセッションを一括失効し、セッション内ロールの陳腐化を防ぐ。
 
+use yuuka_web::error::{bad_request, not_found};
+
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -17,7 +19,7 @@ use yuuka_core::WebError;
 use yuuka_web::{AdminUser, ApiError, Db};
 
 use crate::dto::{
-    AuditQuery, BotIdInput, CodeInput, RoleInput, SystemSettingsInput, TargetUserInput, TokenInput,
+    AuditQuery, BotIdInput, RoleInput, SystemSettingsInput, TargetUserInput, TokenInput,
 };
 use crate::{repo, AdminRuntime};
 
@@ -267,77 +269,6 @@ pub(crate) async fn bots_unsuspend(
     )))
 }
 
-// ─── 招待コード ───────────────────────────────────────────────────────────────
-
-pub(crate) async fn invite_codes_list(
-    _admin: AdminUser,
-    State(db): State<Db>,
-) -> Result<Response, ApiError> {
-    let codes = repo::list_invite_codes(&db).await?;
-    Ok(json_ok(json!({ "success": true, "codes": codes })))
-}
-
-pub(crate) async fn invite_codes_create(
-    admin: AdminUser,
-    State(db): State<Db>,
-    Json(body): Json<CodeInput>,
-) -> Result<Response, ApiError> {
-    let code = body.code.as_deref().map(str::trim).unwrap_or_default();
-    if code.is_empty() {
-        return Ok(bad_request("招待コードを入力してください。"));
-    }
-    repo::create_invite_code(&db, code, &admin.0.discord_id).await?;
-    yuuka_auth::audit::add_audit_log(
-        &db,
-        &admin.0.discord_id,
-        "admin.invite_create",
-        Some(code),
-        None,
-    )
-    .await;
-    Ok(ok_message(&format!("招待コード「{code}」を作成しました。")))
-}
-
-pub(crate) async fn invite_codes_revoke(
-    admin: AdminUser,
-    State(db): State<Db>,
-    Path(code): Path<String>,
-) -> Result<Response, ApiError> {
-    if !repo::revoke_invite_code(&db, &code).await? {
-        return Ok(bad_request("未使用の招待コードのみ無効化できます。"));
-    }
-    yuuka_auth::audit::add_audit_log(
-        &db,
-        &admin.0.discord_id,
-        "admin.invite_revoke",
-        Some(&code),
-        None,
-    )
-    .await;
-    Ok(ok_message(&format!(
-        "招待コード「{code}」を無効化しました。"
-    )))
-}
-
-pub(crate) async fn invite_codes_delete(
-    admin: AdminUser,
-    State(db): State<Db>,
-    Path(code): Path<String>,
-) -> Result<Response, ApiError> {
-    if !repo::delete_invite_code(&db, &code).await? {
-        return Ok(bad_request("未使用の招待コードのみ削除できます。"));
-    }
-    yuuka_auth::audit::add_audit_log(
-        &db,
-        &admin.0.discord_id,
-        "admin.invite_delete",
-        Some(&code),
-        None,
-    )
-    .await;
-    Ok(ok_message(&format!("招待コード「{code}」を削除しました。")))
-}
-
 // ─── レスポンスヘルパ・小ユーティリティ ───────────────────────────────────────
 
 /// 200 で任意の JSON 本文を返す。
@@ -348,24 +279,6 @@ fn json_ok(body: serde_json::Value) -> Response {
 /// 200 `{success:true, message}`。
 fn ok_message(message: &str) -> Response {
     json_ok(json!({ "success": true, "message": message }))
-}
-
-/// 400 `{success:false, message}`。
-fn bad_request(message: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-/// 404 `{success:false, message}`。
-fn not_found(message: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
 }
 
 /// `Some(非空文字列)` のみ通す（Node の `value || fallback` で空文字がフォールバックする挙動）。

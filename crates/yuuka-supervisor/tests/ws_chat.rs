@@ -111,10 +111,22 @@ fn seeded_db() -> (Db, Arc<SystemCrypto>) {
     let enc = crypto.encrypt_text("fake-key").unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
-        "INSERT INTO users (discord_id, username, password_hash, salt, role, \
+        "INSERT INTO users (discord_id, username, salt, role, \
          gemini_api_key_encrypted, gemini_api_key_iv, gemini_api_key_tag) \
-         VALUES ('u1', 'yuu', 'x', '00', 'user', ?1, ?2, ?3)",
+         VALUES ('u1', 'yuu', '00', 'user', ?1, ?2, ?3)",
         rusqlite::params![enc.encrypted, enc.iv, enc.auth_tag],
+    )
+    .unwrap();
+    // u1 はシステム Bot の持ち主（管理者）でもある。共有された Bot（u2 持ち）を自分の Bot より先に作り、
+    // primary が「作成順の先頭」ではなく「自分の最初の Bot」になることを確かめる。
+    conn.execute_batch(
+        "INSERT INTO users (discord_id, username, salt) VALUES ('u2', 'u2', '00');
+         INSERT INTO bots (id, user_id, name, created_at) VALUES
+           ('system_default', 'u1', 'システムデフォルト', '2026-01-01 00:00:00'),
+           ('b_shared', 'u2', 'シェア', '2026-01-02 00:00:00'),
+           ('b_own', 'u1', 'ユウカ', '2026-01-03 00:00:00');
+         INSERT INTO bot_shares (bot_id, owner_id, shared_user_id, status)
+           VALUES ('b_shared', 'u2', 'u1', 'active');",
     )
     .unwrap();
     (db, crypto)
@@ -148,11 +160,17 @@ async fn ws_chat_ready_then_msg_returns_done() {
         // デバイスフロー ルータ（本テストでは不要・空ルータ）。
         axum::Router::new(),
         ws_routes(engine, 20),
-        // MCP / 統合設定 / finance / Bot 管理ルータ（本テストでは不要・空ルータ）。
+        // MCP / 統合設定 / finance / schedule / Bot 管理 / 利用申請・共有招待 / client-api ルータ（本テストでは不要・空ルータ）。
         axum::Router::new(),
         axum::Router::new(),
         axum::Router::new(),
         axum::Router::new(),
+        axum::Router::new(),
+        axum::Router::new(),
+        axum::Router::new(),
+        // 配信設定ルータ（本テストでは不要・空ルータ）。
+        axum::Router::new(),
+        None,
         None,
     );
 
@@ -162,8 +180,20 @@ async fn ws_chat_ready_then_msg_returns_done() {
         let _ = axum::serve(listener, app).await;
     });
 
-    // Bearer 認証つきで /ws/chat?botId=system_default へ接続。
-    let mut req = format!("ws://{addr}/ws/chat?botId=system_default")
+    // システム Bot（案内役）へは、持ち主であっても繋がない（issue #142）。
+    let mut sd_req = format!("ws://{addr}/ws/chat?botId=system_default")
+        .into_client_request()
+        .unwrap();
+    sd_req
+        .headers_mut()
+        .insert("authorization", "Bearer good".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(sd_req).await.is_err(),
+        "system_default への WS upgrade は 403 で拒否される"
+    );
+
+    // Bearer 認証つきで botId 未指定のまま /ws/chat へ接続 → primary（自分の最初の Bot）へ束縛される。
+    let mut req = format!("ws://{addr}/ws/chat")
         .into_client_request()
         .unwrap();
     req.headers_mut()
@@ -176,7 +206,17 @@ async fn ws_chat_ready_then_msg_returns_done() {
     let ready = next_json(&mut ws).await;
     assert_eq!(ready["type"], "ready", "ready: {ready}");
     assert_eq!(ready["user"]["discordId"], "u1");
-    assert_eq!(ready["bot"]["id"], "system_default");
+    assert_eq!(ready["bot"]["id"], "b_own");
+    assert_eq!(ready["bot"]["primary"], true);
+    // Bot 一覧は自分の Bot → 共有された Bot の順。システム Bot は含まない。
+    let ids: Vec<&str> = ready["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b_own", "b_shared"]);
+    assert_eq!(ready["bots"][1]["primary"], false);
     assert_eq!(ready["maxUploadMb"], 20);
 
     // 2) msg 送信 → status/done を受け取る（done まで読む）。
@@ -223,11 +263,17 @@ async fn ws_chat_rejects_cookie_only_auth() {
         // デバイスフロー ルータ（本テストでは不要・空ルータ）。
         axum::Router::new(),
         ws_routes(engine, 20),
-        // MCP / 統合設定 / finance / Bot 管理ルータ（本テストでは不要・空ルータ）。
+        // MCP / 統合設定 / finance / schedule / Bot 管理 / 利用申請・共有招待 / client-api ルータ（本テストでは不要・空ルータ）。
         axum::Router::new(),
         axum::Router::new(),
         axum::Router::new(),
         axum::Router::new(),
+        axum::Router::new(),
+        axum::Router::new(),
+        axum::Router::new(),
+        // 配信設定ルータ（本テストでは不要・空ルータ）。
+        axum::Router::new(),
+        None,
         None,
     );
 
@@ -238,7 +284,7 @@ async fn ws_chat_rejects_cookie_only_auth() {
     });
 
     // 正当な Cookie セッションのみ（Authorization ヘッダ無し）で接続を試みる。
-    let mut req = format!("ws://{addr}/ws/chat?botId=system_default")
+    let mut req = format!("ws://{addr}/ws/chat?botId=b_own")
         .into_client_request()
         .unwrap();
     req.headers_mut()
@@ -250,7 +296,7 @@ async fn ws_chat_rejects_cookie_only_auth() {
     );
 
     // 対照: 同一サーバに Bearer で接続すると 101 で通る（Bearer 専用が機能している証左）。
-    let mut ok_req = format!("ws://{addr}/ws/chat?botId=system_default")
+    let mut ok_req = format!("ws://{addr}/ws/chat?botId=b_own")
         .into_client_request()
         .unwrap();
     ok_req
@@ -289,3 +335,232 @@ async fn read_until(ws: &mut WsStream, want_type: &str) -> Value {
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// 実ソケットで done(components) → interaction → update を往復し、再押下を拒否する。
+#[tokio::test]
+async fn ws_buttons_round_trip_and_reject_forged_or_replayed_actions() {
+    let (db, crypto) = seeded_db();
+    let engine = Arc::new(ChatEngine::new(
+        db.clone(),
+        Some(crypto.clone()),
+        ToolRegistry::new(),
+        Arc::new(FakeFactory {
+            text: "通常の応答".to_owned(),
+        }),
+        None,
+        Arc::new(yuuka_mcp::NullMcpClient),
+        None,
+    ));
+    let deps = yuuka_discord::interaction::ComponentInteractionDeps {
+        membership: Arc::new(yuuka_orchestrator::DbMembership::new(db.clone())),
+        directory: Arc::new(yuuka_orchestrator::DbBotDirectory::new(
+            db.clone(),
+            Some(crypto),
+        )),
+        dm: Arc::new(yuuka_orchestrator::NullMemberDmSender),
+    };
+    let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), db);
+    let app =
+        yuuka_supervisor::ws_routes_with_interactions(engine, 20, deps, true).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut req = format!("ws://{addr}/ws/chat")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer good".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["type"], "ready");
+    ws.send(WsMessage::Text(
+        json!({"type":"msg","text":"/__demo_buttons"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let done = read_until(&mut ws, "done").await;
+    let message_id = done["messageId"].as_str().unwrap();
+    let custom_id = done["components"][0]["components"][0]["custom_id"]
+        .as_str()
+        .unwrap();
+    assert!(custom_id.starts_with("demo_echo:"));
+    // 送信されていない action は、正しい messageId を付けても実行しない。
+    ws.send(WsMessage::Text(
+        json!({"type":"interaction","messageId":message_id,"customId":"persona_import:1"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next_json(&mut ws).await["type"], "error");
+    let interaction =
+        json!({"type":"interaction","messageId":message_id,"customId":custom_id}).to_string();
+    ws.send(WsMessage::Text(interaction.clone().into()))
+        .await
+        .unwrap();
+    let update = next_json(&mut ws).await;
+    assert_eq!(update["type"], "update");
+    assert_eq!(update["messageId"], message_id);
+    assert!(update["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("ボタンを受け取りました:"));
+    assert_eq!(update["components"], json!([]));
+    ws.send(WsMessage::Text(interaction.into())).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["type"], "error");
+    ws.close(None).await.ok();
+    server.abort();
+}
+
+/// 能力を問わず秘書経路で見える、宣言だけのツール（事前計画の対象にするため 2 つ登録する）。
+struct PlainTool(&'static str);
+
+#[async_trait]
+impl yuuka_core::Tool for PlainTool {
+    fn declaration(&self) -> yuuka_core::tool::FunctionDeclaration {
+        yuuka_core::tool::FunctionDeclaration {
+            name: yuuka_core::ToolName::checked(self.0.to_owned()).unwrap(),
+            description: String::new(),
+            parameters_json_schema: json!({ "type": "object", "properties": {} }),
+            requires_confirmation: false,
+        }
+    }
+
+    fn exposure(&self) -> yuuka_core::ToolExposure {
+        yuuka_core::ToolExposure {
+            capability: None,
+            secretary: true,
+            guild_assistant: false,
+            requires_guild: false,
+        }
+    }
+
+    async fn call(
+        &self,
+        _ctx: &yuuka_core::ToolContext,
+        _args: Value,
+    ) -> Result<yuuka_core::ToolOutcome, yuuka_core::ToolError> {
+        Ok(yuuka_core::ToolOutcome::from_payload(
+            json!({ "success": true }),
+        ))
+    }
+}
+
+/// 事前計画（R06）には重い計画を返し、本編は `gate` が開くまで待ってから固定テキストを返す backend。
+struct HeavyPlanBackend {
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl GenerateBackend for HeavyPlanBackend {
+    async fn generate(
+        &self,
+        system_instruction: Option<&str>,
+        _d: &[FunctionDeclaration],
+        _c: &[Content],
+        _tc: Option<ToolConfig>,
+    ) -> Result<GenerateContentResponse, GeminiError> {
+        let text = if system_instruction
+            .is_some_and(|s| s.starts_with(yuuka_orchestrator::turn_plan::PLANNER_INSTRUCTION))
+        {
+            r#"{"steps":["調べる"],"tools":["lookupA"],"weightMs":20000,"interim":"調べています。"}"#
+        } else {
+            self.gate.acquire().await.unwrap().forget();
+            "調べた結果です。"
+        };
+        Ok(serde_json::from_value(json!({
+            "candidates": [ { "content": { "role": "model", "parts": [ { "text": text } ] } } ]
+        }))
+        .unwrap())
+    }
+}
+
+struct HeavyPlanFactory(Arc<HeavyPlanBackend>);
+
+impl GeminiFactory for HeavyPlanFactory {
+    fn build(&self, _m: &str, _k: SecretString) -> Result<Arc<dyn GenerateBackend>, GeminiError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// R07 × R09: 重い計画のターンは WS でも interim → done(deferred:true) → push の順に届く。
+#[tokio::test]
+async fn ws_heavy_plan_sends_interim_then_deferred_done_then_push() {
+    let (db, crypto) = seeded_db();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = yuuka_tools::NativeProvider::new()
+        .with_tool(Arc::new(PlainTool("lookupA")))
+        .and_then(|p| p.with_tool(Arc::new(PlainTool("lookupB"))))
+        .unwrap();
+    let engine = Arc::new(ChatEngine::new(
+        db.clone(),
+        Some(crypto.clone()),
+        ToolRegistry::new().with_provider(Arc::new(provider)),
+        Arc::new(HeavyPlanFactory(Arc::new(HeavyPlanBackend {
+            gate: gate.clone(),
+        }))),
+        None,
+        Arc::new(yuuka_mcp::NullMcpClient),
+        None,
+    ));
+    let deps = yuuka_discord::interaction::ComponentInteractionDeps {
+        membership: Arc::new(yuuka_orchestrator::DbMembership::new(db.clone())),
+        directory: Arc::new(yuuka_orchestrator::DbBotDirectory::new(
+            db.clone(),
+            Some(crypto),
+        )),
+        dm: Arc::new(yuuka_orchestrator::NullMemberDmSender),
+    };
+    let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), db);
+    let app =
+        yuuka_supervisor::ws_routes_with_interactions(engine, 20, deps, false).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut req = format!("ws://{addr}/ws/chat")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer good".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["type"], "ready");
+    ws.send(WsMessage::Text(
+        json!({"type":"msg","text":"最新のニュースを調べて"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // status を読み飛ばし、interim → done の順を確かめる（本編は gate で止まっている）。
+    let mut order = Vec::new();
+    let done = loop {
+        let frame = next_json(&mut ws).await;
+        match frame["type"].as_str() {
+            Some("interim") => {
+                assert_eq!(frame["text"], "調べています。");
+                order.push("interim");
+            }
+            Some("done") => {
+                order.push("done");
+                break frame;
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(order, ["interim", "done"]);
+    assert_eq!(done["deferred"], true);
+    assert_eq!(done["text"], "");
+
+    gate.add_permits(1);
+    let push = read_until(&mut ws, "push").await;
+    assert_eq!(push["text"], "調べた結果です。");
+    assert!(push["messageId"].as_str().unwrap().starts_with("log:"));
+    ws.close(None).await.ok();
+    server.abort();
+}

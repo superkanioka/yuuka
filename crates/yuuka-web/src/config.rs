@@ -28,6 +28,15 @@ pub struct WebConfig {
     pub db_path: String,
     /// リマインダー cron 式（`config.reminder_cron`・`/api/status` の設定表示に返す・Node `config.reminderCron`）。
     pub reminder_cron: String,
+    /// index.html へ差し込む google-site-verification 値（`config.google_site_verification`・
+    /// [`crate::mount_pwa`]/[`crate::mount_static`] へ渡す・#124）。`None` は差し込まない。
+    pub google_site_verification: Option<String>,
+    /// サーバーでの音声生成の URL（`config.tts_server_url`・`/api/client/tts/*` の中継先）。`None` は中継しない。
+    pub tts_server_url: Option<String>,
+    /// 音声生成サーバーへの要求に付ける署名の秘密鍵（`config.tts_signing_key`・検証済み）。`None` は署名しない。
+    pub tts_signing_key: Option<yuuka_core::secrets::SecretString>,
+    /// MCP Apps のサンドボックス用オリジン（`config.mcp_sandbox_origin`・検証済み）。`None` は不透明オリジンで動かす。
+    pub mcp_sandbox_origin: Option<String>,
 }
 
 impl WebConfig {
@@ -44,6 +53,10 @@ impl WebConfig {
             base_url: cfg.base_url.clone(),
             db_path: cfg.db_path.to_string_lossy().into_owned(),
             reminder_cron: cfg.reminder_cron.clone(),
+            google_site_verification: cfg.google_site_verification.clone(),
+            tts_server_url: cfg.tts_server_url.clone(),
+            tts_signing_key: cfg.tts_signing_key.clone(),
+            mcp_sandbox_origin: cfg.mcp_sandbox_origin.clone(),
         }
     }
 }

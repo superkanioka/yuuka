@@ -1,64 +1,56 @@
 <script lang="ts">
-	// Bot招待リンク・プロフィールURLカード（旧 updateBotInviteCard + btn-invite-sync）。
-	// application_id があればリンク表示、無ければ「今すぐ同期」を促す。
-	import { botAttributeApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { Button } from "$lib/components/ui";
-	import CopyField from "./CopyField.svelte";
-	import { botInviteUrl, botProfileUrl, type BotAttrView } from "./configTypes";
+// Bot招待リンク・プロフィールURLカード（旧 updateBotInviteCard + btn-invite-sync）。
+// application_id があればリンク表示、無ければ「今すぐ同期」を促す。
 
-	interface Props {
-		botId: string;
-		bot: BotAttrView;
-		/** 同期成功後に親のカード群・Bot一覧を再取得 */
-		onsynced?: () => void;
-	}
-	let { botId, bot, onsynced }: Props = $props();
+import { botAttributeApi } from "$lib/api/services";
+import { Button } from "$lib/components/ui";
+import { pushToast, toastError } from "$lib/stores/toast";
+import CopyField from "./CopyField.svelte";
+import { type BotAttrView, botInviteUrl, botProfileUrl } from "./configTypes";
 
-	const appId = $derived(bot.discord_application_id ?? "");
-	const inviteUrl = $derived(appId ? botInviteUrl(appId) : "");
-	const profileUrl = $derived(appId ? botProfileUrl(appId) : "");
+interface Props {
+	botId: string;
+	bot: BotAttrView;
+	/** 同期成功後に親のカード群・Bot一覧を再取得 */
+	onsynced?: () => void;
+}
+let { botId, bot, onsynced }: Props = $props();
 
-	let syncing = $state(false);
-	async function sync() {
-		syncing = true;
-		try {
-			const res = await botAttributeApi.syncDiscord(botId);
-			if (res.success) {
-				onsynced?.();
-			} else {
-				pushToast(
-					res.message ??
-						"同期に失敗しました。Botが起動しているか確認してください。",
-					"error",
-				);
-			}
-		} catch (err) {
+const appId = $derived(bot.discord_application_id ?? "");
+const inviteUrl = $derived(appId ? botInviteUrl(appId) : "");
+const profileUrl = $derived(appId ? botProfileUrl(appId) : "");
+
+let syncing = $state(false);
+async function sync() {
+	syncing = true;
+	try {
+		const res = await botAttributeApi.syncDiscord(botId);
+		if (res.success) {
+			onsynced?.();
+		} else {
 			pushToast(
-				err instanceof ApiError ? err.message : "通信エラーが発生しました。",
+				res.message ??
+					"同期に失敗しました。Botが起動しているか確認してください。",
 				"error",
 			);
-		} finally {
-			syncing = false;
 		}
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
+	} finally {
+		syncing = false;
 	}
+}
 </script>
 
-<details class="config-card card">
-	<summary class="column-header">
+<section class="config-card card">
+	<div class="column-header">
 		<h3><span class="material-symbols-outlined header-icon-symbol">link</span>Bot 招待リンク・プロフィール</h3>
-	</summary>
-	<p class="description-text">
-		このBotをサーバーへ追加するための導入リンクと、Discordプロフィールへのリンクです。
-	</p>
-
+	</div>
 	{#if appId}
 		<div class="invite-fields">
 			<CopyField
 				label="導入リンク（サーバーに追加）"
 				value={inviteUrl}
-				sub="※チャンネル表示・メッセージ送信／履歴閲覧・埋め込みリンク・ファイル添付の権限を付与した状態で開きます。"
 			/>
 			<CopyField label="プロフィールURL" value={profileUrl} />
 		</div>
@@ -72,7 +64,7 @@
 			</Button>
 		</div>
 	{/if}
-</details>
+</section>
 
 <style>
 	.invite-fields {

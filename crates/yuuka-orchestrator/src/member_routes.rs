@@ -4,9 +4,14 @@
 //! [`crate::bot_repo`] の `submit_member_request`/`decide_member_request`（Discord ボタンフローと共通の
 //! DB 確定層）を再利用し、HTTP status は結果の `code`（[`SubmitDeny`]/[`DecideDeny`]）で分岐する。
 //!
-//! **DM のシーム**: 申請受付/決定の通知は [`MemberDmSender`] ポート越しに fire-and-forget で送る。
-//! Discord メッセンジャ未配線のうちは既定 [`NullMemberDmSender`]（no-op）へ縮退する（DB 上の申請は
-//! Web 管理から拾えるため DM 失敗は許容・Node も同方針）。実配線時は [`routes_with`] で実 sender を注入。
+//! **DM のシーム**: 申請受付の DM 送信と、決定時のその DM の編集（決定済みの embed へ置き換えてボタンを
+//! 外す）は [`MemberDmSender`] ポート越しに fire-and-forget で行う。申請者へ結果の DM は送らない。
+//! supervisor は Discord ボタン経路（interaction）と同じ `DiscordMessenger` を [`routes_with`] で注入し、
+//! 入口によらず同じ DM が届く（Node `services/memberRequest.ts` が両経路共通だったのと同じ）。送信失敗は
+//! warn ログのみで応答は成功のまま（DB 上の申請は Web 管理から拾える・Node も同方針）。既定 [`routes`] は
+//! [`NullMemberDmSender`]（no-op・テスト / Discord 無し構成用）。
+
+use yuuka_web::error::{server_error, status_json};
 
 use std::sync::Arc;
 
@@ -18,7 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use yuuka_discord::{MemberDecision, MemberDmSender};
+use yuuka_discord::{DecidedRequest, DmMessageRef, MemberDecision, MemberDmSender};
 use yuuka_web::{AppState, AuthenticatedUser, Db};
 
 use crate::bot_repo::{self, DecideDeny, MemberRequestRow, SubmitDeny};
@@ -36,25 +41,20 @@ impl MemberDmSender for NullMemberDmSender {
         _guild_label: &str,
         _note: Option<&str>,
         _request_id: i64,
-    ) -> bool {
-        false
+    ) -> Option<DmMessageRef> {
+        None
     }
-    async fn send_decision_dm(
-        &self,
-        _applicant_id: &str,
-        _bot_name: &str,
-        _approved: bool,
-    ) -> bool {
+    async fn close_request_dm(&self, _dm: &DmMessageRef, _request: &DecidedRequest) -> bool {
         false
     }
 }
 
-/// 利用申請ルータ（既定 [`NullMemberDmSender`]・`AppState` 上でマージされる）。
+/// 利用申請ルータ（DM 未送信の [`NullMemberDmSender`] 版・テスト / Discord 無し構成用）。
 pub fn routes() -> Router<AppState> {
     routes_with(Arc::new(NullMemberDmSender))
 }
 
-/// 実 DM sender を注入して利用申請ルータを組む（Discord 配線時に使う）。
+/// 実 DM sender を注入して利用申請ルータを組む（supervisor は `DiscordMessenger` を渡す）。
 pub fn routes_with(dm: Arc<dyn MemberDmSender>) -> Router<AppState> {
     Router::new()
         .route(
@@ -97,12 +97,15 @@ async fn submit(
         );
     }
 
+    // Web からの申請には Discord の表示名が無い（決定済み embed は ID で示す）。
     let result = match bot_repo::submit_member_request(
         &db,
         bot_id,
         guild_id,
         &applicant,
         note.clone(),
+        None,
+        None,
     )
     .await
     {
@@ -130,7 +133,7 @@ async fn submit(
     if let (Some(owner_id), Some(bot_name), Some(request_id)) =
         (result.owner_id, result.bot_name, result.request_id)
     {
-        let _ = dm
+        let sent = dm
             .send_request_dm(
                 &owner_id,
                 &bot_name,
@@ -140,6 +143,15 @@ async fn submit(
                 request_id,
             )
             .await;
+        match sent {
+            // 決定時に DM を「承認済み/却下済み」へ編集できるよう所在を控える。
+            Some(dm_ref) => {
+                if let Err(e) = bot_repo::set_member_request_dm(&db, request_id, &dm_ref).await {
+                    tracing::warn!(error = %e, request_id, "利用申請 DM の所在の保存に失敗");
+                }
+            }
+            None => tracing::warn!(request_id, owner = %owner_id, "利用申請 DM の送信に失敗"),
+        }
     }
     ok_message("利用申請を送信しました。Bot作成者の承認をお待ちください。")
 }
@@ -285,11 +297,12 @@ async fn decide(
     );
     yuuka_auth::audit::add_audit_log(&db, &actor, action, Some(&target), None).await;
 
-    // 申請者へ結果 DM（fire-and-forget）。
-    if let (Some(applicant_id), Some(bot_name)) = (result.applicant_id, result.bot_name) {
-        let _ = dm
-            .send_decision_dm(&applicant_id, &bot_name, approved)
-            .await;
+    // オーナー宛の受付 DM を決定済みの embed へ置き換えてボタンを外す（Discord ボタンで決定した場合と
+    // 同じ表示・fire-and-forget で失敗しても決定は確定済み）。申請者へ結果の DM は送らない。
+    if let (Some(request), Some(dm_ref)) = (&result.request, &result.request_dm) {
+        if !dm.close_request_dm(dm_ref, request).await {
+            tracing::warn!(request_id = id, "利用申請 DM の編集に失敗");
+        }
     }
     ok_message(if approved {
         "利用申請を承認しました。"
@@ -343,25 +356,10 @@ fn ok_message(message: &str) -> Response {
         .into_response()
 }
 
-fn status_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-fn server_error() -> Response {
-    status_json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "内部エラーが発生しました。",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
@@ -369,6 +367,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
     use yuuka_core::AuthError;
+    use yuuka_discord::{DecidedRequest, DmMessageRef, MemberDecision, MemberDmSender};
     use yuuka_types::{Role, SessionUser};
     use yuuka_web::{AppState, AuthBackend, Db, WebConfig};
 
@@ -417,8 +416,8 @@ mod tests {
                 ("other", "user"),
             ] {
                 conn.execute(
-                    "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt, role) \
-                     VALUES (?1, ?1, 'x', 'x', ?2)",
+                    "INSERT OR IGNORE INTO users (discord_id, username, salt, role) \
+                     VALUES (?1, ?1, 'x', ?2)",
                     rusqlite::params![uid, role],
                 )
                 .expect("seed user");
@@ -436,6 +435,82 @@ mod tests {
     fn app() -> axum::Router {
         let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), seed_db());
         super::routes().with_state(state)
+    }
+
+    /// 受付 DM の記録（宛先オーナー, bot 名, 申請者ラベル, ギルドラベル, note, 申請 ID）。
+    type RequestDm = (String, String, String, String, Option<String>, i64);
+
+    /// 送信された DM を記録する fake（`ok` で送信成否を切り替える）。
+    struct FakeMemberDm {
+        ok: bool,
+        requests: Mutex<Vec<RequestDm>>,
+        /// 決定済みへ編集された受付 DM（メッセージ ID, 決定した申請）。
+        closed: Mutex<Vec<(String, DecidedRequest)>>,
+    }
+
+    impl FakeMemberDm {
+        fn new(ok: bool) -> Arc<Self> {
+            Arc::new(Self {
+                ok,
+                requests: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    /// Web 経由の申請の決定内容（表示名は無く、ID で示す）。
+    fn decided_via_web(
+        decision: MemberDecision,
+        applicant: &str,
+        note: Option<&str>,
+    ) -> DecidedRequest {
+        DecidedRequest {
+            decision,
+            bot_name: "TestBot".to_owned(),
+            applicant_id: applicant.to_owned(),
+            applicant_label: None,
+            guild_id: "123456".to_owned(),
+            guild_label: None,
+            note: note.map(str::to_owned),
+        }
+    }
+
+    #[async_trait]
+    impl MemberDmSender for FakeMemberDm {
+        async fn send_request_dm(
+            &self,
+            owner_id: &str,
+            bot_name: &str,
+            applicant_label: &str,
+            guild_label: &str,
+            note: Option<&str>,
+            request_id: i64,
+        ) -> Option<DmMessageRef> {
+            self.requests.lock().unwrap().push((
+                owner_id.to_owned(),
+                bot_name.to_owned(),
+                applicant_label.to_owned(),
+                guild_label.to_owned(),
+                note.map(str::to_owned),
+                request_id,
+            ));
+            self.ok.then(|| DmMessageRef {
+                channel_id: "dmch".to_owned(),
+                message_id: format!("dmmsg{request_id}"),
+            })
+        }
+        async fn close_request_dm(&self, dm: &DmMessageRef, request: &DecidedRequest) -> bool {
+            self.closed
+                .lock()
+                .unwrap()
+                .push((dm.message_id.clone(), request.clone()));
+            self.ok
+        }
+    }
+
+    fn app_with(dm: Arc<FakeMemberDm>) -> axum::Router {
+        let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), seed_db());
+        super::routes_with(dm).with_state(state)
     }
 
     async fn send(
@@ -682,6 +757,148 @@ mod tests {
         )
         .await;
         assert_eq!(j["requests"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn submit_and_decide_send_and_close_owner_dm() {
+        let dm = FakeMemberDm::new(true);
+        let app = app_with(dm.clone());
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/member-requests",
+            "u",
+            r#"{"botId":"b1","guildId":"123456","note":"よろしく"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (_st, j) = send(&app, "GET", "/api/bots/member-requests/mine", "u", "").await;
+        let req_id = j["requests"][0]["id"].as_i64().unwrap();
+        // 受付 DM はオーナー宛・申請 ID（= ボタン `memreq_approve:{id}` の id）付き（Node の Web 経路と同じ
+        // フォールバックラベル）。
+        assert_eq!(
+            dm.requests.lock().unwrap().clone(),
+            vec![(
+                "owner".to_owned(),
+                "TestBot".to_owned(),
+                "ユーザー u".to_owned(),
+                "ギルド 123456".to_owned(),
+                Some("よろしく".to_owned()),
+                req_id,
+            )]
+        );
+        assert!(dm.closed.lock().unwrap().is_empty());
+
+        // 承認 → 受付時に控えた DM を「承認されました」の embed へ編集する（申請者へ別の DM は送らない）。
+        let (st, _) = send(
+            &app,
+            "POST",
+            &format!("/api/bots/member-requests/{req_id}/decide"),
+            "owner",
+            r#"{"decision":"approved"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            dm.closed.lock().unwrap().clone(),
+            vec![(
+                format!("dmmsg{req_id}"),
+                decided_via_web(MemberDecision::Approved, "u", Some("よろしく")),
+            )]
+        );
+
+        // 別申請者 other の申請を却下 → その受付 DM を「却下されました」へ編集する。
+        send(
+            &app,
+            "POST",
+            "/api/bots/member-requests",
+            "other",
+            r#"{"botId":"b1","guildId":"123456"}"#,
+        )
+        .await;
+        let (_st, j) = send(&app, "GET", "/api/bots/member-requests/mine", "other", "").await;
+        let other_id = j["requests"][0]["id"].as_i64().unwrap();
+        assert_eq!(dm.requests.lock().unwrap().len(), 2);
+        assert_eq!(dm.requests.lock().unwrap()[1].4, None);
+        let (st, _) = send(
+            &app,
+            "POST",
+            &format!("/api/bots/member-requests/{other_id}/decide"),
+            "owner",
+            r#"{"action":"reject"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            dm.closed.lock().unwrap()[1],
+            (
+                format!("dmmsg{other_id}"),
+                decided_via_web(MemberDecision::Rejected, "other", None),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_submit_and_decide_send_no_dm() {
+        let dm = FakeMemberDm::new(true);
+        let app = app_with(dm.clone());
+        // オーナー自身の申請（409）・存在しない申請の決定（404）では DM を送らない。
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/member-requests",
+            "owner",
+            r#"{"botId":"b1","guildId":"123456"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/member-requests/9999/decide",
+            "owner",
+            r#"{"decision":"approved"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(dm.requests.lock().unwrap().is_empty());
+        assert!(dm.closed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dm_failure_keeps_request_and_returns_ok() {
+        let dm = FakeMemberDm::new(false);
+        let app = app_with(dm.clone());
+        // 受付 DM 失敗でも 200・申請は pending で残る。
+        let (st, j) = send(
+            &app,
+            "POST",
+            "/api/bots/member-requests",
+            "u",
+            r#"{"botId":"b1","guildId":"123456"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(j["success"], true);
+        assert_eq!(dm.requests.lock().unwrap().len(), 1);
+        let (_st, j) = send(&app, "GET", "/api/bots/member-requests", "owner", "").await;
+        assert_eq!(j["requests"][0]["status"], "pending");
+        let req_id = j["requests"][0]["id"].as_i64().unwrap();
+
+        // 受付 DM が届いていない申請も決定でき（200）、編集する DM は無い。
+        let (st, j) = send(
+            &app,
+            "POST",
+            &format!("/api/bots/member-requests/{req_id}/decide"),
+            "owner",
+            r#"{"decision":"approved"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(j["success"], true);
+        assert!(dm.closed.lock().unwrap().is_empty());
+        let (_st, j) = send(&app, "GET", "/api/bots/member-requests/mine", "u", "").await;
+        assert_eq!(j["requests"][0]["status"], "approved");
     }
 
     #[test]

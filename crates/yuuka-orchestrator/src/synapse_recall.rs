@@ -6,23 +6,60 @@
 //! 想起したシナプスは鮮度（`use_count`/`last_used_at`/`decay_score`）を更新する（失敗は無視）。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
+use yuuka_core::config;
+use yuuka_core::MetricsSink;
 use yuuka_synapse::{RecencyContext, Scope, SynapseEngine, TimeContext};
 
 use crate::synapse_repo;
 use yuuka_web::Db;
 
-// ─── Node config 既定値（src/config.ts）を逐語移植 ────────────────────────────────
+/// L2 想起のチューニング設定（Node `config.synapseRecall*`）。main が config から組み立てて
+/// [`crate::ChatEngine::with_recall_settings`] で注入する。既定は Node の既定値と同じ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallSettings {
+    /// L2 想起（1st Hop KNN）の取得件数（`SYNAPSE_RECALL_K`・既定 5）。
+    pub k: usize,
+    /// recency 加算ブースト重み（`SYNAPSE_RECENCY_WEIGHT`・既定 0.15）。0 で無効。
+    pub recency_weight: f32,
+    /// recency ブーストの半減期（時間・`SYNAPSE_RECENCY_HALFLIFE_HOURS`・既定 18）。0 で無効。
+    pub recency_halflife_hours: f32,
+}
 
-/// L2 想起（1st Hop KNN）の取得件数（Node `SYNAPSE_RECALL_K` 既定 5）。
-const RECALL_K: usize = 5;
+impl Default for RecallSettings {
+    fn default() -> Self {
+        Self {
+            k: config::DEFAULT_SYNAPSE_RECALL_K,
+            recency_weight: config::DEFAULT_SYNAPSE_RECENCY_WEIGHT,
+            recency_halflife_hours: config::DEFAULT_SYNAPSE_RECENCY_HALFLIFE_HOURS,
+        }
+    }
+}
 
-/// recency 加算ブースト重み（Node `SYNAPSE_RECENCY_WEIGHT` 既定 0.15）。0 で無効。
-const RECENCY_WEIGHT: f32 = 0.15;
+impl RecallSettings {
+    /// 検証済み config から組み立てる。
+    #[must_use]
+    pub fn from_config(cfg: &config::Config) -> Self {
+        Self {
+            k: cfg.synapse_recall_k,
+            recency_weight: cfg.synapse_recency_weight,
+            recency_halflife_hours: cfg.synapse_recency_halflife_hours,
+        }
+    }
 
-/// recency ブーストの半減期（時間・Node `SYNAPSE_RECENCY_HALFLIFE_HOURS` 既定 18）。
-const RECENCY_HALFLIFE_HOURS: f32 = 18.0;
+    /// recency 加算ブーストの文脈（重み・半減期のどちらかが 0 なら `None`＝無効）。
+    fn recency_context(&self, now_epoch: i64) -> Option<RecencyContext> {
+        (self.recency_weight > 0.0 && self.recency_halflife_hours > 0.0).then_some(RecencyContext {
+            now_epoch,
+            weight: self.recency_weight,
+            halflife_secs: self.recency_halflife_hours * 3600.0,
+        })
+    }
+}
+
+// ─── Node の固定値（src/config.ts / gemini.ts）を逐語移植 ────────────────────────
 
 /// 時刻文脈の再ランキング重み（Node `SYNAPSE_TIME_BIAS_WEIGHT` = 0.1）。意味KNN後にコサインへ補正。
 const TIME_BIAS_WEIGHT: f32 = 0.1;
@@ -33,8 +70,7 @@ const RECALL_QUERY_MAX_LEN: usize = 500;
 /// L2 想起のクエリを組み立てる（Node `buildRecallQuery`）。
 ///
 /// 返信時（`reply_chain` 非空）は直近 2 件の返信元文脈を現発話へ前置して「数個前をさかのぼる」想起を
-/// 効かせ、上限でキャップする。返信でない場合は現発話そのまま。現状 Rust の秘書経路は返信チェーンを
-/// 縮退シームとして持たない（空を渡す）ため、実質は現発話がそのままクエリになる。
+/// 効かせ、上限でキャップする。返信でない場合は現発話そのまま。
 #[must_use]
 pub fn build_recall_query(message_text: &str, reply_chain: &[String]) -> String {
     let text = message_text.trim();
@@ -67,16 +103,45 @@ pub fn build_recall_query(message_text: &str, reply_chain: &[String]) -> String 
 ///
 /// エンジン想起が空・クエリが空・失敗のときは `""`（呼び出し側は systemInstruction をそのまま使う）。
 /// 想起できた場合は鮮度更新（`touch_synapses`）を best-effort で行う（失敗は無視）。
+/// 取得件数・recency ブーストは `settings`（config `SYNAPSE_*`）に従う。
+///
+/// `metrics` があれば Node と同じく `assemble` レイテンシと `recall_hit`/`recall_empty` を記録する
+/// （空クエリは想起を試みないため記録しない）。
 pub async fn build_recall_section(
     db: &Db,
     engine: &Arc<Mutex<SynapseEngine>>,
+    settings: &RecallSettings,
     scope: &Scope,
     query: &str,
+    metrics: Option<&dyn MetricsSink>,
 ) -> String {
+    build_recall(db, engine, settings, scope, query, metrics)
+        .await
+        .section
+}
+
+/// 想起の結果。`section` は systemInstruction へ追記する文字列、`recalled` は想起した記憶の id と内容
+/// （返答確定後に「返答に使われたか」を判定して強めるのに使う・[`crate::synapse_maintain::record_usefulness`]）。
+#[derive(Debug, Default, Clone)]
+pub struct Recall {
+    pub section: String,
+    pub recalled: Vec<(i64, String)>,
+}
+
+/// [`build_recall_section`] の本体。想起した id と内容も返す。
+pub async fn build_recall(
+    db: &Db,
+    engine: &Arc<Mutex<SynapseEngine>>,
+    settings: &RecallSettings,
+    scope: &Scope,
+    query: &str,
+    metrics: Option<&dyn MetricsSink>,
+) -> Recall {
     let q = query.trim();
     if q.is_empty() {
-        return String::new();
+        return Recall::default();
     }
+    let started = Instant::now();
 
     // 現在の時間帯・曜日・エポックで時刻補正 + recency 加算ブーストをかける。
     let (now_tod, now_dow, now_epoch) = local_now();
@@ -85,22 +150,28 @@ pub async fn build_recall_section(
         now_dow,
         weight: TIME_BIAS_WEIGHT,
     });
-    let recency_ctx = if RECENCY_WEIGHT > 0.0 && RECENCY_HALFLIFE_HOURS > 0.0 {
-        Some(RecencyContext {
-            now_epoch,
-            weight: RECENCY_WEIGHT,
-            halflife_secs: RECENCY_HALFLIFE_HOURS * 3600.0,
-        })
-    } else {
-        None
-    };
+    let recency_ctx = settings.recency_context(now_epoch);
 
     let neighbors = {
         let eng = engine.lock().await;
-        eng.assemble(scope, q, time_ctx, recency_ctx, RECALL_K)
+        eng.assemble(scope, q, time_ctx, recency_ctx, settings.k)
     };
+    if let Some(m) = metrics {
+        m.record_latency(
+            "assemble",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        m.incr(
+            if neighbors.is_empty() {
+                "recall_empty"
+            } else {
+                "recall_hit"
+            },
+            1,
+        );
+    }
     if neighbors.is_empty() {
-        return String::new();
+        return Recall::default();
     }
 
     // 想起されたシナプスの鮮度を更新（id 群はスコープ済み assemble の結果）。失敗は無視。
@@ -114,11 +185,15 @@ pub async fn build_recall_section(
         .map(|n| format!("- {}", n.content))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
+    let section = format!(
         "\n# 関連する過去の記憶（連想想起／参考情報）\n\
          以下はあなたが過去の会話から記憶した、現在の発話に関連し得る事項です。\
          関連する場合のみ参考にし、無関係なら無視してください（古い情報の可能性があります）。\n{lines}"
-    )
+    );
+    Recall {
+        section,
+        recalled: neighbors.into_iter().map(|n| (n.id, n.content)).collect(),
+    }
 }
 
 /// 現地時刻の (時間帯 0-23, 曜日 0=日〜6=土, Unix エポック秒)。
@@ -134,7 +209,56 @@ fn local_now() -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    /// カウンタとレイテンシ標本数を溜める fake（実体の `MetricsRegistry` は services 側）。
+    #[derive(Default)]
+    struct FakeMetrics {
+        counters: std::sync::Mutex<HashMap<String, u64>>,
+        latencies: std::sync::Mutex<HashMap<String, usize>>,
+    }
+
+    impl FakeMetrics {
+        fn counter(&self, name: &str) -> u64 {
+            self.counters
+                .lock()
+                .expect("lock")
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn latency_count(&self, kind: &str) -> usize {
+            self.latencies
+                .lock()
+                .expect("lock")
+                .get(kind)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl MetricsSink for FakeMetrics {
+        fn incr(&self, name: &str, by: u64) {
+            *self
+                .counters
+                .lock()
+                .expect("lock")
+                .entry(name.to_owned())
+                .or_insert(0) += by;
+        }
+
+        fn record_latency(&self, kind: &str, _ms: u64) {
+            *self
+                .latencies
+                .lock()
+                .expect("lock")
+                .entry(kind.to_owned())
+                .or_insert(0) += 1;
+        }
+    }
 
     #[test]
     fn recall_query_without_reply_chain_is_message_text() {
@@ -180,12 +304,32 @@ mod tests {
             bot_id: "b1".into(),
             guild_id: None,
         };
-        let section = build_recall_section(&db, &engine, &scope, "何か").await;
+        let metrics = FakeMetrics::default();
+        let section = build_recall_section(
+            &db,
+            &engine,
+            &RecallSettings::default(),
+            &scope,
+            "何か",
+            Some(&metrics),
+        )
+        .await;
         assert!(section.is_empty(), "索引が空なら想起セクションは空");
         // 空クエリも空。
-        assert!(build_recall_section(&db, &engine, &scope, "   ")
-            .await
-            .is_empty());
+        assert!(build_recall_section(
+            &db,
+            &engine,
+            &RecallSettings::default(),
+            &scope,
+            "   ",
+            Some(&metrics)
+        )
+        .await
+        .is_empty());
+        // 想起を試みた 1 回だけが空振りとして数えられる（空クエリは想起しないので数えない・Node 同様）。
+        assert_eq!(metrics.counter("recall_empty"), 1);
+        assert_eq!(metrics.counter("recall_hit"), 0);
+        assert_eq!(metrics.latency_count("assemble"), 1);
     }
 
     /// 索引に記憶を入れると想起され、フォーマット済みセクションが返り鮮度も更新される。
@@ -215,6 +359,8 @@ mod tests {
                 source_msg_id: None,
                 ctx_tod: None,
                 ctx_dow: None,
+                status: synapse_repo::STATUS_KEPT,
+                content_hash: None,
             },
         )
         .await
@@ -227,8 +373,17 @@ mod tests {
             yuuka_synapse::FormationContext::default(),
         );
         let engine = Arc::new(Mutex::new(engine));
+        let metrics = FakeMetrics::default();
 
-        let section = build_recall_section(&db, &engine, &scope, "好きな食べ物はカレーです").await;
+        let section = build_recall_section(
+            &db,
+            &engine,
+            &RecallSettings::default(),
+            &scope,
+            "好きな食べ物はカレーです",
+            Some(&metrics),
+        )
+        .await;
         assert!(
             section.contains("# 関連する過去の記憶（連想想起／参考情報）"),
             "見出しを含む"
@@ -250,5 +405,91 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(use_count, 1, "recall で touch されている");
+
+        // 想起ヒットと assemble レイテンシが記録されている（空振りは数えない）。
+        assert_eq!(metrics.counter("recall_hit"), 1);
+        assert_eq!(metrics.counter("recall_empty"), 0);
+        assert_eq!(metrics.latency_count("assemble"), 1);
+    }
+
+    /// 既定値は Node の既定（旧 Rust 定数）と同じ。
+    #[test]
+    fn recall_settings_default_matches_node_defaults() {
+        let s = RecallSettings::default();
+        assert_eq!(s.k, 5);
+        assert!((s.recency_weight - 0.15).abs() < f32::EPSILON);
+        assert!((s.recency_halflife_hours - 18.0).abs() < f32::EPSILON);
+        let rc = s.recency_context(1_000).expect("既定では recency 有効");
+        assert_eq!(rc.now_epoch, 1_000);
+        assert!((rc.halflife_secs - 18.0 * 3600.0).abs() < f32::EPSILON);
+    }
+
+    /// 重み・半減期のどちらかが 0 なら recency ブーストは無効。
+    #[test]
+    fn recall_settings_zero_disables_recency() {
+        let no_weight = RecallSettings {
+            recency_weight: 0.0,
+            ..RecallSettings::default()
+        };
+        assert!(no_weight.recency_context(0).is_none());
+        let no_halflife = RecallSettings {
+            recency_halflife_hours: 0.0,
+            ..RecallSettings::default()
+        };
+        assert!(no_halflife.recency_context(0).is_none());
+    }
+
+    /// `k`（config `SYNAPSE_RECALL_K`）が想起件数の上限として効く。
+    #[tokio::test]
+    async fn recall_k_limits_neighbors() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("t.db");
+        drop(rusqlite::Connection::open(&path).expect("create empty"));
+        let db = Db::open(Path::new(&path)).expect("db");
+        let (mut engine, _) = SynapseEngine::boot(&path, yuuka_synapse::DEFAULT_DIM);
+        let scope = Scope {
+            user_id: "u1".into(),
+            bot_id: "b1".into(),
+            guild_id: None,
+        };
+        for (id, content) in [
+            (1, "好きな食べ物はカレーです"),
+            (2, "好きな飲み物はカレー味のラッシーです"),
+            (3, "好きなカレーの店は駅前です"),
+        ] {
+            engine.index(
+                scope.clone(),
+                id,
+                None,
+                content.into(),
+                yuuka_synapse::FormationContext::default(),
+            );
+        }
+        let engine = Arc::new(Mutex::new(engine));
+
+        let count_items = |section: &str| section.lines().filter(|l| l.starts_with("- ")).count();
+        let all = build_recall_section(
+            &db,
+            &engine,
+            &RecallSettings::default(),
+            &scope,
+            "好きなカレー",
+            None,
+        )
+        .await;
+        assert_eq!(count_items(&all), 3, "既定 k=5 なら 3 件すべて");
+
+        let one = RecallSettings {
+            k: 1,
+            ..RecallSettings::default()
+        };
+        let metrics = FakeMetrics::default();
+        let limited =
+            build_recall_section(&db, &engine, &one, &scope, "好きなカレー", Some(&metrics)).await;
+        assert_eq!(count_items(&limited), 1, "k=1 なら 1 件だけ");
+        assert_eq!(metrics.counter("recall_hit"), 1);
+        assert_eq!(metrics.counter("recall_empty"), 0);
+        assert_eq!(metrics.latency_count("assemble"), 1);
     }
 }

@@ -2,12 +2,11 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 
-// dev-hot(compose)標準フロー = 7855 / ホスト直 tsx watch(dev:host) = 7854
-// prod の HOST_PORT は環境毎に異なる(dev=7855, prod=7701 等)ため、必ず env で切替可能に
-const API = process.env.VITE_API_TARGET ?? "http://127.0.0.1:7855";
+// API の proxy 先。既定は systemd の dev API（yuuka-dev.service・3403）。VITE_API_TARGET で切り替える
+const API = process.env.VITE_API_TARGET ?? "http://127.0.0.1:3403";
 
 // P1a: vite-plugin-pwa の virtual:pwa-register は `workbox-window` を import するが、
 // pnpm の厳格 hoist 配置では bare specifier が top-level から解決できず rolldown が
@@ -24,9 +23,7 @@ function resolveWorkboxWindow(): string | undefined {
 	// 2) .pnpm ストア内をバージョン非依存でグロブ
 	try {
 		const pnpmDir = path.resolve(__dirname, "../node_modules/.pnpm");
-		const dir = fs
-			.readdirSync(pnpmDir)
-			.find((d) => /^workbox-window@/.test(d));
+		const dir = fs.readdirSync(pnpmDir).find((d) => /^workbox-window@/.test(d));
 		if (dir) {
 			const pkgJson = path.join(
 				pnpmDir,
@@ -42,17 +39,72 @@ function resolveWorkboxWindow(): string | undefined {
 }
 const workboxWindowPath = resolveWorkboxWindow();
 
+// dev 専用・opt-in: PWA（clients/pwa の dev server）と管理画面（この dev server）を別ポートで
+// 動かす構成（`pnpm dev:client:mock`・scripts/dev-client-mock.mjs）では、共有ログイン
+// （/admin/login）後の returnTo が PWA のパス（/todo 等）になる。管理画面は base "/admin/" 配下
+// でしか配信されないため、そのままフルページ遷移すると dev server の base 外＝404 になる。
+// `VITE_PWA_DEV_SERVER` が指定されたときだけ、/admin・/api・/ws 以外の GET/HEAD をそちらへ
+// リダイレクトして本番（同一オリジンで PWA が / を配信）と同じ往復を再現する。
+// 未指定（`pnpm dev` 単体）では何もしない。
+function pwaDevelopmentRedirectPlugin(): Plugin | null {
+	const pwaDevServer = process.env.VITE_PWA_DEV_SERVER;
+	if (!pwaDevServer) return null;
+	return {
+		name: "yuuka-pwa-development-redirect",
+		configureServer(server) {
+			server.middlewares.use((request, response, next) => {
+				if (request.method !== "GET" && request.method !== "HEAD")
+					return next();
+				const pathname = new URL(request.url ?? "/", "http://localhost")
+					.pathname;
+				const ours = /^\/(admin|api|ws)(\/|$)/.test(pathname);
+				if (ours) return next();
+				response.statusCode = 302;
+				response.setHeader("Location", `${pwaDevServer}${request.url}`);
+				response.end();
+			});
+		},
+	};
+}
+
+// dev 専用: 本番の Rust は `/admin` も `/admin/` と同じく管理画面を返すが、Vite の dev server は
+// base "/admin/" と完全一致しない `/admin` を 404（"did you mean to visit /admin/"）にするため、
+// `/admin/` へリダイレクトして揃える。クエリは保持する。
+function adminTrailingSlashPlugin(): Plugin {
+	return {
+		name: "yuuka-admin-trailing-slash",
+		configureServer(server) {
+			server.middlewares.use((request, response, next) => {
+				const url = new URL(request.url ?? "/", "http://localhost");
+				if (url.pathname !== "/admin") return next();
+				response.statusCode = 302;
+				response.setHeader("Location", `/admin/${url.search}`);
+				response.end();
+			});
+		},
+	};
+}
+
 export default defineConfig({
 	root: __dirname,
-	base: "/", // ★デフォルト維持（/theme-init.js 等の絶対パス参照が書き換わらないよう）
+	// #34: 管理画面 SPA は Rust 側で /admin 配下に nest される
+	// （crates/yuuka-web/src/static_files.rs の ADMIN_PREFIX と一字一句一致させること）。
+	// index.html 内の public/ 直下参照（manifest/icons/theme-init.js）は %BASE_URL% で
+	// この base を反映させ、コンポーネント内の参照（materials/*）は import.meta.env.BASE_URL
+	// を使う（どちらも public/ はビルド時に書き換えられないため）。
+	base: "/admin/",
 	publicDir: "public",
 	build: {
 		outDir: "../dist/public",
-		emptyOutDir: true, // dist/public 配下のみクリア（dist/ 直下の tsgo 出力は無事）
+		// dist/public 配下をクリアする。PWA の出力先 dist/public/pwa（scripts/build-pwa.mjs）も
+		// 消えるため、`pnpm build:pwa` は必ずこのビルドの後に実行すること（root の `pnpm build` はその順）。
+		emptyOutDir: true,
 		assetsDir: "assets", // ★固定: ハッシュ資産を assets/ 直下に集約（chunk 含む）
 		assetsInlineLimit: 0, // CSP script-src 'self' 準拠: inline module/data-URI を出さない
 	},
 	plugins: [
+		adminTrailingSlashPlugin(),
+		pwaDevelopmentRedirectPlugin(),
 		svelte(),
 		// Service Worker は **無効化**（selfDestroying）。
 		// 経緯: autoUpdate + precache + StaleWhileRevalidate の構成では、アプリを開いたまま
@@ -123,6 +175,9 @@ export default defineConfig({
 	},
 	server: {
 		port: 5173,
+		// dev を Cloudflare Tunnel 経由の公開ホスト名（https）で開くため Host ヘッダ検証を外す。
+		// ホスト名をハードコードしないよう true にしている（dev server 専用・本番ビルドには影響しない）。
+		allowedHosts: true,
 		// 真に必要なのは /api と /ws/chat のみ（§5.6 参照）
 		proxy: {
 			"/api": { target: API, changeOrigin: false },

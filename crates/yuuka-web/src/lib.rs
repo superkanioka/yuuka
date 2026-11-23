@@ -9,6 +9,7 @@
 //! CSRF/ボディ上限レイヤ・WS。DAG: `web → core, types`。
 
 pub mod auth;
+pub mod client_ip;
 pub mod config;
 pub mod csrf;
 pub mod error;
@@ -18,15 +19,20 @@ pub mod scope;
 pub mod settings;
 pub mod state;
 pub mod static_files;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use auth::{AdminUser, AuthBackend, AuthenticatedUser, BearerUser, OptionalUser};
+pub use client_ip::{client_ip, rate_limit_key};
 pub use config::WebConfig;
-pub use error::ApiError;
+pub use error::{ApiError, DomainError};
 pub use extract::ScopedJson;
-pub use scope::{has_bot_access, resolve_scope};
+pub use scope::{has_bot_access, resolve_scope, ScopeError};
 pub use settings::{get_system_setting, public_legal_urls};
 pub use state::{AppState, Db};
-pub use static_files::mount_static;
+pub use static_files::{
+    mount_pwa, mount_static, mount_tts_models, ADMIN_PREFIX, TTS_MODELS_PREFIX,
+};
 
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::header::{
@@ -46,7 +52,10 @@ pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// `script-src` から `'unsafe-inline'` を除外した実効的 XSS 多層防御。`style-src` の
 /// `'unsafe-inline'` はテンプレート内 `style=` のため維持（Node 踏襲）。インライン JS を
 /// 足す場合は nonce/hash 方式へ移行すること。
-const CSP: &str = "default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; \
+///
+/// `'wasm-unsafe-eval'` は PWA の音声チャット（端末内で Irodori-TTS を動かす onnxruntime-web）が
+/// WebAssembly をコンパイルするため。JS の `eval` は許可しない（`'unsafe-eval'` とは別物）。
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com; \
 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; \
 font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; \
 img-src 'self' data: https://assets-global.website-files.com https://cdn.discordapp.com; \
@@ -68,6 +77,31 @@ pub fn apply_common_layers<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    apply_common_layers_with(router, https, allowed_host, None)
+}
+
+/// 本体 CSP の `frame-src` に `extra_frame_origin` を足す（MCP Apps のサンドボックス用オリジンを
+/// 管理画面の iframe で開くため）。`None` なら [`CSP`] そのまま。
+#[must_use]
+pub fn csp_with_frame_origin(extra_frame_origin: Option<&str>) -> String {
+    match extra_frame_origin {
+        Some(origin) => CSP.replace("frame-src 'self';", &format!("frame-src 'self' {origin};")),
+        None => CSP.to_owned(),
+    }
+}
+
+/// [`apply_common_layers`] に、本体 CSP の `frame-src` へ足すオリジンを渡せるようにしたもの。
+pub fn apply_common_layers_with<S>(
+    router: Router<S>,
+    https: bool,
+    allowed_host: Option<String>,
+    extra_frame_origin: Option<&str>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let csp = HeaderValue::from_str(&csp_with_frame_origin(extra_frame_origin))
+        .unwrap_or_else(|_| HeaderValue::from_static(CSP));
     let router = router
         .layer(axum::middleware::from_fn(
             move |req: Request, next: Next| csrf::csrf_guard(allowed_host.clone(), req, next),
@@ -87,9 +121,10 @@ where
             REFERRER_POLICY,
             HeaderValue::from_static("strict-origin-when-cross-origin"),
         ))
-        .layer(SetResponseHeaderLayer::overriding(
+        // 自前の CSP を付けたルート（MCP Apps のサンドボックスプロキシ）はそれを残す。他は本体の CSP。
+        .layer(SetResponseHeaderLayer::if_not_present(
             CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(CSP),
+            csp,
         ));
     // HSTS: HTTPS 本番のみ。2 年・サブドメイン込み（preload は運用判断で含めない）。
     if https {
@@ -134,6 +169,18 @@ mod tests {
 
     static TEST_DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn csp_frame_src_can_add_sandbox_origin() {
+        assert_eq!(super::csp_with_frame_origin(None), super::CSP);
+        let csp = super::csp_with_frame_origin(Some("https://mcp-sandbox.example"));
+        assert!(csp.contains("frame-src 'self' https://mcp-sandbox.example;"));
+        assert_ne!(
+            csp,
+            super::CSP,
+            "置換対象の frame-src が CSP から消えていないこと"
+        );
+    }
+
     /// 一意な一時 DB パスを払い出す。
     fn fresh_db_path() -> std::path::PathBuf {
         let seq = TEST_DB_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -154,7 +201,7 @@ mod tests {
     }
 
     /// `/api/me` の DB 再取得（P3-5）で 200 を返す経路用に、`users` 行を 1 件 seed した DB。
-    /// V17 実スキーマは username/password_hash/salt が NOT NULL なので最小限充足する。
+    /// V17 実スキーマは username/salt が NOT NULL なので最小限充足する。
     fn test_db_with_user(discord_id: &str, username: &str, role: Role) -> Db {
         let path = fresh_db_path();
         {
@@ -163,8 +210,8 @@ mod tests {
         let db = Db::open(&path).expect("open db"); // migrations で users 表を作成。
         let conn = rusqlite::Connection::open(&path).expect("open");
         conn.execute(
-            "INSERT OR REPLACE INTO users (discord_id, username, password_hash, salt, role) \
-             VALUES (?1, ?2, 'x', '00', ?3)",
+            "INSERT OR REPLACE INTO users (discord_id, username, salt, role) \
+             VALUES (?1, ?2, '00', ?3)",
             rusqlite::params![discord_id, username, role_text(role)],
         )
         .expect("seed user");
@@ -640,8 +687,11 @@ mod tests {
             Some(super::CSP.as_bytes())
         );
         // CSP は script-src から unsafe-inline を除外している（XSS 多層防御の核）。
-        assert!(super::CSP.contains("script-src 'self' https://static.cloudflareinsights.com;"));
-        assert!(!super::CSP.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(super::CSP.contains(
+            "script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com;"
+        ));
+        assert!(!super::CSP.contains("'unsafe-inline' https://static.cloudflareinsights.com"));
+        assert!(!super::CSP.contains("'unsafe-eval'"));
         assert_eq!(
             h.get("referrer-policy").map(|v| v.as_bytes()),
             Some(&b"strict-origin-when-cross-origin"[..])

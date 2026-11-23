@@ -6,21 +6,25 @@
 //! **wire 契約の非対称**: HTTP route の body は camelCase だが、**tool 引数は snake_case**
 //! （Node の Gemini 宣言と一致）。ツール名は Node system prompt が参照する **bare 名**を使う。
 //!
-//! 移植済み: addExpense（収支記録・`ExpenseRepo::add`）/ listRecentExpenses（直近一覧・`ExpenseRepo::list`）。
-//! これらは repo の add/list に素直に対応する。予算・支払い予定・月次集計・消込は対応 repo が
-//! 無いため未移植（deferred）。addExpense の予算消化率・消込候補（他 repo 依存）も同様に落とす。
-//! `ExpenseRepo` の get/delete には対応する Node ツールが無い（settle 内部で使うのみ）ため公開しない。
+//! 移植済み: addExpense（収支記録）/ listRecentExpenses（直近一覧・`ExpenseRepo::list`）。
+//! addExpense は支出のとき、Node と同じく予算消化率（`budget_usage`）と消込候補
+//! （`settlement_candidates`）も返す。補足の取得失敗は記帳成功を覆さず、
+//! `unavailable_supplements` に未取得項目を返す（消込候補の取得失敗は `null`）。
+//! 記録済みの収支の修正・削除は updateExpense / deleteExpense（Rust 版で追加・Node には無かった）。
+//! 収支の記録・修正・削除は管理画面・PWA と共通の [`FinanceService`] を通す（D02 #126）。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use yuuka_core::cron_util;
 use yuuka_core::tool::FunctionDeclaration;
 use yuuka_core::{DbError, Tool, ToolContext, ToolError, ToolName, ToolOutcome, UserScope};
 use yuuka_web::Db;
 
-use crate::dto::{NewExpense, NewPlannedPayment};
+use crate::dto::{ExpenseUpdate, NewExpense, NewPlannedPayment, PlannedPayment};
 use crate::repo::ExpenseRepo;
+use crate::service::FinanceService;
 
 /// このドメインが公開する Native ツール一式を作る。
 ///
@@ -36,6 +40,14 @@ pub fn tools(db: Db) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         }),
         Arc::new(ListRecentExpensesTool {
             name: ToolName::checked("listRecentExpenses".to_owned())?,
+            db: db.clone(),
+        }),
+        Arc::new(UpdateExpenseTool {
+            name: ToolName::checked("updateExpense".to_owned())?,
+            db: db.clone(),
+        }),
+        Arc::new(DeleteExpenseTool {
+            name: ToolName::checked("deleteExpense".to_owned())?,
             db: db.clone(),
         }),
         Arc::new(GetMonthlySummaryTool {
@@ -87,12 +99,6 @@ pub fn tools(db: Db) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
             db,
         }),
     ])
-}
-
-/// 最小 cron 妥当性（5 フィールド・空でない）。厳密な croner 検証は簡約（todo tools と同方針）。
-fn is_valid_cron_basic(rule: &str) -> bool {
-    let fields: Vec<&str> = rule.split_whitespace().collect();
-    fields.len() == 5 && fields.iter().all(|f| !f.is_empty())
 }
 
 /// 支払い予定 1 件の状態絵文字。
@@ -166,6 +172,28 @@ fn ok_payload(message: impl Into<String>, extra: Value) -> Value {
     Value::Object(obj)
 }
 
+/// 支払い予定 1 件の案内行（Node `planLine`）。一覧と addExpense の消込候補で共用する。
+fn plan_line(p: &PlannedPayment) -> String {
+    let repeat = if p.repeat_rule.is_some() { " 🔁" } else { "" };
+    format!(
+        "{} #{} {} {}（{}・期日 {}）{repeat}",
+        plan_status_emoji(&p.status),
+        p.id,
+        p.title,
+        format_yen(p.amount),
+        p.category,
+        p.due_date,
+    )
+}
+
+/// `'YYYY-MM-DD'` から年・月を取り出す（予算消化率を集計する月の特定用）。
+fn year_month_of(date: &str) -> Option<(i64, i64)> {
+    let mut parts = date.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = parts.next()?.parse().ok()?;
+    Some((year, month))
+}
+
 /// `{success:false, message}`（Node `fail(msg)`）。実行エラーではなく「妥当だが失敗」な結果。
 fn fail_payload(message: impl Into<String>) -> ToolOutcome {
     ToolOutcome::from_payload(json!({ "success": false, "message": message.into() }))
@@ -215,8 +243,8 @@ fn is_ymd(s: &str) -> bool {
     }
 }
 
-/// DbError をツール実行エラーへ（握り潰さず Gemini へ `{success:false}` として返る・§8.4）。
-fn exec_err(e: DbError) -> ToolError {
+/// DB・サービスの失敗をツール実行エラーへ（握り潰さず Gemini へ `{success:false}` として返る・§8.4）。
+fn exec_err(e: impl std::fmt::Display) -> ToolError {
     ToolError::Execution(e.to_string())
 }
 
@@ -253,7 +281,8 @@ impl Tool for AddExpenseTool {
                     "type": { "type": "string", "description": "収入か支出か。'expense'=支出（既定）/'income'=収入（任意）" },
                     "memo": { "type": "string", "description": "メモ。店名・品目・用途など（任意）" },
                     "date": { "type": "string", "description": "日付。形式 YYYY-MM-DD。省略=今日（任意）" },
-                    "time": { "type": "string", "description": "時刻。形式 HH:MM:SS（任意）" }
+                    "time": { "type": "string", "description": "時刻。形式 HH:MM:SS（任意）" },
+                    "source": { "type": "string", "enum": ["manual", "receipt_ocr"], "description": "レシート読み取りからの記帳は receipt_ocr。省略は manual" }
                 },
                 "required": ["amount", "category"]
             }),
@@ -287,18 +316,23 @@ impl Tool for AddExpenseTool {
             r#type: arg_str(&args, "type"),
         };
 
-        let expense = ExpenseRepo::new(&self.db)
-            .add(&scope_of(ctx), new)
+        let expense = FinanceService::new(&self.db)
+            .add_transaction(
+                &scope_of(ctx),
+                new,
+                args.get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("manual"),
+            )
             .await
             .map_err(exec_err)?;
 
-        // NOTE: 予算消化率・消込候補（budget_limits / planned_payments）は対応 repo が無いため落とす。
         let memo_suffix = expense
             .memo
             .as_ref()
             .map(|m| format!(" — {m}"))
             .unwrap_or_default();
-        let message = format!(
+        let mut message = format!(
             "{} {}円 ({}) を記録しました{} (ID: #{})",
             type_label(&expense.r#type),
             expense.amount,
@@ -306,9 +340,246 @@ impl Tool for AddExpenseTool {
             memo_suffix,
             expense.id,
         );
+        let mut unavailable = Vec::new();
+        let mut extra = serde_json::Map::new();
+        extra.insert("expense".to_owned(), json!(expense));
+        extra.insert("settlement_candidates".to_owned(), json!([]));
+
+        // 支出のときだけ予算消化率と消込候補を添え、ユーザーへの確認につなげる（Node addExpense）。
+        if expense.r#type == "expense" {
+            let scope = scope_of(ctx);
+            let repo = ExpenseRepo::new(&self.db);
+
+            // 記帳は確定済み。補足の読み出し失敗をツール失敗として返さない。
+            let budget_result: Result<(), DbError> = async {
+                let limit = repo
+                    .list_budget_limits(&scope)
+                    .await?
+                    .into_iter()
+                    .find(|l| l.category == expense.category);
+                if let (Some(limit), Some((year, month))) = (limit, year_month_of(&expense.date)) {
+                    let spent = repo
+                        .monthly_category_breakdown(&scope, year, month, "expense")
+                        .await?
+                        .into_iter()
+                        .find(|c| c.category == expense.category)
+                        .map_or(0, |c| c.total);
+                    let ratio = if limit.limit_amount > 0 {
+                        ((spent as f64 / limit.limit_amount as f64) * 100.0).round() as i64
+                    } else {
+                        0
+                    };
+                    message.push_str(&format!(
+                        "\n{}の{year}年{month}月の予算消化率: {ratio}% ({} / {})",
+                        expense.category,
+                        format_yen(spent),
+                        format_yen(limit.limit_amount),
+                    ));
+                    if ratio >= 100 {
+                        message.push_str(" ⚠️予算を超過しています！");
+                    } else if ratio >= 80 {
+                        message.push_str(" ⚠️予算の8割を超えています。");
+                    }
+                    extra.insert(
+                        "budget_usage".to_owned(),
+                        json!({
+                            "limit_amount": limit.limit_amount,
+                            "spent": spent,
+                            "ratio_percent": ratio,
+                        }),
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = budget_result {
+                tracing::warn!(expense_id = expense.id, %error, "Recorded expense but could not load budget usage");
+                unavailable.push("budget_usage");
+            }
+
+            let candidates = repo
+                .find_settlement_candidates(
+                    &scope,
+                    expense.amount,
+                    expense.category.clone(),
+                    Some(expense.date.clone()),
+                )
+                .await;
+            match candidates {
+                Err(error) => {
+                    tracing::warn!(expense_id = expense.id, %error, "Recorded expense but could not load settlement candidates");
+                    unavailable.push("settlement_candidates");
+                    extra.insert("settlement_candidates".to_owned(), Value::Null);
+                }
+                Ok(candidates) if !candidates.is_empty() => {
+                    let lines: Vec<String> = candidates.iter().map(plan_line).collect();
+                    message.push_str(&format!(
+                        "\n💡 この支出に対応しそうな支払い予定が{}件あります:\n{}\n\
+                     消込するかユーザーに確認し、承認されたら \
+                     settlePlannedPayment(plan_id, expense_id={}) を呼んでください。",
+                        candidates.len(),
+                        lines.join("\n"),
+                        expense.id,
+                    ));
+                    extra.insert("settlement_candidates".to_owned(), json!(candidates));
+                }
+                Ok(_) => {}
+            }
+        }
+
+        if !unavailable.is_empty() {
+            message.push_str("\n記帳は完了していますが、予算消化率または消込候補の補足情報を取得できませんでした。再記帳は不要です。");
+            extra.insert("unavailable_supplements".to_owned(), json!(unavailable));
+        }
+
+        Ok(ToolOutcome::from_payload(ok_payload(
+            message,
+            Value::Object(extra),
+        )))
+    }
+}
+
+// ─── updateExpense ───────────────────────────────────────────────────────────
+
+struct UpdateExpenseTool {
+    name: ToolName,
+    db: Db,
+}
+
+#[async_trait]
+impl Tool for UpdateExpenseTool {
+    fn declaration(&self) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: self.name.clone(),
+            description: "記録済みの収支 1 件を修正する（金額・カテゴリ・収支の種別・メモ・日付・時刻）。\
+                「さっきの記録を3333円に直して」のような修正依頼では、新しく addExpense せずにこれを使う。\
+                変更したい項目だけ指定する。どの記録か分からない時は先に listRecentExpenses で ID を確認する。"
+                .to_owned(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "expense_id": { "type": "number", "description": "修正する記録の ID（addExpense / listRecentExpenses が返す #番号）" },
+                    "amount": { "type": "number", "description": "新しい金額。円単位の1以上の整数（任意）" },
+                    "category": { "type": "string", "description": "新しいカテゴリ（任意）" },
+                    "type": { "type": "string", "description": "'expense'=支出 / 'income'=収入（任意）" },
+                    "memo": { "type": "string", "description": "新しいメモ（任意）" },
+                    "date": { "type": "string", "description": "新しい日付。形式 YYYY-MM-DD（任意）" },
+                    "time": { "type": "string", "description": "新しい時刻。形式 HH:MM:SS（任意）" }
+                },
+                "required": ["expense_id"]
+            }),
+            requires_confirmation: false,
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+        let Some(id) = arg_i64(&args, "expense_id") else {
+            return Ok(fail_payload("expense_id を指定してください。"));
+        };
+        let amount = arg_i64(&args, "amount");
+        if amount.is_some_and(|n| n <= 0) {
+            return Ok(fail_payload(
+                "amount は1以上の整数（円）で指定してください。",
+            ));
+        }
+        let date = arg_str(&args, "date");
+        if date.as_deref().is_some_and(|d| !is_ymd(d)) {
+            return Ok(fail_payload("date は YYYY-MM-DD 形式で指定してください。"));
+        }
+        let r#type = arg_str(&args, "type");
+        if r#type
+            .as_deref()
+            .is_some_and(|t| t != "expense" && t != "income")
+        {
+            return Ok(fail_payload(
+                "type は 'expense' か 'income' で指定してください。",
+            ));
+        }
+        let update = ExpenseUpdate {
+            amount,
+            category: arg_str(&args, "category"),
+            memo: arg_str(&args, "memo"),
+            date,
+            time: arg_str(&args, "time"),
+            r#type,
+        };
+        if update.is_empty() {
+            return Ok(fail_payload("変更する項目を1つ以上指定してください。"));
+        }
+
+        let Some(expense) = FinanceService::new(&self.db)
+            .update(&scope_of(ctx), id, update)
+            .await
+            .map_err(exec_err)?
+        else {
+            return Ok(fail_payload(format!("ID #{id} の記録が見つかりません。")));
+        };
+        let message = format!(
+            "記録 #{} を {} {}円 ({}) に修正しました",
+            expense.id,
+            type_label(&expense.r#type),
+            expense.amount,
+            expense.category,
+        );
         Ok(ToolOutcome::from_payload(ok_payload(
             message,
             json!({ "expense": expense }),
+        )))
+    }
+}
+
+// ─── deleteExpense ───────────────────────────────────────────────────────────
+
+struct DeleteExpenseTool {
+    name: ToolName,
+    db: Db,
+}
+
+#[async_trait]
+impl Tool for DeleteExpenseTool {
+    fn declaration(&self) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: self.name.clone(),
+            description: "記録済みの収支 1 件を削除する。ユーザーが削除を求めた時だけ使う。\
+                どの記録か分からない時は先に listRecentExpenses で ID を確認する。"
+                .to_owned(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "expense_id": { "type": "number", "description": "削除する記録の ID（addExpense / listRecentExpenses が返す #番号）" }
+                },
+                "required": ["expense_id"]
+            }),
+            requires_confirmation: false,
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+        let Some(id) = arg_i64(&args, "expense_id") else {
+            return Ok(fail_payload("expense_id を指定してください。"));
+        };
+        let repo = ExpenseRepo::new(&self.db);
+        let scope = scope_of(ctx);
+        let Some(expense) = repo.get(&scope, id).await.map_err(exec_err)? else {
+            return Ok(fail_payload(format!("ID #{id} の記録が見つかりません。")));
+        };
+        if !FinanceService::new(&self.db)
+            .delete(&scope, id)
+            .await
+            .map_err(exec_err)?
+        {
+            return Ok(fail_payload(format!("ID #{id} の記録が見つかりません。")));
+        }
+        let message = format!(
+            "記録 #{} ({} {}円 {}) を削除しました",
+            expense.id,
+            type_label(&expense.r#type),
+            expense.amount,
+            expense.category,
+        );
+        Ok(ToolOutcome::from_payload(ok_payload(
+            message,
+            json!({ "deleted": expense }),
         )))
     }
 }
@@ -794,21 +1065,7 @@ impl Tool for ListPlannedPaymentsTool {
                 json!({ "plans": [] }),
             )));
         }
-        let lines: Vec<String> = plans
-            .iter()
-            .map(|p| {
-                let repeat = if p.repeat_rule.is_some() { " 🔁" } else { "" };
-                format!(
-                    "{} #{} {} {}（{}・期日 {}）{repeat}",
-                    plan_status_emoji(&p.status),
-                    p.id,
-                    p.title,
-                    format_yen(p.amount),
-                    p.category,
-                    p.due_date,
-                )
-            })
-            .collect();
+        let lines: Vec<String> = plans.iter().map(plan_line).collect();
         Ok(ToolOutcome::from_payload(ok_payload(
             format!("支払い予定 ({}件):\n{}", plans.len(), lines.join("\n")),
             json!({ "plans": plans }),
@@ -873,7 +1130,7 @@ impl Tool for AddPlannedPaymentTool {
         };
         let repeat_rule = arg_str(&args, "repeat_rule");
         if let Some(rule) = &repeat_rule {
-            if !is_valid_cron_basic(rule) {
+            if !cron_util::is_valid(rule) {
                 return Ok(fail_payload(format!(
                     "repeat_rule のcron式が不正です: {rule}（例: '0 0 27 * *' = 毎月27日）"
                 )));
@@ -923,14 +1180,18 @@ impl Tool for SettlePlannedPaymentTool {
     fn declaration(&self) -> FunctionDeclaration {
         FunctionDeclaration {
             name: self.name.clone(),
-            description: "支払い予定を「支払い済み」にして家計簿に実支出として記帳する（消込）。\
-                「家賃払った」等で呼ぶ。紐付く未完了 ToDo があれば自動で完了になる。\
+            description: "支払い予定を「支払い済み」にする（消込）。「家賃払った」等で呼ぶ。\
+                expense_id を渡すと、その記帳済みの支出記録と紐付けて消込する（新しい支出は記録しない）。\
+                省くと予定の金額・カテゴリで新しい支出を家計簿に記帳して消込する。\
+                レシート等で先に記帳した支払いを消込む時は、二重計上を避けるため expense_id を渡す。\
+                紐付く未完了 ToDo があれば自動で完了になり、紐付く期日前リマインドは止まる。\
                 まだ払っていない予定を取り消すだけなら cancelPlannedPayment を使う。"
                 .to_owned(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
-                    "plan_id": { "type": "number", "description": "消込する支払い予定のID（#のあとの番号）" }
+                    "plan_id": { "type": "number", "description": "消込する支払い予定のID（#のあとの番号）" },
+                    "expense_id": { "type": "number", "description": "紐付ける記帳済みの支出記録の ID（addExpense / listRecentExpenses が返す #番号）。省略=予定の内容で支出を新しく記録して消込する（任意）" }
                 },
                 "required": ["plan_id"]
             }),
@@ -941,6 +1202,19 @@ impl Tool for SettlePlannedPaymentTool {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
         let Some(plan_id) = arg_int(&args, "plan_id") else {
             return Ok(fail_payload("plan_id を指定してください。"));
+        };
+        // expense_id が渡されたのに数値として読めない時は、新規記帳へ落とさず失敗にする
+        // （黙って新しい支出を作ると二重計上になるため）。
+        let existing_expense_id = match args.get("expense_id") {
+            None | Some(Value::Null) => None,
+            Some(_) => match arg_i64(&args, "expense_id") {
+                Some(id) => Some(id),
+                None => {
+                    return Ok(fail_payload(
+                        "expense_id は支出記録の ID（#のあとの番号）で指定してください。",
+                    ))
+                }
+            },
         };
         let scope = scope_of(ctx);
         let repo = ExpenseRepo::new(&self.db);
@@ -959,23 +1233,81 @@ impl Tool for SettlePlannedPaymentTool {
                 "支払い予定 #{plan_id} は既に{state}です。"
             )));
         }
-        // 予定内容で新規記帳 + 消込 + 紐付き ToDo 自動完了（expense_id 指定での既存記録紐付けは deferred）。
-        let (expense_id, completed) = repo.settle_plan(&scope, &plan).await.map_err(exec_err)?;
+
+        // expense_id 指定: 記帳済みの支出と紐付けて消込 + 紐付き ToDo 自動完了 + 紐付きリマインド停止
+        // （新規記帳しない・R14）。
+        if let Some(expense_id) = existing_expense_id {
+            let Some(expense) = repo.get(&scope, expense_id).await.map_err(exec_err)? else {
+                return Ok(fail_payload(format!(
+                    "支出記録 #{expense_id} が見つかりません。"
+                )));
+            };
+            if expense.r#type != "expense" {
+                return Ok(fail_payload(format!(
+                    "記録 #{expense_id} は収入のため消込に使えません。"
+                )));
+            }
+            let Some(settled) = repo
+                .settle_plan_with_expense(&scope, plan_id, expense_id)
+                .await
+                .map_err(exec_err)?
+            else {
+                return Ok(fail_payload(format!(
+                    "支払い予定 #{plan_id} の消込に失敗しました。"
+                )));
+            };
+            return Ok(ToolOutcome::from_payload(ok_payload(
+                format!(
+                    "支払い予定「{}」({}) を消込しました✅ 支出記録 #{expense_id} と紐付けました。{}{}",
+                    plan.title,
+                    format_yen(plan.amount),
+                    completed_todo_note(settled.completed_todos),
+                    cancelled_reminder_note(settled.cancelled_reminder_id),
+                ),
+                json!({
+                    "expense": expense,
+                    "completed_todos": settled.completed_todos,
+                    "cancelled_reminder_id": settled.cancelled_reminder_id,
+                }),
+            )));
+        }
+
+        // expense_id 省略: 予定内容で新規記帳 + 消込 + 紐付き ToDo 自動完了 + 紐付きリマインド停止。
+        let settled = repo.settle_plan(&scope, &plan).await.map_err(exec_err)?;
+        let expense_id = settled.expense_id;
         let expense = repo.get(&scope, expense_id).await.map_err(exec_err)?;
-        let todo_note = if completed > 0 {
-            format!(" 紐付きToDo {completed} 件を自動的に完了にしました✅")
-        } else {
-            String::new()
-        };
         Ok(ToolOutcome::from_payload(ok_payload(
             format!(
-                "支払い予定「{}」({}) を消込しました✅ 支出 {} を新規記帳しました (ID: #{expense_id})。{todo_note}",
+                "支払い予定「{}」({}) を消込しました✅ 支出 {} を新規記帳しました (ID: #{expense_id})。{}{}",
                 plan.title,
                 format_yen(plan.amount),
                 format_yen(plan.amount),
+                completed_todo_note(settled.completed_todos),
+                cancelled_reminder_note(settled.cancelled_reminder_id),
             ),
-            json!({ "expense": expense, "completed_todos": completed }),
+            json!({
+                "expense": expense,
+                "completed_todos": settled.completed_todos,
+                "cancelled_reminder_id": settled.cancelled_reminder_id,
+            }),
         )))
+    }
+}
+
+/// 消込で自動完了した ToDo の補足文（0 件なら空）。
+fn completed_todo_note(completed: i64) -> String {
+    if completed > 0 {
+        format!(" 紐付きToDo {completed} 件を自動的に完了にしました✅")
+    } else {
+        String::new()
+    }
+}
+
+/// 消込で止めた期日前リマインドの補足文（止めていなければ空・Node `settlePlannedPayment`）。
+fn cancelled_reminder_note(reminder_id: Option<i64>) -> String {
+    match reminder_id {
+        Some(rid) => format!(" 期日前リマインド (#{rid}) をキャンセルしました。"),
+        None => String::new(),
     }
 }
 
@@ -992,7 +1324,8 @@ impl Tool for CancelPlannedPaymentTool {
         FunctionDeclaration {
             name: self.name.clone(),
             description: "まだ支払っていない支払い予定を取り消す（キャンセル）。\
-                「来月の予定はもういらない」等で呼ぶ。実際に支払った時は settlePlannedPayment を使う。"
+                「来月の予定はもういらない」等で呼ぶ。実際に支払った時は settlePlannedPayment を使う。\
+                紐付く期日前リマインドも自動で取り消される。"
                 .to_owned(),
             parameters_json_schema: json!({
                 "type": "object",
@@ -1026,15 +1359,22 @@ impl Tool for CancelPlannedPaymentTool {
                 "支払い予定 #{plan_id} は既に{state}です。"
             )));
         }
-        // NOTE: 紐付きリマインドの期日前キャンセル（linked_reminder_id）は cross-domain のため deferred。
-        if !repo.cancel_plan(&scope, plan_id).await.map_err(exec_err)? {
+        // 紐付く期日前リマインドは repo が同じトランザクションで止める（R15）。
+        let Some(cancelled) = repo.cancel_plan(&scope, plan_id).await.map_err(exec_err)? else {
             return Ok(fail_payload(format!(
                 "支払い予定 #{plan_id} のキャンセルに失敗しました。"
             )));
-        }
+        };
+        let reminder_note = match cancelled.cancelled_reminder_id {
+            Some(rid) => format!(" 期日前リマインド (#{rid}) もキャンセルしました。"),
+            None => String::new(),
+        };
         Ok(ToolOutcome::from_payload(ok_payload(
-            format!("支払い予定「{}」をキャンセルしました。", plan.title),
-            json!({}),
+            format!(
+                "支払い予定「{}」をキャンセルしました。{reminder_note}",
+                plan.title
+            ),
+            json!({ "cancelled_reminder_id": cancelled.cancelled_reminder_id }),
         )))
     }
 }
@@ -1315,10 +1655,10 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     // lib.rs の #[cfg(test)] と同一の実効スキーマ（migrations.ts + bot_id ALTER）。
-    const EXPENSES_DDL: &str = "CREATE TABLE expenses (
+    const EXPENSES_DDL: &str = "DROP TABLE IF EXISTS expenses; CREATE TABLE expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         type TEXT NOT NULL DEFAULT 'expense',
         amount INTEGER NOT NULL,
         category TEXT NOT NULL,
@@ -1329,21 +1669,23 @@ mod tests {
         created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
     );";
 
-    // budget_limits を FK 無しで先に作る（V17 の users FK を避ける・todo tools テストと同方針）。
-    const BUDGET_LIMITS_DDL: &str = "CREATE TABLE budget_limits (
+    // budget_limits を migration 後に FK 無しで置き換える（V17 の users FK を避ける・todo tools テストと同方針）。
+    const BUDGET_LIMITS_DDL: &str =
+        "DROP TABLE IF EXISTS budget_limits; CREATE TABLE budget_limits (
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         category TEXT NOT NULL,
         limit_amount INTEGER NOT NULL DEFAULT 50000,
         updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
         PRIMARY KEY (user_id, bot_id, category)
     );";
 
-    // planned_payments を FK 無しで先に作る（V17 の users FK を避ける）。
-    const PLANNED_PAYMENTS_DDL: &str = "CREATE TABLE planned_payments (
+    // planned_payments を migration 後に FK 無しで置き換える（V17 の users FK を避ける）。
+    const PLANNED_PAYMENTS_DDL: &str =
+        "DROP TABLE IF EXISTS planned_payments; CREATE TABLE planned_payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         title TEXT NOT NULL,
         amount INTEGER NOT NULL,
         category TEXT NOT NULL,
@@ -1360,10 +1702,11 @@ mod tests {
 
     // settle_plan が紐付き ToDo を自動完了するため todos を用意（FK 無し・migration の index が参照
     // する列を欠かさないよう V17 全列を持つ・todo crate テストと同一 DDL）。
-    const TODOS_DDL: &str = "CREATE TABLE todos (
+    const TODOS_DDL: &str =
+        "DROP TABLE IF EXISTS todos; CREATE TABLE todos (list TEXT NOT NULL DEFAULT '個人',
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         title TEXT NOT NULL, description TEXT, due_date TEXT, start_date TEXT,
         priority TEXT, tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open',
         progress INTEGER NOT NULL DEFAULT 0, parent_id INTEGER, linked_payment_id INTEGER,
@@ -1372,10 +1715,10 @@ mod tests {
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));";
 
     // link_reminder が reminders へ挿入するため FK 無しで用意（V17 の users FK を避ける）。
-    const REMINDERS_DDL: &str = "CREATE TABLE reminders (
+    const REMINDERS_DDL: &str = "DROP TABLE IF EXISTS reminders; CREATE TABLE reminders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         message TEXT NOT NULL,
         trigger_at TEXT NOT NULL,
         repeat_rule TEXT,
@@ -1393,11 +1736,13 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = Connection::open(&path).unwrap();
+            let mut conn = Connection::open(&path).unwrap();
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(EXPENSES_DDL).unwrap();
             conn.execute_batch(BUDGET_LIMITS_DDL).unwrap();
             conn.execute_batch(PLANNED_PAYMENTS_DDL).unwrap();
-            conn.execute_batch(TODOS_DDL).unwrap();
+            yuuka_db::test_support::execute_unit_ddl(&conn, TODOS_DDL).unwrap();
             conn.execute_batch(REMINDERS_DDL).unwrap();
         }
         Db::open(&path).unwrap()
@@ -1412,6 +1757,99 @@ mod tests {
             .iter()
             .find(|t| t.declaration().name.as_str() == name)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn receipt_source_is_saved_by_existing_tool_and_scoped() {
+        let db = seed_db();
+        let tool_set = tools(db.clone()).unwrap();
+        let add = find(&tool_set, "addExpense");
+        for (source, expected) in [
+            (Some("receipt_ocr"), "receipt_ocr"),
+            (Some("unknown"), "manual"),
+            (None, "manual"),
+        ] {
+            let mut args = json!({"amount": 600, "category": "食費"});
+            if let Some(source) = source {
+                args["source"] = json!(source);
+            }
+            let out = add.call(&ctx(), args).await.unwrap();
+            assert_eq!(out.payload["success"], true);
+            let id = out.payload["expense"]["id"].as_i64().unwrap();
+            let repo = ExpenseRepo::new(&db);
+            let saved = repo.get(&scope_of(&ctx()), id).await.unwrap().unwrap();
+            assert_eq!(saved.source, expected);
+            for foreign in [
+                UserScope::new(UserId::new("other"), ctx().bot_id),
+                UserScope::new(ctx().user_id, BotId::new("other-bot")),
+            ] {
+                assert!(repo.get(&foreign, id).await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_expense() {
+        let db = seed_db();
+        let tools = tools(db).unwrap();
+        let add = find(&tools, "addExpense");
+        let update = find(&tools, "updateExpense");
+        let delete = find(&tools, "deleteExpense");
+
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 600, "category": "食費", "memo": "卵"}),
+            )
+            .await
+            .unwrap();
+        let id = out.payload["expense"]["id"].as_i64().unwrap();
+
+        // 指定した項目だけ変わる。
+        let out = update
+            .call(&ctx(), json!({"expense_id": id, "amount": 3333}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true, "{}", out.payload);
+        assert_eq!(out.payload["expense"]["amount"], 3333);
+        assert_eq!(out.payload["expense"]["category"], "食費");
+        assert_eq!(out.payload["expense"]["memo"], "卵");
+
+        // 不正な値・変更なし・他人の記録は fail。
+        for args in [
+            json!({"expense_id": id}),
+            json!({"expense_id": id, "amount": 0}),
+            json!({"expense_id": id, "date": "2026/10/06"}),
+            json!({"expense_id": id, "type": "refund"}),
+            json!({"amount": 100}),
+        ] {
+            let out = update.call(&ctx(), args.clone()).await.unwrap();
+            assert_eq!(out.payload["success"], false, "{args}");
+        }
+        let other = ToolContext::new(BotId::system_default(), UserId::new("userB"));
+        let out = update
+            .call(&other, json!({"expense_id": id, "amount": 1}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], false);
+        let out = delete
+            .call(&other, json!({"expense_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], false);
+
+        // 削除すると一覧から消え、2 回目は見つからない。
+        let out = delete
+            .call(&ctx(), json!({"expense_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(out.payload["deleted"]["amount"], 3333);
+        let out = delete
+            .call(&ctx(), json!({"expense_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], false);
     }
 
     #[tokio::test]
@@ -1642,6 +2080,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.payload["success"], false);
+        // 5 フィールドでも実行時 parser が解釈できない repeat_rule は登録しない。
+        let out = add.call(&ctx(), json!({"title": "家賃", "amount": 80000, "category": "その他", "due_date": "2026-08-27", "repeat_rule": "0 0 32 * *"})).await.unwrap();
+        assert_eq!(out.payload["success"], false);
         // 正常追加 2 件。
         let out = add.call(&ctx(), json!({"title": "家賃", "amount": 80000, "category": "その他", "due_date": "2026-08-27"})).await.unwrap();
         assert_eq!(out.payload["success"], true);
@@ -1684,6 +2125,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.payload["plans"].as_array().unwrap().len(), 1);
+    }
+
+    /// R14: expense_id を渡すと記帳済みの支出に紐付けて消込し、新しい支出を作らない（二重計上防止）。
+    #[tokio::test]
+    async fn settle_with_existing_expense_does_not_record_again() {
+        let db = seed_db();
+        let tools = tools(db).unwrap();
+        let add_expense = find(&tools, "addExpense");
+        let list_expenses = find(&tools, "listRecentExpenses");
+        let add = find(&tools, "addPlannedPayment");
+        let link = find(&tools, "linkPlannedPaymentTodo");
+        let list = find(&tools, "listPlannedPayments");
+        let settle = find(&tools, "settlePlannedPayment");
+
+        // 先にレシート等で記帳した支払い・収入・他ユーザーの支出。
+        let out = add_expense
+            .call(
+                &ctx(),
+                json!({"amount": 80000, "category": "その他", "memo": "家賃"}),
+            )
+            .await
+            .unwrap();
+        let paid = out.payload["expense"]["id"].as_i64().unwrap();
+        let out = add_expense
+            .call(
+                &ctx(),
+                json!({"amount": 80000, "category": "その他", "type": "income"}),
+            )
+            .await
+            .unwrap();
+        let income = out.payload["expense"]["id"].as_i64().unwrap();
+        let other = ToolContext::new(BotId::system_default(), UserId::new("userB"));
+        let out = add_expense
+            .call(&other, json!({"amount": 80000, "category": "その他"}))
+            .await
+            .unwrap();
+        let others = out.payload["expense"]["id"].as_i64().unwrap();
+
+        let out = add.call(&ctx(), json!({"title": "家賃", "amount": 80000, "category": "その他", "due_date": "2026-08-27"})).await.unwrap();
+        let plan_id = out.payload["plan"]["id"].as_i64().unwrap();
+        link.call(&ctx(), json!({"plan_id": plan_id}))
+            .await
+            .unwrap();
+
+        // 使えない expense_id は失敗し、新規記帳にも落ちない（予定は pending のまま）。
+        for bad in [
+            json!(99999),
+            json!(income),
+            json!(others),
+            json!("abc"),
+            json!(true),
+        ] {
+            let out = settle
+                .call(&ctx(), json!({"plan_id": plan_id, "expense_id": bad}))
+                .await
+                .unwrap();
+            assert_eq!(out.payload["success"], false, "expense_id={bad}");
+        }
+        let out = list.call(&ctx(), json!({})).await.unwrap();
+        assert_eq!(out.payload["plans"][0]["status"], "pending");
+        let out = list_expenses.call(&ctx(), json!({})).await.unwrap();
+        assert_eq!(out.payload["expenses"].as_array().unwrap().len(), 2);
+
+        // 記帳済みの支出で消込: その支出を返し、紐付き ToDo を完了し、支出は増えない。
+        let out = settle
+            .call(&ctx(), json!({"plan_id": plan_id, "expense_id": paid}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(out.payload["expense"]["id"].as_i64(), Some(paid));
+        assert_eq!(out.payload["completed_todos"], 1);
+        assert!(out.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("支出記録 #{paid} と紐付けました")));
+        let out = list_expenses.call(&ctx(), json!({})).await.unwrap();
+        assert_eq!(out.payload["expenses"].as_array().unwrap().len(), 2);
+        let out = list
+            .call(&ctx(), json!({"status": "settled"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.payload["plans"][0]["settled_expense_id"].as_i64(),
+            Some(paid)
+        );
+
+        // 数値文字列の ID も受け付ける（別の予定・別の支出で確認）。
+        let out = add_expense
+            .call(&ctx(), json!({"amount": 5000, "category": "光熱費"}))
+            .await
+            .unwrap();
+        let paid2 = out.payload["expense"]["id"].as_i64().unwrap();
+        let out = add.call(&ctx(), json!({"title": "電気代", "amount": 5000, "category": "光熱費", "due_date": "2026-08-27"})).await.unwrap();
+        let plan2 = out.payload["plan"]["id"].as_i64().unwrap();
+        let out = settle
+            .call(
+                &ctx(),
+                json!({"plan_id": plan2, "expense_id": paid2.to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(out.payload["expense"]["id"].as_i64(), Some(paid2));
+        assert_eq!(out.payload["completed_todos"], 0);
     }
 
     #[tokio::test]
@@ -1747,10 +2292,222 @@ mod tests {
         assert_eq!(out.payload["candidates"].as_array().unwrap().len(), 0);
     }
 
+    enum SupplementFault {
+        BudgetLimits,
+        MonthlyBreakdown,
+        SettlementCandidates,
+    }
+
+    // 実際の SQLite 読み出しエラーでも確定済みの記帳を失敗扱いにしない。
+    async fn assert_expense_survives_supplement_failure(fault: SupplementFault) {
+        let db = seed_db();
+        let tool_set = tools(db.clone()).unwrap();
+        find(&tool_set, "setBudgetLimit")
+            .call(&ctx(), json!({"category": "食費", "limit_amount": 10000}))
+            .await
+            .unwrap();
+        // 予算側の障害でも消込候補は読み出せることを確認する。
+        find(&tool_set, "addPlannedPayment")
+            .call(&ctx(), json!({"title": "食費予定", "amount": 1000, "category": "食費", "due_date": "2026-08-20"}))
+            .await
+            .unwrap();
+        let unavailable = if matches!(fault, SupplementFault::SettlementCandidates) {
+            "settlement_candidates"
+        } else {
+            "budget_usage"
+        };
+        db.writer
+            .execute(move |conn| {
+                match fault {
+                    SupplementFault::BudgetLimits => conn.execute_batch("DROP TABLE budget_limits"),
+                    SupplementFault::MonthlyBreakdown => conn.execute_batch(
+                        "INSERT INTO expenses (user_id, bot_id, amount, category, date)
+                     VALUES ('userA', 'system_default', 9223372036854775807, '食費', '2026-08-01')",
+                    ),
+                    SupplementFault::SettlementCandidates => {
+                        conn.execute_batch("DROP TABLE planned_payments")
+                    }
+                }
+                .map_err(yuuka_db::map_sqlite)
+            })
+            .await
+            .unwrap();
+        let repo = ExpenseRepo::new(&db);
+        let before = repo.list(&scope_of(&ctx())).await.unwrap().len();
+        let out = find(&tool_set, "addExpense")
+            .call(&ctx(), json!({"amount": 1000, "category": "食費", "date": "2026-08-20", "memo": "今回の記帳"}))
+            .await
+            .expect("補足情報の取得失敗は記帳成功を覆さない");
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(out.payload["unavailable_supplements"], json!([unavailable]));
+        assert!(out.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("再記帳は不要"));
+        let entries = repo.list(&scope_of(&ctx())).await.unwrap();
+        assert_eq!(entries.len(), before + 1);
+        let recorded: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.memo.as_deref() == Some("今回の記帳"))
+            .collect();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(out.payload["expense"]["id"], recorded[0].id);
+        if unavailable == "budget_usage" {
+            assert!(out.payload.get("budget_usage").is_none());
+            assert_eq!(
+                out.payload["settlement_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            assert!(out.payload["settlement_candidates"].is_null());
+            assert_eq!(out.payload["budget_usage"]["spent"], 1000);
+        }
+    }
+
+    #[tokio::test]
+    async fn add_expense_survives_budget_limits_read_failure() {
+        assert_expense_survives_supplement_failure(SupplementFault::BudgetLimits).await;
+    }
+
+    #[tokio::test]
+    async fn add_expense_survives_monthly_breakdown_read_failure() {
+        assert_expense_survives_supplement_failure(SupplementFault::MonthlyBreakdown).await;
+    }
+
+    #[tokio::test]
+    async fn add_expense_survives_settlement_candidates_read_failure() {
+        assert_expense_survives_supplement_failure(SupplementFault::SettlementCandidates).await;
+    }
+
+    #[tokio::test]
+    async fn add_expense_reports_budget_usage_of_its_month() {
+        let db = seed_db();
+        let tools = tools(db).unwrap();
+        let add = find(&tools, "addExpense");
+        let set_budget = find(&tools, "setBudgetLimit");
+
+        // 予算未設定のカテゴリは budget_usage を返さない。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 7000, "category": "食費", "date": "2026-08-10"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.payload.get("budget_usage").is_none());
+
+        set_budget
+            .call(&ctx(), json!({"category": "食費", "limit_amount": 10000}))
+            .await
+            .unwrap();
+        // 別の月の支出は消化額に入らない。
+        add.call(
+            &ctx(),
+            json!({"amount": 5000, "category": "食費", "date": "2026-07-31"}),
+        )
+        .await
+        .unwrap();
+
+        // 8月: 7000 + 2000 = 9000 / 10000 → 90%（8割超えの注意）。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 2000, "category": "食費", "date": "2026-08-12"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.payload["budget_usage"]["spent"], 9000);
+        assert_eq!(out.payload["budget_usage"]["limit_amount"], 10000);
+        assert_eq!(out.payload["budget_usage"]["ratio_percent"], 90);
+        let message = out.payload["message"].as_str().unwrap();
+        assert!(message.contains("食費の2026年8月の予算消化率: 90% (¥9,000 / ¥10,000)"));
+        assert!(message.contains("予算の8割を超えています"));
+
+        // 9000 + 2000 = 11000 → 110%（超過の注意）。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 2000, "category": "食費", "date": "2026-08-20"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.payload["budget_usage"]["ratio_percent"], 110);
+        assert!(out.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("予算を超過しています"));
+
+        // 収入は予算の対象外。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 2000, "category": "食費", "type": "income", "date": "2026-08-20"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.payload.get("budget_usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn add_expense_suggests_settlement_candidates() {
+        let db = seed_db();
+        let tools = tools(db).unwrap();
+        let add = find(&tools, "addExpense");
+        let add_plan = find(&tools, "addPlannedPayment");
+
+        add_plan
+            .call(&ctx(), json!({"title": "家賃", "amount": 80000, "category": "その他", "due_date": "2026-08-27"}))
+            .await
+            .unwrap();
+
+        // 一致する支出: 候補 1 件と、expense_id を添えた消込の案内を返す。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 78000, "category": "その他", "date": "2026-08-25"}),
+            )
+            .await
+            .unwrap();
+        let expense_id = out.payload["expense"]["id"].as_i64().unwrap();
+        let candidates = out.payload["settlement_candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["title"], "家賃");
+        let message = out.payload["message"].as_str().unwrap();
+        assert!(message.contains("対応しそうな支払い予定が1件あります"));
+        assert!(message.contains("家賃 ¥80,000"));
+        assert!(message.contains(&format!(
+            "settlePlannedPayment(plan_id, expense_id={expense_id})"
+        )));
+
+        // 期日から離れた支出は候補なし（空配列で返す）。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 80000, "category": "その他", "date": "2026-10-01"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.payload["settlement_candidates"], json!([]));
+        assert!(!out.payload["message"].as_str().unwrap().contains("💡"));
+
+        // 収入は照合しない。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"amount": 80000, "category": "その他", "type": "income", "date": "2026-08-25"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.payload["settlement_candidates"], json!([]));
+    }
+
     #[tokio::test]
     async fn link_planned_payment_todo() {
         let db = seed_db();
-        let tools = tools(db).unwrap();
+        let tools = tools(db.clone()).unwrap();
         let add = find(&tools, "addPlannedPayment");
         let link = find(&tools, "linkPlannedPaymentTodo");
         let list = find(&tools, "listPlannedPayments");
@@ -1774,6 +2531,20 @@ mod tests {
         let todo_id = out.payload["todo_id"].as_i64().unwrap();
         assert!(todo_id > 0);
 
+        let (explicit, pending): (String, i64) = db
+            .read
+            .read(move |c| {
+                c.query_row(
+                    "SELECT explicit_tags, pending FROM todo_tagging WHERE todo_id = ?1",
+                    [todo_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(yuuka_db::map_sqlite)
+            })
+            .await
+            .unwrap();
+        assert!(explicit.contains("支払い"));
+        assert_eq!(pending, 1);
         // 予定に linked_todo_id が入る。
         let out = list.call(&ctx(), json!({})).await.unwrap();
         let plan = &out.payload["plans"][0];
@@ -1846,5 +2617,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.payload["success"], false);
+    }
+
+    /// R15: 消込（新規記帳・記帳済みの支出）とキャンセルで紐付きの期日前リマインドを止め、
+    /// そのことを返答に含める。
+    #[tokio::test]
+    async fn settle_and_cancel_stop_linked_reminder() {
+        let db = seed_db();
+        let tools = tools(db.clone()).unwrap();
+        let add_expense = find(&tools, "addExpense");
+        let add = find(&tools, "addPlannedPayment");
+        let link = find(&tools, "linkPlannedPaymentReminder");
+        let settle = find(&tools, "settlePlannedPayment");
+        let cancel = find(&tools, "cancelPlannedPayment");
+
+        // 期日が遠い予定を作り、期日前リマインドを紐付けて (plan_id, reminder_id) を返す。
+        let plan_with_reminder = |title: &'static str| {
+            let (add, link) = (add.clone(), link.clone());
+            async move {
+                let out = add
+                    .call(
+                        &ctx(),
+                        json!({"title": title, "amount": 12000, "category": "その他", "due_date": "2099-01-10"}),
+                    )
+                    .await
+                    .unwrap();
+                let plan_id = out.payload["plan"]["id"].as_i64().unwrap();
+                let out = link
+                    .call(&ctx(), json!({"plan_id": plan_id}))
+                    .await
+                    .unwrap();
+                (plan_id, out.payload["reminder_id"].as_i64().unwrap())
+            }
+        };
+        let reminder_status = |id: i64| {
+            let db = db.clone();
+            async move {
+                db.read
+                    .read(move |conn| {
+                        conn.query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .map_err(yuuka_db::map_sqlite)
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // 新規記帳で消込。
+        let (plan_id, reminder_id) = plan_with_reminder("年会費").await;
+        let out = settle
+            .call(&ctx(), json!({"plan_id": plan_id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(
+            out.payload["cancelled_reminder_id"].as_i64(),
+            Some(reminder_id)
+        );
+        assert!(out.payload["message"].as_str().unwrap().contains(&format!(
+            "期日前リマインド (#{reminder_id}) をキャンセルしました"
+        )));
+        assert_eq!(reminder_status(reminder_id).await, "cancelled");
+
+        // 記帳済みの支出で消込。
+        let (plan_id, reminder_id) = plan_with_reminder("保険料").await;
+        let out = add_expense
+            .call(&ctx(), json!({"amount": 12000, "category": "その他"}))
+            .await
+            .unwrap();
+        let paid = out.payload["expense"]["id"].as_i64().unwrap();
+        let out = settle
+            .call(&ctx(), json!({"plan_id": plan_id, "expense_id": paid}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(
+            out.payload["cancelled_reminder_id"].as_i64(),
+            Some(reminder_id)
+        );
+        assert_eq!(reminder_status(reminder_id).await, "cancelled");
+
+        // キャンセル。
+        let (plan_id, reminder_id) = plan_with_reminder("会費").await;
+        let out = cancel
+            .call(&ctx(), json!({"plan_id": plan_id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert_eq!(
+            out.payload["cancelled_reminder_id"].as_i64(),
+            Some(reminder_id)
+        );
+        assert!(out.payload["message"].as_str().unwrap().contains(&format!(
+            "期日前リマインド (#{reminder_id}) もキャンセルしました"
+        )));
+        assert_eq!(reminder_status(reminder_id).await, "cancelled");
+
+        // 紐付きリマインドが無ければ何も言わない。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"title": "雑費", "amount": 500, "category": "その他", "due_date": "2099-01-10"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = out.payload["plan"]["id"].as_i64().unwrap();
+        let out = cancel
+            .call(&ctx(), json!({"plan_id": plan_id}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], true);
+        assert!(out.payload["cancelled_reminder_id"].is_null());
+        assert!(!out.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("リマインド"));
     }
 }

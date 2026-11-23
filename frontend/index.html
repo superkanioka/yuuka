@@ -9,22 +9,25 @@
   <meta name="description" content="AIアシスタントと連携したスマートなパーソナル管理システム">
   <meta name="theme-color" content="#121212">
   <!-- PWA -->
-  <link rel="manifest" href="/manifest.json">
+  <!-- #34: public/ 直下の参照は Vite がビルド時に書き換えないため、base（/admin/）反映には
+       %BASE_URL% が必須（さもないと base 変更後に /manifest.json 等が直下 404 になる）。 -->
+  <link rel="manifest" href="%BASE_URL%manifest.json">
   <!-- Favicon -->
-  <link rel="icon" href="/icons/favicon.ico" sizes="any">
-  <link rel="icon" href="/icons/icon-32x32.png" type="image/png" sizes="32x32">
-  <link rel="icon" href="/icons/icon-16x16.png" type="image/png" sizes="16x16">
-  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="icon" href="%BASE_URL%icons/favicon.ico" sizes="any">
+  <link rel="icon" href="%BASE_URL%icons/icon-32x32.png" type="image/png" sizes="32x32">
+  <link rel="icon" href="%BASE_URL%icons/icon-16x16.png" type="image/png" sizes="16x16">
+  <link rel="apple-touch-icon" href="%BASE_URL%icons/apple-touch-icon.png">
   <!-- Google Fonts for Modern & Matte Typography -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Zen+Kaku+Gothic+New:wght@300;400;500;700;900&family=Roboto:wght@300;400;500;600;700;800&display=swap"
     rel="stylesheet">
   <!-- Google Material Symbols (Outlined version matches shadcn/ui aesthetic perfectly) -->
   <link rel="stylesheet"
     href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
   <!-- FOUC 対策: 同期・非module 外部 script（CSP script-src 'self' 準拠）。Vite バンドル参照より前に置く -->
+  <!-- public の非module script は Vite が base を付加するため、%BASE_URL% を重ねない。 -->
   <script src="/theme-init.js"></script>
 </head>
 

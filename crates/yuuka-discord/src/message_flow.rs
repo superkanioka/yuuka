@@ -6,7 +6,7 @@
 //!   [`src/bot.ts:958-1263`]。登録ユーザー・共有アクセス・メンション/返信を通す。
 //!
 //! ルーティングは [`handle_message`]（`author.bot` 無視 → 冪等ガード → Bot 種別で分岐）。防衛線の
-//! 判定は注入ポート（[`BotDirectory`]/[`RateLimiter`]/[`TurnProcessor`]）越し。twilight 送信は
+//! 判定は注入ポート（[`BotDirectory`]/[`TurnProcessor`]）越し。twilight 送信は
 //! [`crate::reply`] に隔離する。純ヘルパ（表示名解決・添付選別・返信プレフィックス）はユニットテスト。
 
 use std::sync::Arc;
@@ -17,27 +17,31 @@ use base64::Engine as _;
 use twilight_gateway::MessageSender;
 use twilight_http::Client;
 use twilight_model::channel::{Attachment, Message};
-use twilight_model::id::marker::{ChannelMarker, MessageMarker, UserMarker};
+use twilight_model::id::marker::{ChannelMarker, MessageMarker, RoleMarker, UserMarker};
 use twilight_model::id::Id;
 use yuuka_core::{BotId, DiscordError, GuildId, UserId};
 
 use crate::idempotent::MessageDedup;
-use crate::turn_gate::TurnGate;
 use crate::ports::{
     rate_limit_message, BotDirectory, BotRecord, BotStatus, DeliverTarget, IncomingChat,
-    InlineMedia, Notifier, RateLimiter, Speaker, StatusSink, TurnDelivery, TurnError,
+    InlineMedia, Notifier, ReplyAncestor, Speaker, StatusSink, TurnDelivery, TurnError,
     TurnProcessor, TurnReply,
 };
 use crate::presence::build_presence;
 use crate::reply::{send_channel_reply, send_channel_text};
+use crate::streaming::StreamingReply;
 use crate::text::{
     is_supported_audio, strip_all_mentions, strip_self_mention, NON_MEMBER_GUIDANCE,
 };
+use crate::turn_gate::TurnGate;
 
 // ─── 定型文（現行文言 1:1） ────────────────────────────────────────────────────
 
 const SECRETARY_DEFAULT_HELP: &str =
     "何かお手伝いできることはありますか？ 📋\n\nタスク管理、予定管理、家計管理、ブラウザ操作ができますよ！";
+/// システム Bot（`system_default`）の既定ヘルプ。個人の秘書ではなく Yuuka の使い方・設定の案内役。
+const SYSTEM_BOT_DEFAULT_HELP: &str =
+    "Yuuka の使い方や設定について質問してください。管理画面のどこで設定できるかをご案内します。\n\nタスク・予定・家計などは、ご自身のエージェント（Bot）でご利用ください。";
 const SECRETARY_AUDIO_PLACEHOLDER: &str = "（音声メッセージを受信しました。内容を正確に文字起こしし、プレビューを提示してください。タスク依頼が含まれる場合はToDoへの変換を提案してください。）";
 const ASSISTANT_AUDIO_PLACEHOLDER: &str =
     "（音声メッセージを受信しました。内容を正確に文字起こしし、内容に沿って応答してください。）";
@@ -52,7 +56,6 @@ const GENERIC_ERROR: &str =
 pub struct FlowDeps {
     pub http: Arc<Client>,
     pub directory: Arc<dyn BotDirectory>,
-    pub rate_limiter: Arc<dyn RateLimiter>,
     pub processor: Arc<dyn TurnProcessor>,
     pub notifier: Arc<dyn Notifier>,
     /// 二重応答冪等ガード（`(bot_user_id, message_id)`・TTL 60s）。
@@ -70,27 +73,77 @@ pub struct RuntimeBot {
     pub bot_user_id: Id<UserMarker>,
     /// プレゼンス（`setBotStatus`）を spawn 先タスクから送るための cloneable sender。
     pub sender: MessageSender,
-    /// ギルド別の Bot 統合ロール ID（`@Bot名` 補完がロールメンションになるケースの判定用。
-    /// GUILD_CREATE の `role.tags.bot_id == 自 Bot` で控える）。
-    pub integration_roles: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    /// ギルド別の Bot 自身のロール（統合ロール＋保持ロール）。ロールメンション判定と
+    /// `<@&統合ロール>` の除去に使う。gateway イベントで更新する（[`OwnGuildRoles`]）。
+    pub own_roles: Arc<std::sync::Mutex<OwnGuildRoles>>,
 }
 
 impl RuntimeBot {
-    /// GUILD_CREATE で確認した Bot 統合ロールを控える。
-    pub fn note_integration_role(&self, guild_id: u64, role_id: u64) {
-        self.integration_roles
+    /// 自ロール表を参照・更新する（GUILD_CREATE / GUILD_MEMBER_UPDATE / GUILD_DELETE から呼ぶ）。
+    pub fn with_own_roles<R>(&self, f: impl FnOnce(&mut OwnGuildRoles) -> R) -> R {
+        let mut roles = self
+            .own_roles
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(guild_id, role_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut roles)
     }
 
     /// ギルドの Bot 統合ロール ID（未知なら `None`）。
     fn integration_role(&self, guild_id: u64) -> Option<u64> {
-        self.integration_roles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&guild_id)
-            .copied()
+        self.with_own_roles(|r| r.integration_role(guild_id))
+    }
+}
+
+/// ギルドごとの Bot 自身のロール控え（現行 discord.js の `guild.members.me.roles` 相当）。
+///
+/// - 統合ロール: GUILD_CREATE の `role.tags.bot_id == 自 Bot` で控える（`@Bot名` 補完のロールメンション）。
+/// - 保持ロール: GUILD_CREATE の自メンバー（Discord は intent に関わらず自 Bot を `members` に含める）
+///   と、自分宛の GUILD_MEMBER_UPDATE で丸ごと置き換える（手動付与の共用ロール等）。
+///
+/// メッセージごとの member fetch はしない。@everyone ロール（ID = guild_id）は `mention_everyone`
+/// 側で扱うので保持ロールから除く。
+#[derive(Debug, Default)]
+pub struct OwnGuildRoles {
+    integration: std::collections::HashMap<u64, u64>,
+    held: std::collections::HashMap<u64, std::collections::HashSet<u64>>,
+}
+
+impl OwnGuildRoles {
+    /// 統合ロールを控える。
+    pub fn note_integration_role(&mut self, guild_id: u64, role_id: u64) {
+        self.integration.insert(guild_id, role_id);
+    }
+
+    /// 自メンバーの保持ロールを丸ごと置き換える（@everyone ロールは除く）。
+    pub fn set_held_roles(&mut self, guild_id: u64, roles: impl IntoIterator<Item = u64>) {
+        let held = roles.into_iter().filter(|&r| r != guild_id).collect();
+        self.held.insert(guild_id, held);
+    }
+
+    /// ギルドから離脱した際に控えを捨てる。
+    pub fn forget_guild(&mut self, guild_id: u64) {
+        self.integration.remove(&guild_id);
+        self.held.remove(&guild_id);
+    }
+
+    /// ギルドの統合ロール ID（未知なら `None`）。
+    #[must_use]
+    pub fn integration_role(&self, guild_id: u64) -> Option<u64> {
+        self.integration.get(&guild_id).copied()
+    }
+
+    /// `mention_roles` のいずれかが自 Bot のロール（統合ロール＋保持ロール）か。DM（guild なし）は偽。
+    #[must_use]
+    pub fn is_mentioned(&self, guild_id: Option<u64>, mention_roles: &[Id<RoleMarker>]) -> bool {
+        let Some(gid) = guild_id else {
+            return false;
+        };
+        let integration = self.integration_role(gid);
+        let held = self.held.get(&gid);
+        mention_roles
+            .iter()
+            .map(|r| r.get())
+            .any(|r| r != gid && (integration == Some(r) || held.is_some_and(|h| h.contains(&r))))
     }
 }
 
@@ -130,8 +183,8 @@ pub async fn handle_message(deps: &FlowDeps, rt: &RuntimeBot, message: Message) 
     // Bot 種別でルーティング（現行 `isGuildAssistantBot(botId)`）。
     let bot = match deps.directory.get_bot(&rt.bot_id).await {
         Some(b) => b,
-        // system_default はレコードが無くても常に秘書として応答する（現行はデフォルト Bot の
-        // レコードを引かず secretary 経路にハードコード）。custom はレコード必須（無ければ黙殺）。
+        // system_default はレコードが無くても常に応答する（秘書経路を通り、エンジンがシステム Bot の
+        // 案内役として処理する）。custom はレコード必須（無ければ黙殺）。
         None if rt.bot_id.as_str() == BotId::SYSTEM_DEFAULT => default_secretary_record(),
         None => {
             tracing::debug!(bot_id = %rt.bot_id, "黙殺: Bot レコード無し");
@@ -253,21 +306,6 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
             tracing::warn!(bot_id = %rt.bot_id, "Gemini APIキー未設定のため応答しません");
             return;
         }
-        // レート制限（超過時は LLM を呼ばず定型応答・§6）。
-        let rate = deps.rate_limiter.consume(&rt.bot_id, gid, &author).await;
-        if !rate.allowed {
-            if let Some(exceeded) = rate.exceeded {
-                send_channel_text(
-                    &deps.http,
-                    message.channel_id,
-                    Some(message.id),
-                    &rate_limit_message(exceeded),
-                    &[],
-                )
-                .await;
-            }
-            return;
-        }
     }
 
     let typing = TypingGuard::start(deps.http.clone(), message.channel_id);
@@ -290,7 +328,21 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
         user_id: author.clone(),
         display_name: resolve_display_name(&message),
     };
-    let delivery = make_delivery(deps, rt, &message, is_dm, author.clone(), typing.handle());
+    let stream = StreamingReply::new(
+        deps.http.clone(),
+        message.channel_id,
+        message.id,
+        typing.handle(),
+    );
+    let delivery = make_delivery(
+        deps,
+        rt,
+        &message,
+        is_dm,
+        author.clone(),
+        typing.handle(),
+        Arc::clone(&stream),
+    );
     let handles = TurnHandles {
         status: status.clone(),
         delivery,
@@ -312,6 +364,13 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
                     audio: Some(media),
                     discord_msg_id,
                     reply_to_msg_id,
+                    reply_chain: resolve_reply_chain(
+                        deps,
+                        &message,
+                        reference.as_ref(),
+                        rt.bot_user_id,
+                    )
+                    .await,
                     channel_id,
                     ..IncomingChat::default()
                 };
@@ -328,6 +387,13 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
                     image: Some(media),
                     discord_msg_id,
                     reply_to_msg_id,
+                    reply_chain: resolve_reply_chain(
+                        deps,
+                        &message,
+                        reference.as_ref(),
+                        rt.bot_user_id,
+                    )
+                    .await,
                     channel_id,
                     ..IncomingChat::default()
                 };
@@ -341,6 +407,8 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
             text: full_text.clone(),
             discord_msg_id,
             reply_to_msg_id,
+            reply_chain: resolve_reply_chain(deps, &message, reference.as_ref(), rt.bot_user_id)
+                .await,
             channel_id,
             ..IncomingChat::default()
         };
@@ -368,7 +436,7 @@ async fn assistant_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
 
     drop(typing);
     status(BotStatus::Idle);
-    finish_reply(deps, &message, result, /* skip_silent */ true).await;
+    finish_reply(deps, &message, result, /* skip_silent */ true, &stream).await;
 }
 
 /// アシスタントの DM/ギルド分岐（現行 `processBotDmMessage` / `processGuildMessage`）。
@@ -455,25 +523,57 @@ async fn secretary_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
             .and_then(|r| select_image(&r.attachments).cloned())
     });
     let audio = select_audio(&message.attachments).cloned();
-    let delivery = make_delivery(deps, rt, &message, is_dm, author.clone(), typing.handle());
+    let stream = StreamingReply::new(
+        deps.http.clone(),
+        message.channel_id,
+        message.id,
+        typing.handle(),
+    );
+    let delivery = make_delivery(
+        deps,
+        rt,
+        &message,
+        is_dm,
+        author.clone(),
+        typing.handle(),
+        Arc::clone(&stream),
+    );
     let discord_msg_id = Some(message.id.get().to_string());
     let reply_to_msg_id = reference_message_id(&message);
     let channel_id = Some(message.channel_id.get().to_string());
 
+    // Only the current message's authenticated author can supply saveable attachments.
+    // Reference images remain context only; their bytes never enter the save catalog.
+    // 会話の入力（画像1枚・音声）は従来どおりで、保存候補のバイト列は Gemini へ送らない。
+    // 取得できない・上限を超える添付は候補から外すだけで、ターンは失敗させない。
+    let timeline_attachments = current_timeline_attachments(message.id, &message.attachments).await;
     let result: Result<TurnReply, TurnError> = if let Some(att) = audio {
         match fetch_inline_media(&att, "audio/ogg").await {
             Ok(media) => {
                 // 現行 `const instruction = fullText.trim() || placeholder`（trim 済み）。
                 let instruction = if full_text.trim().is_empty() {
-                    SECRETARY_AUDIO_PLACEHOLDER.to_owned()
+                    if is_custom {
+                        SECRETARY_AUDIO_PLACEHOLDER
+                    } else {
+                        ASSISTANT_AUDIO_PLACEHOLDER
+                    }
+                    .to_owned()
                 } else {
                     full_text.trim().to_owned()
                 };
                 let chat = IncomingChat {
                     text: instruction,
                     audio: Some(media),
+                    timeline_attachments,
                     discord_msg_id,
                     reply_to_msg_id,
+                    reply_chain: resolve_reply_chain(
+                        deps,
+                        &message,
+                        reference.as_ref(),
+                        rt.bot_user_id,
+                    )
+                    .await,
                     channel_id,
                     ..IncomingChat::default()
                 };
@@ -484,20 +584,43 @@ async fn secretary_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
             Err(e) => Err(TurnError::Failed(e.to_string())),
         }
     } else if let Some(att) = image {
-        match fetch_inline_media(&att, "image/jpeg").await {
+        // 現メッセージの画像は保存候補として取得済みなら再利用する（同じ添付を二重に取得しない）。
+        let current = timeline_attachments
+            .iter()
+            .find(|a| a.attachment_id == att.id.to_string())
+            .map(|a| InlineMedia {
+                data_base64: a.data_base64.clone(),
+                mime_type: a.mime_type.clone(),
+            });
+        let media = match current {
+            Some(media) => Ok(media),
+            None => fetch_inline_media(&att, "image/jpeg").await,
+        };
+        match media {
             Ok(media) => {
-                // レシート OCR は秘書専用。caption は現メッセージ本文（空なら None）。
-                let caption = if text.is_empty() {
-                    None
-                } else {
-                    Some(text.clone())
+                // レシート OCR は秘書専用。キャプションは現メッセージ本文（空なら指示なし）。会話ログの
+                // 紐づけ（R08）のため、メッセージ ID・返信先・チャンネル・返信元チェーンも渡す。
+                let chat = IncomingChat {
+                    text: text.clone(),
+                    timeline_attachments,
+                    discord_msg_id,
+                    reply_to_msg_id,
+                    reply_chain: resolve_reply_chain(
+                        deps,
+                        &message,
+                        reference.as_ref(),
+                        rt.bot_user_id,
+                    )
+                    .await,
+                    channel_id,
+                    ..IncomingChat::default()
                 };
                 deps.processor
                     .parse_receipt(
                         &rt.bot_id,
                         &author,
                         media,
-                        caption,
+                        chat,
                         status.clone(),
                         delivery.clone(),
                     )
@@ -506,43 +629,68 @@ async fn secretary_flow(deps: &FlowDeps, rt: &RuntimeBot, bot: &BotRecord, messa
             Err(e) => Err(TurnError::Failed(e.to_string())),
         }
     } else if !full_text.trim().is_empty() {
+        // 動画だけを添えた発話もここに来る（動画は従来どおり会話の入力にせず、保存候補だけ渡す）。
         let chat = IncomingChat {
             text: full_text.clone(),
+            timeline_attachments,
             discord_msg_id,
             reply_to_msg_id,
+            reply_chain: resolve_reply_chain(deps, &message, reference.as_ref(), rt.bot_user_id)
+                .await,
             channel_id,
             ..IncomingChat::default()
         };
         deps.processor
             .process_secretary(&rt.bot_id, &author, chat, status.clone(), delivery.clone())
             .await
-    } else {
+    } else if is_custom {
         Ok(TurnReply::text(SECRETARY_DEFAULT_HELP))
+    } else {
+        Ok(TurnReply::text(SYSTEM_BOT_DEFAULT_HELP))
     };
 
     drop(typing);
     status(BotStatus::Idle);
     // 秘書は空応答でも既定ヘルプで必ず何か送る（silent skip 無し）。
-    finish_reply(deps, &message, result, /* skip_silent */ false).await;
+    finish_reply(
+        deps, &message, result, /* skip_silent */ false, &stream,
+    )
+    .await;
 }
 
 /// 処理結果を返信送信する（エラーは定型文へ縮退・現行 try/catch）。`skip_silent` は
-/// アシスタントの「空応答は黙殺」挙動（秘書は false）。
+/// アシスタントの「空応答は黙殺」挙動（秘書は false）。本文を逐次表示していたら、その返信を最終結果
+/// （エラー時は定型文）で確定する。
 async fn finish_reply(
     deps: &FlowDeps,
     message: &Message,
     result: Result<TurnReply, TurnError>,
     skip_silent: bool,
+    stream: &StreamingReply,
 ) {
     match result {
         Ok(reply) => {
-            if skip_silent && reply.is_silent() {
+            // 後続配信へ回したターン（R07）は途中応答を送信済みで、最終結果は配信ハンドルが送る。
+            if reply.deferred || stream.finish(&reply).await || (skip_silent && reply.is_silent()) {
                 return;
             }
             send_channel_reply(&deps.http, message.channel_id, Some(message.id), &reply).await;
         }
+        Err(TurnError::RateLimited(exceeded)) => {
+            send_channel_text(
+                &deps.http,
+                message.channel_id,
+                Some(message.id),
+                &rate_limit_message(exceeded),
+                &[],
+            )
+            .await;
+        }
         Err(e) => {
             tracing::error!(error = %e, "ターン処理に失敗（定型エラーへ縮退）");
+            if stream.finish(&TurnReply::text(GENERIC_ERROR)).await {
+                return;
+            }
             send_channel_text(
                 &deps.http,
                 message.channel_id,
@@ -596,13 +744,19 @@ struct FlowDelivery {
     user_id: UserId,
     bot_id: BotId,
     is_dm: bool,
+    /// 生成中の本文の逐次表示（最終結果もこの返信へ確定する）。
+    stream: Arc<StreamingReply>,
 }
 
 #[async_trait]
 impl TurnDelivery for FlowDelivery {
     async fn on_interim(&self, text: String) {
-        // 「入力中…」を止めてから一時応答を即返す（現行 onInterim）。
+        // 「入力中…」を止めてから一時応答を即返す（現行 onInterim）。一時応答は逐次表示の返信として送り、
+        // 経過時間の表示・生成中の本文・最終結果をこの 1 通の編集で見せる。
         self.typing_abort.abort();
+        if self.stream.begin_interim(&text).await {
+            return;
+        }
         send_channel_reply(
             &self.http,
             self.channel_id,
@@ -613,6 +767,10 @@ impl TurnDelivery for FlowDelivery {
     }
 
     async fn deliver_final(&self, reply: TurnReply) {
+        // 本文を逐次表示していたら、その返信を最終結果で確定する（送り先は逐次表示と同じチャンネル）。
+        if self.stream.finish(&reply).await {
+            return;
+        }
         let target = if self.is_dm {
             DeliverTarget::Dm
         } else {
@@ -629,6 +787,14 @@ impl TurnDelivery for FlowDelivery {
                 .await;
         }
     }
+
+    fn shows_partial_text(&self) -> bool {
+        true
+    }
+
+    fn on_partial_text(&self, text: &str) {
+        self.stream.push(text);
+    }
 }
 
 fn make_delivery(
@@ -638,6 +804,7 @@ fn make_delivery(
     is_dm: bool,
     user_id: UserId,
     typing_abort: tokio::task::AbortHandle,
+    stream: Arc<StreamingReply>,
 ) -> Arc<dyn TurnDelivery> {
     Arc::new(FlowDelivery {
         http: deps.http.clone(),
@@ -648,6 +815,7 @@ fn make_delivery(
         user_id,
         bot_id: rt.bot_id.clone(),
         is_dm,
+        stream,
     })
 }
 
@@ -690,6 +858,9 @@ impl Drop for TypingGuard {
 
 /// 返信先メッセージの必要情報（純データ）。
 struct RefInfo {
+    id: Id<MessageMarker>,
+    /// この返信先がさらに返信していた先（同じチャンネルのときだけ・返信元チェーン用）。
+    parent: Option<Id<MessageMarker>>,
     author_id: Id<UserMarker>,
     author_name: String,
     content: String,
@@ -706,7 +877,14 @@ impl RefInfo {
             .as_ref()
             .and_then(|pm| pm.nick.clone())
             .unwrap_or_else(|| m.author.name.clone());
+        let parent = m
+            .reference
+            .as_ref()
+            .filter(|r| r.channel_id.is_none_or(|c| c == m.channel_id))
+            .and_then(|r| r.message_id);
         Self {
+            id: m.id,
+            parent,
             author_id: m.author.id,
             author_name,
             content: m.content.clone(),
@@ -734,6 +912,91 @@ async fn resolve_reference(deps: &FlowDeps, message: &Message) -> Option<RefInfo
             None
         }
     }
+}
+
+/// 返信元チェーンの上限件数と 1 件の最大文字数（orchestrator `message_log` の
+/// `REPLY_CHAIN_MAX`/`REPLY_CHAIN_ITEM_CHARS` と同じ値。engine 側でも同じ上限で揃える）。
+const REPLY_CHAIN_MAX: usize = 8;
+const REPLY_CHAIN_ITEM_CHARS: usize = 1200;
+/// 返信元チェーンの取得にかける時間の上限（超えたら取得済みの分だけ使う）。
+const REPLY_CHAIN_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 返信元チェーン（R08）を Discord から取得する。古い順・各件 `[発言者] 本文`（自 Bot は「あなた」）。
+///
+/// 返信先（[`resolve_reference`] で解決済み）から、さらにその返信先を受信チャンネル内だけで REST 取得して
+/// 遡る（Discord は返信先を 1 段しか埋め込まないため）。返信のたびに REST を叩かないよう、応答すると
+/// 決めた後のターン組み立てでだけ呼ぶ。循環・取得失敗・[`REPLY_CHAIN_FETCH_TIMEOUT`] 超過で打ち切り、
+/// 本文のない発言（添付のみ等）は飛ばす。各件は Discord のメッセージ ID を持ち、engine が会話ログから
+/// 復元した分（取得が途中で切れたときの補完）と ID で重複を除いて合わせる。
+async fn resolve_reply_chain(
+    deps: &FlowDeps,
+    message: &Message,
+    reference: Option<&RefInfo>,
+    bot_user_id: Id<UserMarker>,
+) -> Vec<ReplyAncestor> {
+    let Some(reference) = reference else {
+        return Vec::new();
+    };
+    let mut chain: Vec<ReplyAncestor> = reply_chain_entry(reference, bot_user_id)
+        .into_iter()
+        .collect();
+    let mut seen = std::collections::HashSet::from([reference.id]);
+    let mut next = reference.parent;
+    let fetch = async {
+        while chain.len() < REPLY_CHAIN_MAX {
+            let Some(mid) = next.take() else {
+                break;
+            };
+            if !seen.insert(mid) {
+                break;
+            }
+            let ancestor = match deps.http.message(message.channel_id, mid).await {
+                Ok(resp) => match resp.model().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "返信元チェーンの取得に失敗しました");
+                        break;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "返信元チェーンの取得に失敗しました");
+                    break;
+                }
+            };
+            if ancestor.channel_id != message.channel_id {
+                break;
+            }
+            let info = RefInfo::from_message(&ancestor);
+            chain.extend(reply_chain_entry(&info, bot_user_id));
+            next = info.parent;
+        }
+    };
+    if tokio::time::timeout(REPLY_CHAIN_FETCH_TIMEOUT, fetch)
+        .await
+        .is_err()
+    {
+        tracing::debug!("返信元チェーンの取得が時間切れ: 取得済みの分だけ使います");
+    }
+    chain.reverse();
+    chain
+}
+
+/// 返信元チェーンの 1 件（本文が空なら `None`）。
+fn reply_chain_entry(info: &RefInfo, bot_user_id: Id<UserMarker>) -> Option<ReplyAncestor> {
+    let content = info.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let name = if info.author_id == bot_user_id {
+        "あなた"
+    } else {
+        info.author_name.as_str()
+    };
+    let content: String = content.chars().take(REPLY_CHAIN_ITEM_CHARS).collect();
+    Some(ReplyAncestor {
+        message_id: info.id.get().to_string(),
+        text: format!("[{name}] {content}"),
+    })
 }
 
 /// 返信先コンテキストプレフィックスを組み立てる（現行 contextPrefix）。`strip_self` は自 Bot
@@ -764,27 +1027,65 @@ fn bot_uid_str(rt: &RuntimeBot) -> String {
     rt.bot_user_id.get().to_string()
 }
 
+/// `[返信先メッセージ (…): "…"]\n` の返信先プレフィックスを剥がして本文だけを返す。
+///
+/// プレフィックスは上の `context_prefix` が本文の前に付ける（Bot 自身の返答を含む）。会話記憶の抽出は
+/// 利用者本人の発話だけを見たいので、この関数で分離する。プレフィックスが無ければそのまま返す。
+#[must_use]
+pub fn strip_reply_prefix(text: &str) -> &str {
+    const HEAD: &str = "[返信先メッセージ (";
+    const TAIL: &str = "\"]\n";
+    let Some(rest) = text.strip_prefix(HEAD) else {
+        return text;
+    };
+    // 引用本文に `"]` が含まれることは稀。最初の終端で切る（残った引用の断片は候補の選別で落ちる）。
+    match rest.find(TAIL) {
+        Some(pos) => rest.get(pos + TAIL.len()..).unwrap_or(""),
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod reply_prefix_tests {
+    use super::strip_reply_prefix;
+
+    #[test]
+    fn strips_prefix_and_keeps_body() {
+        let text = "[返信先メッセージ (あなた): \"昨日の\n返答です\"]\n私はカレーが好き";
+        assert_eq!(strip_reply_prefix(text), "私はカレーが好き");
+    }
+
+    #[test]
+    fn prefix_only_becomes_empty_and_plain_text_is_unchanged() {
+        assert_eq!(
+            strip_reply_prefix("[返信先メッセージ (太郎): \"やあ\"]\n"),
+            ""
+        );
+        assert_eq!(strip_reply_prefix("私はカレーが好き"), "私はカレーが好き");
+        assert_eq!(
+            strip_reply_prefix("[返信先メッセージ (壊れた"),
+            "[返信先メッセージ (壊れた"
+        );
+    }
+}
+
 /// 与えられたユーザーがメンションされているか（現行 `message.mentions.has(botClient.user)`）。
 ///
 /// discord.js の `has()` は直接メンションに加え **@everyone/@here**（`mention_everyone`）と
 /// **Bot 自身が保持するロールへのロールメンション**も真とする。前者は本関数、後者は
-/// [`is_bot_role_mentioned`]（統合ロール＝`@Bot名` 補完で付くロール）で移植する。統合ロール以外の
-/// 保持ロール（例: 手動付与の共用ロール）へのメンションは未対応（既知の狭め・member fetch が必要）。
+/// [`is_bot_role_mentioned`]（統合ロール＋手動付与の共用ロール等の保持ロール）で移植する。
 fn is_user_mentioned(message: &Message, user_id: Id<UserMarker>) -> bool {
     message.mention_everyone || message.mentions.iter().any(|m| m.id == user_id)
 }
 
-/// Bot の統合ロールへのロールメンションか。Discord の `@Bot名` 補完はユーザーメンションではなく
+/// Bot 自身のロールへのロールメンションか。Discord の `@Bot名` 補完はユーザーメンションではなく
 /// **統合ロールのロールメンション**になることがあり（`message.mentions` は空・`mention_roles` に
-/// ロール ID）、discord.js の `mentions.has()` はこれを真とするため移植する。
+/// ロール ID）、Bot が保持する一般ロール（共用ロール等）へのメンションも含めて discord.js の
+/// `mentions.has()` は真とするため移植する。保持ロールは gateway イベントで控えた値で判定する
+/// （[`OwnGuildRoles`]・メッセージごとの member fetch はしない）。
 fn is_bot_role_mentioned(rt: &RuntimeBot, message: &Message) -> bool {
-    let Some(gid) = message.guild_id else {
-        return false;
-    };
-    let Some(role_id) = rt.integration_role(gid.get()) else {
-        return false;
-    };
-    message.mention_roles.iter().any(|r| r.get() == role_id)
+    let guild_id = message.guild_id.map(Id::get);
+    rt.with_own_roles(|r| r.is_mentioned(guild_id, &message.mention_roles))
 }
 
 /// ギルド表示名を解決する（nick → global_name → username・現行 `resolveDisplayName`）。
@@ -820,6 +1121,143 @@ fn select_audio(attachments: &[Attachment]) -> Option<&Attachment> {
     attachments
         .iter()
         .find(|a| a.content_type.as_deref().is_some_and(is_supported_audio))
+}
+
+fn is_photo_or_video(a: &Attachment) -> bool {
+    a.content_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/") || m.starts_with("video/"))
+}
+
+/// タイムライン保存候補の上限（保存ツール `addTimelineRecord` の検査と同じ値）。
+const TIMELINE_ATTACHMENT_MAX_COUNT: usize = 10;
+const TIMELINE_ATTACHMENT_MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+/// 保存候補の取得にかける時間の上限（会話の応答をこれ以上待たせない）。
+const TIMELINE_ATTACHMENT_FETCH_BUDGET: Duration = Duration::from_secs(30);
+
+/// 現メッセージの写真・動画を、タイムライン保存の候補として取得する。
+///
+/// Discord の認証済み CDN（`/attachments/`）だけをリダイレクト無しで取得する。会話そのものは
+/// 止めないため、取得に失敗した添付や、件数・合計サイズ・取得時間の上限を超える添付は候補から外す
+/// （`warn` ログのみ）。候補は保存ツールの入力にだけ使い、Gemini へ inline では送らない。
+async fn current_timeline_attachments(
+    message_id: Id<MessageMarker>,
+    attachments: &[Attachment],
+) -> Vec<yuuka_core::tool::ConversationAttachment> {
+    let candidates: Vec<(usize, &Attachment)> = attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| is_photo_or_video(a))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, reqwest::Error>> =
+        std::sync::OnceLock::new();
+    let client = match CLIENT
+        .get_or_init(|| yuuka_outbound::guarded_client(TIMELINE_ATTACHMENT_FETCH_BUDGET))
+        .as_ref()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "保存候補の添付を取得できません（候補なしで続行）");
+            return Vec::new();
+        }
+    };
+    let deadline = tokio::time::Instant::now() + TIMELINE_ATTACHMENT_FETCH_BUDGET;
+    let mut catalog = Vec::new();
+    let mut total = 0usize;
+    for (position, att) in candidates {
+        if catalog.len() >= TIMELINE_ATTACHMENT_MAX_COUNT {
+            tracing::warn!(attachment = %att.id, "保存候補の件数上限を超えた添付を除外");
+            continue;
+        }
+        // Discord が通知するサイズで、取得する前に合計上限の超過を除外する（取得中も実バイト数で再確認）。
+        let remaining = TIMELINE_ATTACHMENT_MAX_TOTAL_BYTES - total;
+        if !usize::try_from(att.size).is_ok_and(|size| size <= remaining) {
+            tracing::warn!(attachment = %att.id, size = att.size, "保存候補の合計サイズ上限を超えた添付を除外");
+            continue;
+        }
+        let bytes = match tokio::time::timeout_at(
+            deadline,
+            fetch_timeline_attachment(client, att, remaining),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(reason)) => {
+                tracing::warn!(attachment = %att.id, reason, "保存候補の添付を除外");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(attachment = %att.id, "保存候補の取得時間の上限に達したため、以降の添付を除外");
+                break;
+            }
+        };
+        total += bytes.len();
+        let mime_type = att
+            .content_type
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        catalog.push(yuuka_core::tool::ConversationAttachment {
+            source_message_id: format!("discord:{message_id}"),
+            attachment_id: att.id.to_string(),
+            position,
+            mime_type,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+    catalog
+}
+
+/// Fetch only Discord's authenticated current-message CDN attachments, with no redirects.
+async fn fetch_timeline_attachment(
+    client: &reqwest::Client,
+    att: &Attachment,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let url = reqwest::Url::parse(&att.url).map_err(|_| "添付URLが不正です")?;
+    if url.scheme() != "https"
+        || !matches!(
+            url.host_str(),
+            Some("cdn.discordapp.com" | "media.discordapp.net")
+        )
+        || !url.path().starts_with("/attachments/")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return Err("Discord添付以外は取得しません");
+    }
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|_| "添付の取得に失敗しました")?;
+    if response.status().is_redirection() {
+        return Err("添付の転送は許可しません");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "添付の読込に失敗しました")?
+    {
+        if bytes.len() + chunk.len() > limit {
+            return Err("添付合計の上限（20MiB）を超えます");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err("添付が空です");
+    }
+    Ok(bytes)
 }
 
 /// 添付を URL 取得 → base64 化する（現行 fetch → Buffer.toString("base64")）。
@@ -870,6 +1308,99 @@ mod tests {
         let atts = vec![mk("image/png"), mk("audio/ogg; codecs=opus")];
         assert!(select_audio(&atts).is_some());
         assert!(select_image(&atts).is_some());
+    }
+
+    /// 保存候補を作れない添付があっても失敗にせず、候補から外して会話を続ける（R13 レビュー指摘）。
+    /// どちらの添付も取得前に除外されるため、ネットワークには出ない。
+    #[tokio::test]
+    async fn timeline_catalog_skips_oversized_and_foreign_attachments() {
+        let video = Attachment {
+            content_type: Some("video/mp4".to_owned()),
+            size: 20 * 1024 * 1024 + 1,
+            url: "https://cdn.discordapp.com/attachments/1/2/large.mp4".to_owned(),
+            ..dummy_attachment()
+        };
+        let foreign = Attachment {
+            content_type: Some("image/png".to_owned()),
+            id: Id::new(2),
+            size: 3,
+            url: "https://example.invalid/attachments/photo.png".to_owned(),
+            ..dummy_attachment()
+        };
+        let audio = Attachment {
+            content_type: Some("audio/ogg".to_owned()),
+            id: Id::new(3),
+            ..dummy_attachment()
+        };
+        let catalog = current_timeline_attachments(Id::new(42), &[video, foreign, audio]).await;
+        assert!(catalog.is_empty());
+    }
+
+    fn roles(ids: &[u64]) -> Vec<Id<RoleMarker>> {
+        ids.iter().map(|&i| Id::new(i)).collect()
+    }
+
+    const GUILD: u64 = 100;
+    const INTEGRATION: u64 = 200;
+    const SHARED: u64 = 300;
+    const UNRELATED: u64 = 400;
+
+    fn own_roles() -> OwnGuildRoles {
+        let mut r = OwnGuildRoles::default();
+        r.note_integration_role(GUILD, INTEGRATION);
+        // 実際の自メンバーは統合ロールも保持するが、統合ロール単独でも判定できることを見るため外す。
+        r.set_held_roles(GUILD, [SHARED]);
+        r
+    }
+
+    #[test]
+    fn role_mention_hits_integration_role() {
+        assert!(own_roles().is_mentioned(Some(GUILD), &roles(&[INTEGRATION])));
+    }
+
+    #[test]
+    fn role_mention_hits_manually_assigned_held_role() {
+        let r = own_roles();
+        assert!(r.is_mentioned(Some(GUILD), &roles(&[SHARED])));
+        assert!(r.is_mentioned(Some(GUILD), &roles(&[UNRELATED, SHARED])));
+    }
+
+    #[test]
+    fn role_mention_ignores_unrelated_role_and_other_guild() {
+        let r = own_roles();
+        assert!(!r.is_mentioned(Some(GUILD), &roles(&[UNRELATED])));
+        assert!(!r.is_mentioned(Some(GUILD), &[]));
+        // 別ギルドでは同じ ID でも控えが無いので偽。
+        assert!(!r.is_mentioned(Some(999), &roles(&[SHARED, INTEGRATION])));
+    }
+
+    #[test]
+    fn role_mention_is_false_in_dm() {
+        assert!(!own_roles().is_mentioned(None, &roles(&[SHARED, INTEGRATION])));
+    }
+
+    #[test]
+    fn everyone_role_is_not_counted_as_held_role() {
+        // @everyone ロール（ID = guild_id）は mention_everyone 側で扱うため二重に数えない。
+        let mut r = OwnGuildRoles::default();
+        r.set_held_roles(GUILD, [GUILD, SHARED]);
+        assert!(!r.is_mentioned(Some(GUILD), &roles(&[GUILD])));
+        assert!(r.is_mentioned(Some(GUILD), &roles(&[SHARED])));
+    }
+
+    #[test]
+    fn held_roles_are_replaced_on_update_and_forgotten_on_leave() {
+        let mut r = own_roles();
+        // GUILD_MEMBER_UPDATE で共用ロールが外れ、別ロールが付いた。
+        r.set_held_roles(GUILD, [UNRELATED]);
+        assert!(!r.is_mentioned(Some(GUILD), &roles(&[SHARED])));
+        assert!(r.is_mentioned(Some(GUILD), &roles(&[UNRELATED])));
+        // 統合ロールは保持ロール更新の影響を受けない。
+        assert_eq!(r.integration_role(GUILD), Some(INTEGRATION));
+
+        r.forget_guild(GUILD);
+        assert!(!r.is_mentioned(Some(GUILD), &roles(&[UNRELATED, INTEGRATION])));
+        assert_eq!(r.integration_role(GUILD), None);
     }
 
     fn dummy_attachment() -> Attachment {

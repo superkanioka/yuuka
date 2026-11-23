@@ -6,13 +6,15 @@
 
 use std::sync::Arc;
 
+use yuuka_core::aux_text::{AuxTextGenerator, NullAuxTextGenerator};
 use yuuka_core::CrossUserAccess;
 use yuuka_web::Db;
 
 use crate::backup::{BackupRunner, NullBackupRunner};
+use crate::calendar_sync::{CalendarSyncRunner, NullCalendarSyncRunner};
 use crate::instagram::InstagramSettings;
 use crate::metrics::MetricsRegistry;
-use crate::notifier::Notifier;
+use crate::notifier::{DefaultTargetNotifier, Notifier};
 use crate::turn::PlaybookRunner;
 
 /// サービス実行時の依存一式。
@@ -21,16 +23,22 @@ pub struct ServiceContext {
     /// 共有 DB ハンドル（read pool + 単一 writer actor）。
     pub db: Db,
     /// ユーザー通知配信（discord 未配線時は [`crate::notifier::NullNotifier`]）。
+    /// `DefaultTargetNotifier` で包み、送信先省略の通知をユーザー既定送信先へ解決してから配信する。
     pub notifier: Arc<dyn Notifier>,
     /// 軽量メトリクスレジストリ（定期ログサービスが snapshot を出す）。
     pub metrics: Arc<MetricsRegistry>,
     /// マクロ定期実行の秘書ターン起動ポート（未配線時は [`crate::turn::NullPlaybookRunner`]）。
     pub playbook_runner: Arc<dyn PlaybookRunner>,
+    /// ユーザー本人のキーで行う補助テキスト生成（定期報告のニュース要約・活動データのまとめ）。
+    /// 未配線・障害時は [`NullAuxTextGenerator`] と同じく、ニュースはタイトル列挙・活動データは生データへ縮退する。
+    pub aux_text: Arc<dyn AuxTextGenerator>,
     /// 定期バックアップの実行ポート（未配線時は [`NullBackupRunner`]・[`crate::backup::BackupService`] が使う）。
     pub backup: Arc<dyn BackupRunner>,
-    /// Instagram 連携設定（§3.15）。`INSTAGRAM_CHANNEL_ID` 未設定時は `None` で、
-    /// [`crate::build_services`] は Instagram サービス自体を登録しない。
+    /// Instagram 連携設定（§3.16）。`INSTAGRAM_CHANNEL_ID` 未設定時は `None` で、
+    /// [`crate::build_optional_services`] は Instagram サービス自体を登録しない。
     pub instagram: Option<Arc<InstagramSettings>>,
+    /// Google カレンダーの定期取り込みポート（未配線時は [`NullCalendarSyncRunner`]）。
+    pub calendar_sync: Arc<dyn CalendarSyncRunner>,
     /// 横断（全ユーザー跨ぎ）アクセス証憑。cron の起点はここに限定される。
     pub cross: CrossUserAccess,
 }
@@ -46,12 +54,14 @@ impl ServiceContext {
         playbook_runner: Arc<dyn PlaybookRunner>,
     ) -> Self {
         Self {
+            notifier: Arc::new(DefaultTargetNotifier::new(db.clone(), notifier)),
             db,
-            notifier,
             metrics,
             playbook_runner,
+            aux_text: Arc::new(NullAuxTextGenerator),
             backup: Arc::new(NullBackupRunner),
             instagram: None,
+            calendar_sync: Arc::new(NullCalendarSyncRunner),
             cross: CrossUserAccess::for_scheduled_task(),
         }
     }
@@ -60,6 +70,20 @@ impl ServiceContext {
     #[must_use]
     pub fn with_backup(mut self, backup: Arc<dyn BackupRunner>) -> Self {
         self.backup = backup;
+        self
+    }
+
+    /// Google カレンダーの定期取り込みポートを差し替える（main が Google クライアントのアダプタを注入する）。
+    #[must_use]
+    pub fn with_calendar_sync(mut self, calendar_sync: Arc<dyn CalendarSyncRunner>) -> Self {
+        self.calendar_sync = calendar_sync;
+        self
+    }
+
+    /// 補助テキスト生成ポートを差し替える（main が `GeminiAuxText` を注入する）。
+    #[must_use]
+    pub fn with_aux_text(mut self, aux_text: Arc<dyn AuxTextGenerator>) -> Self {
+        self.aux_text = aux_text;
         self
     }
 

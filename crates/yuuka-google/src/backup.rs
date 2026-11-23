@@ -44,12 +44,66 @@ const FILES_ENDPOINT: &str = "https://www.googleapis.com/drive/v3/files";
 /// トークンリフレッシュエンドポイント（`GoogleHttpClient` と同一）。
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
-/// `user_id` 列でユーザーデータが分離されているテーブル群（Node `USER_SCOPED_TABLES`・backupService.ts:29-49）。
+/// ユーザーデータが分離されているテーブル群（Node `USER_SCOPED_TABLES`・backupService.ts:29-49）。
 ///
-/// **Node からそのまま写した 18 テーブル**（順序も一致）。列は `SELECT *` で保持順にコピーする。
-const USER_SCOPED_TABLES: &[&str] = &[
-    "personas",
+/// 各要素は `(テーブル名, 絞り込み列名)`。**Node からそのまま写した 18 テーブル**（順序も一致）。列は
+/// `SELECT *` で保持順にコピーする。
+///
+/// 絞り込み列はほとんどが `user_id` だが、`personas`（`crates/yuuka-db/migrations/V17__baseline.sql`）
+/// のみ実スキーマの列名が `owner_id`。以前は一律 `user_id` 決め打ちだったため `personas` の
+/// `prepare` が常に `no such column: user_id` で失敗し、`copy_rows` のテーブル不在 skip 経路に
+/// 巻き込まれて**無条件でスキップ**されていた＝バックアップに一度も persona データが含まれていな
+/// かった（#50 の FK 修正を調査中に発覚した別バグ）。他の全テーブルは `crates/yuuka-db/migrations/
+/// *.sql` 全体に対して列名を確認済み（`user_id` で一致）。
+const USER_SCOPED_TABLES: &[(&str, &str)] = &[
+    ("personas", "owner_id"),
+    ("bot_active_personas", "user_id"),
+    ("message_logs", "user_id"),
+    ("timeline_records", "user_id"),
+    ("day_plan_blocks", "user_id"),
+    ("todos", "user_id"),
+    ("schedules", "user_id"),
+    ("reminders", "user_id"),
+    ("expenses", "user_id"),
+    ("budget_limits", "user_id"),
+    ("planned_payments", "user_id"),
+    ("playbooks", "user_id"),
+    ("playbook_schedules", "user_id"),
+    ("playbook_runs", "user_id"),
+    ("clipboard_entries", "user_id"),
+    ("contacts", "user_id"),
+    ("credentials", "user_id"),
+    ("webhook_endpoints", "user_id"),
+    ("webhook_deliveries", "user_id"),
+    ("report_configs", "user_id"),
+    ("periodic_reports", "user_id"),
+    ("mcp_servers", "user_id"),
+];
+
+/// `user_id` が主キーの単一行テーブル（Node `USER_KEYED_TABLES`・backupService.ts:52）。
+/// 要素は [`USER_SCOPED_TABLES`] と同じく `(テーブル名, 絞り込み列名)`。
+const USER_KEYED_TABLES: &[(&str, &str)] = &[
+    ("context_notes", "user_id"),
+    ("briefing_configs", "user_id"),
+];
+
+/// 所有 Bot に直接ぶら下がるテーブル。共有ユーザーがその Bot 上で作った履歴・業務データも、
+/// Bot 単位の移行で欠落しないよう `bots.user_id` を介して抽出する。
+const BOT_SCOPED_TABLES: &[&str] = &[
+    "bot_shares",
+    "bot_context_notes",
+    "bot_guild_notes",
+    "bot_guilds",
+    "bot_members",
+    "bot_channels",
+    "bot_muted_channels",
+    "bot_credential_access",
+    "bot_google_account",
+    "bot_mcp_access",
     "bot_active_personas",
+    "bot_member_requests",
+    "bot_roles",
+    "bot_user_modules",
     "message_logs",
     "todos",
     "schedules",
@@ -62,15 +116,18 @@ const USER_SCOPED_TABLES: &[&str] = &[
     "playbook_runs",
     "clipboard_entries",
     "contacts",
-    "credentials",
-    "webhook_endpoints",
-    "webhook_deliveries",
-    "report_configs",
     "mcp_servers",
+    "context_notes",
+    "briefing_configs",
+    "report_configs",
+    "periodic_reports",
+    "tool_outcomes",
+    "topic_tool_stats",
+    "synapses",
+    "task_progress_logs",
+    "day_plan_blocks",
+    "timeline_records",
 ];
-
-/// `user_id` が主キーの単一行テーブル（Node `USER_KEYED_TABLES`・backupService.ts:52）。
-const USER_KEYED_TABLES: &[&str] = &["context_notes", "briefing_configs"];
 
 /// Drive ファイルの最小ビュー（Node `listBackupFiles` の返り値要素）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +156,7 @@ pub struct GoogleBackupClient {
     crypto: Arc<SystemCrypto>,
     db: Db,
     http: reqwest::Client,
+    media_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for GoogleBackupClient {
@@ -125,7 +183,15 @@ impl GoogleBackupClient {
             crypto,
             db,
             http,
+            media_dir: std::path::PathBuf::from("data/media"),
         }
+    }
+
+    /// Use the same legacy media directory as the timeline HTTP routes.
+    #[must_use]
+    pub fn with_media_dir(mut self, media_dir: std::path::PathBuf) -> Self {
+        self.media_dir = media_dir;
+        self
     }
 
     /// primary アカウントの復号済みリフレッシュトークンからアクセストークンを得る（`GoogleHttpClient`
@@ -329,26 +395,7 @@ impl GoogleBackupClient {
     /// # Errors
     /// 一時 DB 作成 / コピー / ZIP 化失敗時 [`GoogleError::Upstream`]。
     async fn export_and_zip(&self, user_id: &str) -> Result<Vec<u8>, GoogleError> {
-        let uid = user_id.to_owned();
-        let db_bytes = self
-            .db
-            .read
-            .read(move |conn| {
-                // 一時 SQLite ファイルへ本人分をエクスポート（Node `exportUserData`）。
-                let tmp = tempfile::Builder::new()
-                    .prefix("yuuka_backup_")
-                    .suffix(".db")
-                    .tempfile()
-                    .map_err(|e| DbError::Operation(format!("temp db: {e}")))?;
-                let tmp_path = tmp.path().to_path_buf();
-                {
-                    let dest = Connection::open(&tmp_path).map_err(map_sqlite)?;
-                    export_user_data(conn, &dest, &uid).map_err(map_sqlite)?;
-                    // dest は close（drop）してからファイルを読む。
-                }
-                std::fs::read(&tmp_path)
-                    .map_err(|e| DbError::Operation(format!("read temp db: {e}")))
-            })
+        let db_bytes = export_user_database_with_media_dir(&self.db, user_id, &self.media_dir)
             .await
             .map_err(|e| GoogleError::Upstream(e.to_string()))?;
 
@@ -357,17 +404,138 @@ impl GoogleBackupClient {
     }
 }
 
+/// 本人のアカウント設定・所有 Bot とその業務データだけを SQLite バイト列へ抽出する。
+/// Google Drive バックアップと PIN 付き移行パッケージが同じ抽出規則を共有するための入口。
+pub async fn export_user_database(db: &Db, user_id: &str) -> Result<Vec<u8>, DbError> {
+    export_user_database_with_media_dir(db, user_id, std::path::Path::new("data/media")).await
+}
+
+/// Embed legacy disk media into the exported SQLite alongside all V29 media bytes.
+/// A missing referenced legacy file fails the backup instead of claiming a complete archive.
+pub async fn export_user_database_with_media_dir(
+    db: &Db,
+    user_id: &str,
+    media_dir: &std::path::Path,
+) -> Result<Vec<u8>, DbError> {
+    let uid = user_id.to_owned();
+    let media_dir = media_dir.to_path_buf();
+    db.read
+        .read(move |conn| {
+            let tmp = tempfile::Builder::new()
+                .prefix("yuuka_export_")
+                .suffix(".db")
+                .tempfile()
+                .map_err(|e| DbError::Operation(format!("temp db: {e}")))?;
+            let tmp_path = tmp.path().to_path_buf();
+            {
+                let dest = Connection::open(&tmp_path).map_err(map_sqlite)?;
+                // Keep metadata and DB-resident bytes in one read snapshot.
+                conn.execute_batch("BEGIN DEFERRED").map_err(map_sqlite)?;
+                let result = export_user_data(conn, &dest, &uid).map_err(map_sqlite);
+                conn.execute_batch("ROLLBACK").map_err(map_sqlite)?;
+                result?;
+                embed_legacy_media(&dest, &media_dir)?;
+            }
+            std::fs::read(&tmp_path).map_err(|e| DbError::Operation(format!("read temp db: {e}")))
+        })
+        .await
+}
+
+/// Read media from the completed export, avoiding a second live DB/filesystem snapshot.
+pub fn exported_timeline_media(database: &[u8]) -> Result<Vec<(String, Vec<u8>)>, DbError> {
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| DbError::Operation(e.to_string()))?;
+    tmp.write_all(database)
+        .map_err(|e| DbError::Operation(e.to_string()))?;
+    let conn = Connection::open(tmp.path()).map_err(map_sqlite)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT filename,bytes FROM timeline_media_assets GROUP BY filename ORDER BY filename",
+        )
+        .map_err(map_sqlite)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(map_sqlite)?;
+    let media: Vec<(String, Vec<u8>)> = rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+    if media.iter().any(|(name, _)| {
+        name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..")
+    }) {
+        return Err(DbError::Operation(
+            "バックアップ対象のメディア名が不正です。".to_owned(),
+        ));
+    }
+    Ok(media)
+}
+
+/// Convert only the exported snapshot's referenced legacy files to transactional DB media.
+fn embed_legacy_media(dest: &Connection, media_dir: &std::path::Path) -> Result<(), DbError> {
+    if !table_has_column(dest, "timeline_media_assets", "bytes").map_err(map_sqlite)? {
+        return Ok(());
+    }
+    let mut stmt = dest.prepare("SELECT r.id,r.media_path,r.user_id,r.bot_id FROM timeline_records r \
+        WHERE r.media_path IS NOT NULL AND NOT EXISTS(SELECT 1 FROM timeline_media_assets a WHERE a.record_id=r.id)").map_err(map_sqlite)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(map_sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite)?;
+    for (id, filename, uid, bid) in rows {
+        if filename.is_empty()
+            || filename.contains('/')
+            || filename.contains('\\')
+            || filename.contains("..")
+        {
+            return Err(DbError::Operation(
+                "バックアップ対象のメディア名が不正です。".to_owned(),
+            ));
+        }
+        let root = media_dir
+            .canonicalize()
+            .map_err(|_| DbError::Operation("メディア保存先を読み込めませんでした。".to_owned()))?;
+        let path = root.join(&filename).canonicalize().map_err(|_| {
+            DbError::Operation("バックアップ対象のメディアが見つかりません。".to_owned())
+        })?;
+        if !path.starts_with(&root) {
+            return Err(DbError::Operation(
+                "メディアが保存先の外にあります。".to_owned(),
+            ));
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|_| DbError::Operation("メディアのバックアップに失敗しました。".to_owned()))?;
+        dest.execute("INSERT INTO timeline_media_assets(record_id,filename,mime_type,bytes,user_id,bot_id) VALUES(?1,?2,'application/octet-stream',?3,?4,?5)",
+            rusqlite::params![id,filename,bytes,uid,bid]).map_err(map_sqlite)?;
+    }
+    Ok(())
+}
+
 // ─── 純ロジック（テスト対象） ──────────────────────────────────────────────────
 
 /// データベーススキーマ + 当該ユーザーのデータのみを送り先 SQLite へエクスポートする（Node `exportUserData`）。
 ///
 /// スキーマ: `sqlite_master` の table/index 定義（FTS5 仮想テーブル・内部シャドウ・`sqlite_%` は除外）。
-/// データ: `users WHERE discord_id`、[`USER_SCOPED_TABLES`] + [`USER_KEYED_TABLES`] を `WHERE user_id`、
-/// `bots WHERE user_id`。テーブル不在は skip（Node try/catch）。`SELECT *` の列順を保って INSERT する。
+/// データ: `users WHERE discord_id`、[`USER_SCOPED_TABLES`] + [`USER_KEYED_TABLES`]（各テーブルごとの
+/// 絞り込み列で `WHERE`）、`bots WHERE user_id`。テーブル不在は skip（Node try/catch）。`SELECT *` の
+/// 列順を保って INSERT する。
 ///
 /// # Errors
-/// スキーマ/データコピーの SQL 失敗時 [`rusqlite::Error`]（テーブル不在の skip は含まない）。
+/// スキーマ/データコピーの SQL 失敗時 [`rusqlite::Error`]（テーブル不在の skip は含まない。列名不一致
+/// 等のテーブル不在以外の `prepare` 失敗は [`copy_rows`] が伝播する）。
 fn export_user_data(src: &Connection, dest: &Connection, user_id: &str) -> rusqlite::Result<()> {
+    // 0) 外部キー制約を無効化する。`rusqlite` の `bundled` feature は
+    //    `-DSQLITE_DEFAULT_FOREIGN_KEYS=1` でビルドされるため、`dest`（新規接続）は既定で FK が
+    //    有効になる。本人分だけを抽出コピーする都合上 `users` → ユーザースコープ各テーブル →
+    //    `bots` の順で INSERT するが、この並びでは `bots(id)` 等を参照する行が親より先に入り
+    //    `FOREIGN KEY constraint failed` になる（#50・本番の毎時バックアップ失敗）。コピー先は
+    //    一貫したスナップショット（親行は最終的に必ず入る）であり、FK を切るのは検証を後回しに
+    //    するだけでデータそのものは欠落しない＝リストア可能なコピーのまま保たれる。
+    dest.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
     // 1) スキーマ（table/index 定義）をコピー。個々の失敗は skip（Node の per-statement try/catch）。
     let schema: Vec<String> = {
         let mut stmt = src.prepare(
@@ -386,18 +554,88 @@ fn export_user_data(src: &Connection, dest: &Connection, user_id: &str) -> rusql
 
     // 2) 本人分の行を INSERT（`SELECT *` の列順を保つ）。
     copy_rows(src, dest, "users", "discord_id", user_id)?;
-    for table in USER_SCOPED_TABLES.iter().chain(USER_KEYED_TABLES) {
-        copy_rows(src, dest, table, "user_id", user_id)?;
+    for (table, where_col) in USER_SCOPED_TABLES.iter().chain(USER_KEYED_TABLES) {
+        copy_rows(src, dest, table, where_col, user_id)?;
     }
+    for table in BOT_SCOPED_TABLES {
+        if !table_has_column(src, table, "bot_id")? {
+            continue;
+        }
+        let select = format!(
+            "SELECT t.* FROM {table} t JOIN bots b ON b.id = t.bot_id WHERE b.user_id = ?1"
+        );
+        copy_rows_from_select(src, dest, table, &select, user_id)?;
+    }
+    // V28: tag provenance/opt-out belong to the same exported todos (personal or owned Bot).
+    copy_rows_from_select(
+        src,
+        dest,
+        "todo_tagging",
+        "SELECT s.* FROM todo_tagging s JOIN todos t ON t.id=s.todo_id
+         WHERE t.user_id=?1 OR EXISTS (SELECT 1 FROM bots b WHERE b.id=t.bot_id AND b.user_id=?1)",
+        user_id,
+    )?;
+    // V22: 添付には user_id 列がない。親の message_logs を介して本人分だけをコピーする。
+    // これを省くと返信本文は復元できても、グラフ等のファイル実体が失われる。
+    copy_rows_from_select(
+        src,
+        dest,
+        "message_attachments",
+        "SELECT a.* FROM message_attachments a \
+         JOIN message_logs m ON m.id = a.message_log_id \
+         LEFT JOIN bots b ON b.id = m.bot_id \
+         WHERE m.user_id = ?1 OR b.user_id = ?1",
+        user_id,
+    )?;
+    copy_rows_from_select(
+        src,
+        dest,
+        "timeline_media_assets",
+        "SELECT a.* FROM timeline_media_assets a JOIN timeline_records r ON r.id=a.record_id \
+         LEFT JOIN bots b ON b.id=r.bot_id WHERE r.user_id=?1 OR b.user_id=?1",
+        user_id,
+    )?;
     copy_rows(src, dest, "bots", "user_id", user_id)?;
+    // Preserve R13 lifecycle cleanup in the exported database too.
+    let mut triggers = src.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('timeline_media_user_delete','timeline_media_bot_delete')")?;
+    for sql in triggers.query_map([], |r| r.get::<_, String>(0))? {
+        dest.execute_batch(&sql?)?;
+    }
     Ok(())
+}
+
+/// 古いスキーマや最小テストスキーマに対象列が無い場合は、その抽出経路だけを省略する。
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `prepare` 失敗が「対象テーブルが存在しない」ことによるものか判定する。
+///
+/// [`copy_rows`] はテーブル不在（古いスキーマ等）だけを意図的に skip する。それ以外の `prepare` 失敗
+/// （列名の不一致など）は実装上のバグの可能性が高く、握り潰すと `personas`/`owner_id`（#50 の FK 修正
+/// を調査中に発覚）のように**エラーにもならず静かにデータが欠落**するため、区別して伝播させる。
+/// SQLite のエラーメッセージ文言（`"no such table: <name>"`）で判定する（`rusqlite::Error` の
+/// variant はテーブル不在は [`rusqlite::Error::SqliteFailure`]、列名不一致は
+/// [`rusqlite::Error::SqlInputError`] と実際には分かれるが、文言の方が SQLite 側の安定した契約のため
+/// こちらに依る）。
+fn is_missing_table(err: &rusqlite::Error) -> bool {
+    err.to_string().starts_with("no such table:")
 }
 
 /// `SELECT * FROM {table} WHERE {where_col} = ?` の全行を送り先へコピーする（Node `copyRows`）。
 /// テーブル不在（prepare 失敗）は skip（Node の try/catch return）。列名は `SELECT *` の順を保つ。
 ///
 /// # Errors
-/// INSERT の SQL 失敗時 [`rusqlite::Error`]（prepare 失敗＝テーブル不在は `Ok(())` へ握る）。
+/// INSERT の SQL 失敗時、およびテーブル不在以外の `prepare` 失敗（列名不一致等のスキーマ不整合）
+/// 時に [`rusqlite::Error`]（テーブル不在の `prepare` 失敗のみ `Ok(())` へ握る）。
 fn copy_rows(
     src: &Connection,
     dest: &Connection,
@@ -406,15 +644,32 @@ fn copy_rows(
     user_id: &str,
 ) -> rusqlite::Result<()> {
     let select = format!("SELECT * FROM {table} WHERE {where_col} = ?1");
-    // テーブル不在は prepare で失敗 → skip（Node の catch return）。
-    let Ok(mut stmt) = src.prepare(&select) else {
-        return Ok(());
+    copy_rows_from_select(src, dest, table, &select, user_id)
+}
+
+/// `user_id` を 1 パラメータに取る SELECT の結果を、同名テーブルへ型を保ってコピーする。
+/// V22 の添付のように所有者を親テーブル経由で絞る場合にも使う。
+fn copy_rows_from_select(
+    src: &Connection,
+    dest: &Connection,
+    table: &str,
+    select: &str,
+    user_id: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = match src.prepare(select) {
+        Ok(stmt) => stmt,
+        // テーブル不在は skip（Node の catch return）。
+        Err(e) if is_missing_table(&e) => return Ok(()),
+        // それ以外（列名不一致など）は握り潰さず、警告ログの上で伝播させる（データ欠落を隠さない）。
+        Err(e) => {
+            tracing::warn!(
+                table = %table, error = %e,
+                "⚠️ [Backup] テーブルのエクスポートに失敗（スキーマ不整合の可能性）"
+            );
+            return Err(e);
+        }
     };
-    let columns: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|c| (*c).to_owned())
-        .collect();
+    let columns: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     if columns.is_empty() {
         return Ok(());
     }
@@ -423,7 +678,8 @@ fn copy_rows(
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let insert = format!("INSERT INTO {table} ({col_list}) VALUES ({placeholders})");
+    // user scope と owned-bot scope の両方に該当する行は重複するため冪等にコピーする。
+    let insert = format!("INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})");
 
     let col_count = columns.len();
     let mut rows = stmt.query([user_id])?;
@@ -468,7 +724,7 @@ fn zip_single_file(name: &str, bytes: &[u8]) -> Result<Vec<u8>, zip::result::Zip
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         writer.start_file(name, options)?;
         writer.write_all(bytes)?;
@@ -630,18 +886,23 @@ mod tests {
 
     use super::{
         backup_file_name, build_multipart_body, copy_rows, drive_metadata_json, export_user_data,
-        parse_backup_files, parse_web_view_link, stale_files, zip_single_file, DriveFile,
-        BACKUP_PREFIX,
+        is_missing_table, parse_backup_files, parse_web_view_link, stale_files, zip_single_file,
+        DriveFile, BACKUP_PREFIX,
     };
 
     /// 最小スキーマ（users / todos / message_logs / message_logs_fts / bots / personas）を持つソース DB を作る。
+    ///
+    /// `personas` は実スキーマ（`crates/yuuka-db/migrations/V17__baseline.sql`）と同じく `owner_id` 列
+    /// でユーザーへ紐づく（他テーブルは `user_id`）。#50 の調査で発覚した「`personas` だけ列名が違う
+    /// ため一律 `user_id` 決め打ちだと無条件でスキップされる」を再現・回帰防止するため、この不一致を
+    /// そのままフィクスチャにも反映している。
     fn source_db() -> Connection {
         let conn = Connection::open_in_memory().expect("mem db");
         conn.execute_batch(
             "CREATE TABLE users (discord_id TEXT PRIMARY KEY, username TEXT);\
              CREATE TABLE todos (id INTEGER PRIMARY KEY, user_id TEXT, title TEXT);\
              CREATE TABLE message_logs (id INTEGER PRIMARY KEY, user_id TEXT, content TEXT);\
-             CREATE TABLE personas (id INTEGER PRIMARY KEY, user_id TEXT, name TEXT);\
+             CREATE TABLE personas (id INTEGER PRIMARY KEY, owner_id TEXT, name TEXT);\
              CREATE TABLE bots (id TEXT PRIMARY KEY, user_id TEXT, name TEXT);\
              CREATE INDEX idx_todos_user ON todos(user_id);\
              CREATE VIRTUAL TABLE message_logs_fts USING fts5(content);",
@@ -652,7 +913,7 @@ mod tests {
             "INSERT INTO users (discord_id, username) VALUES ('alice','A'),('bob','B');\
              INSERT INTO todos (user_id, title) VALUES ('alice','買い物'),('alice','掃除'),('bob','他人');\
              INSERT INTO message_logs (user_id, content) VALUES ('alice','hi'),('bob','bye');\
-             INSERT INTO personas (user_id, name) VALUES ('alice','秘書');\
+             INSERT INTO personas (owner_id, name) VALUES ('alice','秘書'),('bob','執事');\
              INSERT INTO bots (id, user_id, name) VALUES ('b1','alice','MyBot'),('b2','bob','Other');\
              INSERT INTO message_logs_fts (content) VALUES ('hi');",
         )
@@ -660,6 +921,29 @@ mod tests {
         conn
     }
 
+    #[test]
+    fn export_preserves_tag_provenance_and_opt_out_without_other_users() {
+        let src = source_db();
+        src.execute_batch(r#"ALTER TABLE todos ADD COLUMN bot_id TEXT;
+            CREATE TABLE todo_tagging (todo_id INTEGER PRIMARY KEY, explicit_tags TEXT, auto_tags TEXT, disabled INTEGER);
+            INSERT INTO todo_tagging VALUES (1,'["manual"]','["auto"]',0), (2,'[]','[]',1), (3,'["secret"]','[]',0);"#).unwrap();
+        let dest = Connection::open_in_memory().unwrap();
+        export_user_data(&src, &dest, "alice").unwrap();
+        let rows: Vec<(i64, String, String, i64)> = dest
+            .prepare("SELECT * FROM todo_tagging ORDER BY todo_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, r#"["manual"]"#.into(), r#"["auto"]"#.into(), 0),
+                (2, "[]".into(), "[]".into(), 1)
+            ]
+        );
+    }
     #[test]
     fn export_copies_only_target_user_rows() {
         let src = source_db();
@@ -693,6 +977,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(bots, 1);
+
+        // personas: owner_id で alice の 1 件のみ（#50 の調査で発覚した別バグの回帰確認）。
+        let personas: i64 = dest
+            .query_row("SELECT COUNT(*) FROM personas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(personas, 1);
+        let persona_name: String = dest
+            .query_row("SELECT name FROM personas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(persona_name, "秘書");
+    }
+
+    #[test]
+    fn export_includes_personas_scoped_by_owner_id() {
+        // #50 の FK 修正を調査中に発覚した別バグ: USER_SCOPED_TABLES が一律 `user_id` 決め打ちだと
+        // 実スキーマで `owner_id` 列の `personas` は `prepare` が「no such column: user_id」で失敗し、
+        // テーブル不在と同じ skip 経路に巻き込まれて常に無条件でスキップされていた（エラーにならず
+        // 静かに 0 件）。`USER_SCOPED_TABLES` に `personas` 専用の絞り込み列（`owner_id`）を持たせた
+        // ことで正しくコピーされることを検証する。
+        let src = source_db();
+        let dest = Connection::open_in_memory().expect("dest");
+        export_user_data(&src, &dest, "alice").expect("export");
+
+        let names: Vec<String> = {
+            let mut stmt = dest
+                .prepare("SELECT name FROM personas ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        // alice のペルソナのみ（bob の「執事」は含まれない）。
+        assert_eq!(names, vec!["秘書".to_owned()]);
+    }
+
+    #[test]
+    fn copy_rows_propagates_non_missing_table_errors() {
+        // テーブルは存在するが絞り込み列が無い（列名の取り違え等）場合は、テーブル不在の skip と
+        // 区別して呼び出し側へエラーを伝播させる（#50 の調査で発覚した「エラーにもならず静かに
+        // データが欠落する」問題の再発防止）。
+        let src = source_db();
+        let dest = Connection::open_in_memory().expect("dest");
+        // personas の実列は owner_id。存在しない列名を渡すと「no such column」で失敗するはずで、
+        // これは「no such table」ではないため Ok(()) へ握り潰されてはならない。
+        let err = copy_rows(&src, &dest, "personas", "nonexistent_column", "alice")
+            .expect_err("column mismatch must propagate, not be swallowed");
+        assert!(
+            !is_missing_table(&err),
+            "must not be classified as missing table"
+        );
     }
 
     #[test]
@@ -709,6 +1044,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_fts, 0);
+    }
+
+    /// FK 付きスキーマ（issue #50 が報告した失敗クラスの最小再現）を持つソース DB を作る。
+    ///
+    /// `export_user_data` は `users` → ユーザースコープの各テーブル → `bots` の順でコピーするため、
+    /// `bots(id)` を参照する行は親（`bots`）より先に INSERT される。`bot_active_personas` は実際の
+    /// migrations（`crates/yuuka-db/migrations/V17__baseline.sql`）にある実テーブル名を借りるが、
+    /// ここでの `bot_id → bots(id)` FK は本番スキーマの厳密な複製ではなく、「`bots` より先にコピー
+    /// される表が `bots(id)` を参照する」という issue #50 の依存関係の形を再現するためのもの。
+    /// `rusqlite` の `bundled` feature は `-DSQLITE_DEFAULT_FOREIGN_KEYS=1` でビルドされるため、
+    /// 送り先 DB（新規接続）でも既定で外部キー制約が有効になり、この順序で INSERT すると
+    /// `FOREIGN KEY constraint failed` になる（本番で実際に発生した障害）。
+    fn source_db_with_foreign_keys() -> Connection {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE users (discord_id TEXT PRIMARY KEY, username TEXT NOT NULL);\
+             CREATE TABLE bots (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,\
+                FOREIGN KEY (user_id) REFERENCES users(discord_id) ON DELETE CASCADE);\
+             CREATE TABLE bot_active_personas (user_id TEXT NOT NULL, bot_id TEXT NOT NULL,\
+                PRIMARY KEY (user_id, bot_id),\
+                FOREIGN KEY (user_id) REFERENCES users(discord_id) ON DELETE CASCADE,\
+                FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE);",
+        )
+        .expect("ddl");
+        conn.execute_batch(
+            "INSERT INTO users (discord_id, username) VALUES ('alice','A');\
+             INSERT INTO bots (id, user_id, name) VALUES ('b1','alice','MyBot');\
+             INSERT INTO bot_active_personas (user_id, bot_id) VALUES ('alice','b1');",
+        )
+        .expect("seed");
+        conn
+    }
+
+    #[test]
+    fn export_survives_foreign_keys_when_parent_copied_later() {
+        // #50: dest は新規接続のため FK 既定 ON（bundled の -DSQLITE_DEFAULT_FOREIGN_KEYS=1）。
+        // bots が最後にコピーされる現行の並びでも失敗せず、両テーブルの行が両方とも
+        // コピーされる（FK を切っても対象データが欠落しない）ことを検証する。
+        let src = source_db_with_foreign_keys();
+        let dest = Connection::open_in_memory().expect("dest");
+        export_user_data(&src, &dest, "alice").expect("export must survive FK-ordered copy");
+
+        let bots: i64 = dest
+            .query_row("SELECT COUNT(*) FROM bots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bots, 1);
+        let links: i64 = dest
+            .query_row("SELECT COUNT(*) FROM bot_active_personas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 1);
     }
 
     #[test]
@@ -804,7 +1189,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).expect("open zip");
         assert_eq!(archive.len(), 1);
         let mut file = archive.by_index(0).expect("entry");
-        assert_eq!(file.name(), "data/yuuka.db");
+        assert_eq!(file.name().unwrap(), "data/yuuka.db");
         use std::io::Read as _;
         let mut out = Vec::new();
         file.read_to_end(&mut out).expect("read");
@@ -879,5 +1264,46 @@ mod tests {
         assert!(parse_backup_files(r#"{"kind":"x"}"#).is_empty());
         assert!(parse_backup_files("nope").is_empty());
         assert!(parse_backup_files(r#"{"files":[]}"#).is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeline_export_contains_db_and_legacy_bytes_from_only_exported_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.db");
+        Connection::open(&path).unwrap();
+        let db = yuuka_web::Db::open(&path).unwrap();
+        db.writer.transaction(|tx| {
+            tx.execute_batch("INSERT INTO users(discord_id,username,salt) VALUES('u','U','x'),('other','O','x');
+                INSERT INTO bots(id,user_id,name) VALUES('b','u','B'),('foreign','other','F');
+                INSERT INTO timeline_records(id,user_id,bot_id,date,type,media_path,media_type) VALUES
+                (1,'u','b','2026-10-20','media','current.png','photo'),
+                (2,'u','b','2026-10-20','media','legacy.png','photo'),
+                (3,'other','foreign','2026-10-20','media','private.png','photo');
+                INSERT INTO timeline_media_assets(record_id,user_id,bot_id,filename,mime_type,bytes) VALUES
+                (1,'u','b','current.png','image/png',x'010203'),
+                (3,'other','foreign','private.png','image/png',x'999999');").map_err(yuuka_db::map_sqlite)?;
+            Ok(())
+        }).await.unwrap();
+        std::fs::write(temp.path().join("legacy.png"), [4, 5, 6]).unwrap();
+        let bytes = super::export_user_database_with_media_dir(&db, "u", temp.path())
+            .await
+            .unwrap();
+        let media = super::exported_timeline_media(&bytes).unwrap();
+        assert_eq!(
+            media,
+            vec![
+                ("current.png".to_owned(), vec![1, 2, 3]),
+                ("legacy.png".to_owned(), vec![4, 5, 6])
+            ]
+        );
+        // The export is self-contained: the legacy original is no longer needed to read it.
+        std::fs::remove_file(temp.path().join("legacy.png")).unwrap();
+        assert_eq!(super::exported_timeline_media(&bytes).unwrap(), media);
+        assert!(
+            super::export_user_database_with_media_dir(&db, "u", temp.path())
+                .await
+                .is_err(),
+            "missing referenced bytes cannot be reported as a successful complete backup"
+        );
     }
 }

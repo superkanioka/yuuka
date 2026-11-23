@@ -1,105 +1,155 @@
 <script lang="ts">
-	// ─────────────────────────────────────────────────────────────────────────
-	// リマインダー タブ（旧 app.js fetchRemindersList / reminder-form + index.html
-	// #tab-reminders を移植）。reminderApi 使用（bot-scoped）。
-	//
-	// 挙動の忠実移植:
-	//   - 登録フォーム（メッセージ / 通知日時 / cron / 送信先 / チャンネルID）。
-	//   - 一覧（全件表示チェックボックスで sent/cancelled も含める → ?all=1）。
-	//   - pending のみキャンセル可（ConfirmDialog で確認）。
-	//   - activeBot 変更でリロード。
-	// ─────────────────────────────────────────────────────────────────────────
-	import { activeBot } from "$lib/stores/activeBot";
-	import { reminderApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { confirmDialog } from "$lib/components/ui";
-	import { EmptyState } from "$lib/components/ui";
-	import type { ReminderRecord } from "$lib/api/types";
+import { onDestroy } from "svelte";
+import { asyncState } from "$lib/asyncState";
+// ─────────────────────────────────────────────────────────────────────────
+// リマインダー タブ（旧 app.js fetchRemindersList / reminder-form + index.html
+// #tab-reminders を移植）。reminderApi 使用（bot-scoped）。
+//
+// 挙動の忠実移植:
+//   - 登録フォーム（メッセージ / 通知日時 / cron / 送信先 / チャンネルID）。
+//   - 一覧（全件表示チェックボックスで sent/cancelled も含める → ?all=1）。
+//   - pending のみキャンセル可（ConfirmDialog で確認）。
+//   - activeBot 変更でリロード。
+// ─────────────────────────────────────────────────────────────────────────
 
-	import ReminderCard from "./reminders/ReminderCard.svelte";
-	import { toTriggerAt } from "./reminders/reminderUtils";
+import { reminderApi, settingsApi } from "$lib/api/services";
+import type { ReminderRecord } from "$lib/api/types";
+import { confirmDialog, EmptyState } from "$lib/components/ui";
+import { activeBot } from "$lib/stores/activeBot";
+import { pushToast, toastError } from "$lib/stores/toast";
+import type { StatusConfigResponse } from "./config/configTypes";
+import CronField from "./delivery/CronField.svelte";
+import TargetField from "./delivery/TargetField.svelte";
 
-	let reminders = $state<ReminderRecord[]>([]);
-	let showAll = $state(false);
-	let loading = $state(false);
+import ReminderCard from "./reminders/ReminderCard.svelte";
+import { toTriggerAt } from "./reminders/reminderUtils";
 
-	// フォーム state
-	let message = $state("");
-	let triggerAt = $state("");
-	let repeatRule = $state("");
-	let targetType = $state<"" | "dm" | "channel">("");
-	let targetId = $state("");
-	let submitting = $state(false);
+let reminders = $state<ReminderRecord[]>([]);
+let showAll = $state(false);
+let loading = $state(false);
 
-	function reportError(e: unknown) {
-		const msg = e instanceof ApiError ? e.message : "エラーが発生しました";
-		pushToast(msg, "error");
-	}
+// フォーム state
+let message = $state("");
+let triggerAt = $state("");
+let repeatRule = $state("");
+let targetType = $state<"dm" | "channel">("dm");
+let targetId = $state("");
+// ユーザー設定の既定送信先。送信先の初期値にし、選択肢に（既定）を付ける。
+let defaultTarget = $state<{ type: "dm" | "channel"; id: string } | null>(null);
+let submitting = $state(false);
 
-	async function loadReminders() {
-		loading = true;
-		try {
-			const res = await reminderApi.list({ all: showAll });
+const targetOptions = $derived<{ value: "dm" | "channel"; label: string }[]>([
+	{ value: "dm", label: `DM${defaultTarget?.type === "dm" ? "（既定）" : ""}` },
+	{
+		value: "channel",
+		label: `チャンネル${defaultTarget?.type === "channel" ? "（既定）" : ""}`,
+	},
+]);
+
+function resetTarget() {
+	targetType = defaultTarget?.type ?? "dm";
+	targetId = defaultTarget?.type === "channel" ? defaultTarget.id : "";
+}
+
+async function loadReminders() {
+	await loadRemindersRequest.run(
+		async () => await reminderApi.list({ all: showAll }),
+		(res) => {
 			reminders = res.reminders ?? [];
-		} catch (e) {
-			reportError(e);
+		},
+		(e) => {
+			toastError(e);
 			reminders = [];
-		} finally {
-			loading = false;
-		}
-	}
+		},
+	);
+}
 
-	// activeBot（bot-scoped）変更 or showAll 変更で再取得。
-	$effect(() => {
-		void $activeBot?.id;
-		void showAll;
-		void loadReminders();
-	});
+async function loadDefaultTarget() {
+	defaultTarget = null;
+	await loadDefaultTargetRequest.run(
+		async () => (await settingsApi.status()) as StatusConfigResponse,
+		(res) => {
+			const t = res.config?.notifyTarget;
+			defaultTarget =
+				t?.type === "channel"
+					? { type: "channel", id: t.id ?? "" }
+					: { type: "dm", id: "" };
+			resetTarget();
+		},
+		() => {
+			defaultTarget = null;
+			resetTarget();
+		},
+	);
+}
 
-	async function onSubmit(e: SubmitEvent) {
-		e.preventDefault();
-		const msg = message.trim();
-		if (!msg || !triggerAt) return;
-		submitting = true;
-		try {
-			await reminderApi.add({
-				message: msg,
-				trigger_at: toTriggerAt(triggerAt),
-				...(repeatRule.trim() ? { repeat_rule: repeatRule.trim() } : {}),
-				...(targetType ? { target_type: targetType } : {}),
-				...(targetId.trim() ? { target_id: targetId.trim() } : {}),
-			});
-			// フォームリセット（旧 reminderForm.reset()）
-			message = "";
-			triggerAt = "";
-			repeatRule = "";
-			targetType = "";
-			targetId = "";
-			pushToast("リマインダーを登録しました。", "success");
-			await loadReminders();
-		} catch (err) {
-			reportError(err);
-		} finally {
-			submitting = false;
-		}
-	}
+// activeBot（bot-scoped）変更 or showAll 変更で再取得。
+$effect(() => {
+	void $activeBot?.id;
+	void showAll;
+	void loadReminders();
+});
 
-	async function onCancel(id: number) {
-		const target = reminders.find((r) => r.id === id);
-		const ok = await confirmDialog({
-			message: `リマインダー「${target?.message ?? ""}」をキャンセルしますか？`,
-			danger: true,
-			confirmLabel: "キャンセルする",
+$effect(() => {
+	void $activeBot?.id;
+	void loadDefaultTarget();
+});
+
+async function onSubmit(e: SubmitEvent) {
+	e.preventDefault();
+	const msg = message.trim();
+	if (!msg || !triggerAt) return;
+	submitting = true;
+	try {
+		await reminderApi.add({
+			message: msg,
+			trigger_at: toTriggerAt(triggerAt),
+			...(repeatRule.trim() ? { repeat_rule: repeatRule.trim() } : {}),
+			target_type: targetType,
+			...(targetType === "channel" && targetId.trim()
+				? { target_id: targetId.trim() }
+				: {}),
 		});
-		if (!ok) return;
-		try {
-			await reminderApi.cancel(id);
-			await loadReminders();
-		} catch (e) {
-			reportError(e);
-		}
+		// フォームリセット（旧 reminderForm.reset()）
+		message = "";
+		triggerAt = "";
+		repeatRule = "";
+		resetTarget();
+		pushToast("リマインダーを登録しました。", "success");
+		await loadReminders();
+	} catch (err) {
+		toastError(err);
+	} finally {
+		submitting = false;
 	}
+}
+
+async function onCancel(id: number) {
+	const target = reminders.find((r) => r.id === id);
+	const ok = await confirmDialog({
+		message: `リマインダー「${target?.message ?? ""}」をキャンセルしますか？`,
+		danger: true,
+		confirmLabel: "キャンセルする",
+	});
+	if (!ok) return;
+	try {
+		await reminderApi.cancel(id);
+		await loadReminders();
+	} catch (e) {
+		toastError(e);
+	}
+}
+
+const loadRemindersRequest = asyncState((value) => {
+	loading = value;
+});
+onDestroy(() => {
+	loadRemindersRequest.cancel();
+});
+const loadDefaultTargetRequest = asyncState();
+onDestroy(() => {
+	loadDefaultTargetRequest.cancel();
+});
 </script>
 
 <section class="tab-view">
@@ -112,10 +162,7 @@
 					>リマインダーの登録
 				</h3>
 			</div>
-			<p class="description-text">
-				指定日時にDiscordへ通知するリマインダーを登録します。cron式を指定すると繰り返しリマインドになります。
-			</p>
-			<form class="reminder-form" onsubmit={onSubmit}>
+			<form class="form-stack" onsubmit={onSubmit}>
 				<div class="form-group">
 					<label for="reminder-message">メッセージ *</label>
 					<input
@@ -136,34 +183,23 @@
 					/>
 				</div>
 				<div class="form-group">
-					<label for="reminder-repeat-rule">繰り返し (cron式・任意)</label>
-					<input
-						type="text"
+					<CronField
 						id="reminder-repeat-rule"
+						label="繰り返し（任意）"
 						placeholder="例: 0 9 * * 1 (毎週月曜9時)"
-						class="reminder-cron-input"
+						help="指定すると送信後も自動で次回が予約されます。"
 						bind:value={repeatRule}
 					/>
-					<span class="field-sub">※指定すると送信後も自動で次回が予約されます。</span>
 				</div>
-				<div class="form-row">
-					<div class="form-group">
-						<label for="reminder-target-type">送信先</label>
-						<select id="reminder-target-type" bind:value={targetType}>
-							<option value="">既定 (ユーザー設定に従う)</option>
-							<option value="dm">DM</option>
-							<option value="channel">チャンネル</option>
-						</select>
-					</div>
-					<div class="form-group">
-						<label for="reminder-target-id">チャンネルID (チャンネル選択時)</label>
-						<input
-							type="text"
-							id="reminder-target-id"
-							placeholder="例: 123456789012345678"
-							bind:value={targetId}
-						/>
-					</div>
+				<div class="form-group">
+					<label for="reminder-target-type">送信先</label>
+					<TargetField
+						id="reminder-target-type"
+						idInputId="reminder-target-id"
+						options={targetOptions}
+						bind:type={targetType}
+						bind:targetId
+					/>
 				</div>
 				<button type="submit" class="btn btn-primary btn-block" disabled={submitting}
 					>リマインダーを登録</button
@@ -173,7 +209,7 @@
 
 		<!-- 一覧 -->
 		<div class="action-column card">
-			<div class="column-header">
+			<div class="column-header action-right">
 				<h3>
 					<span class="material-symbols-outlined header-icon-symbol"
 						>notifications</span
@@ -201,19 +237,16 @@
 </section>
 
 <style>
-	.reminder-form {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		margin-top: 8px;
+	/* 中身が長くても段の幅を広げない（grid の 1fr は既定で中身の幅より縮まない） */
+	.action-column {
+		min-width: 0;
 	}
-	.reminder-cron-input {
-		font-family: var(--font-family-mono);
-	}
+	/* 見出しの並びの右端に置く */
 	.reminders-showall-group {
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		margin-left: auto;
 	}
 	.reminders-showall-group label {
 		margin: 0;
@@ -227,8 +260,10 @@
 		flex-direction: column;
 		gap: 10px;
 		max-height: 560px;
+		overflow-x: hidden;
 		overflow-y: auto;
-		padding-right: 4px;
-		margin-top: 12px;
+		/* .card-item は左右に 12px はみ出す（margin: 0 -12px）ので、その分を枠に含めて横スクロールを出さない */
+		margin: 12px -12px 0;
+		padding: 0 12px;
 	}
 </style>

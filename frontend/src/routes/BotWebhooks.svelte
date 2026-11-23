@@ -1,298 +1,293 @@
 <script lang="ts">
-	// ─────────────────────────────────────────────────────────────────────────
-	// Webhook タブ（旧 app.js fetchWebhooksList / fetchWebhookDeliveries +
-	//  index.html #tab-webhooks を移植）。webhookApi 使用（scope:'user'）。
-	//   - エンドポイント一覧（URL コピー・有効/無効トグル・削除）
-	//   - 受信履歴（直近50件）
-	//   - 作成モーダル
-	// user-scoped のため activeBot に依存しない（$effect で一度だけ取得）。
-	// ─────────────────────────────────────────────────────────────────────────
-	import { webhookApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { confirmDialog } from "$lib/components/ui";
-	import { Button, Icon, Badge, EmptyState } from "$lib/components/ui";
-	import type {
-		WebhookEndpointView,
-		WebhookDeliveryRecord,
-	} from "$lib/api/types";
-	import WebhookCreateModal from "./webhooks/WebhookCreateModal.svelte";
-	import { deliveryStatusLabel, deliveryStatusTone } from "./webhooks/webhookUtils";
+import { onDestroy } from "svelte";
+import { asyncState } from "$lib/asyncState";
+// ─────────────────────────────────────────────────────────────────────────
+// Webhook タブ（旧 app.js fetchWebhooksList / fetchWebhookDeliveries +
+//  index.html #tab-webhooks を移植）。webhookApi 使用（一覧・作成・受信履歴は選択中 Bot）。
+// Playbook タブと同じく、次の 2 つをヘッダーのページ内タブで切り替える:
+//   - 一覧: エンドポイント一覧（URL コピー・有効/無効トグル・削除）。追加で作成フォームに切り替わる
+//   - 受信履歴: 直近50件
+// エンドポイントは Bot ごとの設定のため、選択中 Bot が変わったら取り直す。
+// ─────────────────────────────────────────────────────────────────────────
 
-	let endpoints = $state<WebhookEndpointView[]>([]);
-	let deliveries = $state<WebhookDeliveryRecord[]>([]);
-	let createOpen = $state(false);
+import { webhookApi } from "$lib/api/services";
+import type {
+	WebhookDeliveryRecord,
+	WebhookEndpointView,
+} from "$lib/api/types";
+import {
+	Badge,
+	Button,
+	confirmDialog,
+	EmptyState,
+	Icon,
+	PageTabs,
+} from "$lib/components/ui";
+import { activeBot } from "$lib/stores/activeBot";
+import { setHeaderExtra } from "$lib/stores/headerExtra";
+import { pushToast, toastError } from "$lib/stores/toast";
+import WebhookForm from "./webhooks/WebhookForm.svelte";
+import {
+	deliveryStatusLabel,
+	deliveryStatusTone,
+} from "./webhooks/webhookUtils";
 
-	function reportError(e: unknown) {
-		pushToast(e instanceof ApiError ? e.message : "エラーが発生しました", "error");
-	}
+const VIEWS = [
+	{ id: "list", label: "一覧", icon: "list_alt" },
+	{ id: "deliveries", label: "受信履歴", icon: "history" },
+];
+let view = $state("list");
 
-	async function loadEndpoints() {
-		try {
-			const res = await webhookApi.list();
+let endpoints = $state<WebhookEndpointView[]>([]);
+let deliveries = $state<WebhookDeliveryRecord[]>([]);
+let adding = $state(false);
+
+async function loadEndpoints() {
+	await loadEndpointsRequest.run(
+		async () => await webhookApi.list(),
+		(res) => {
 			endpoints = res.endpoints ?? [];
-		} catch (e) {
-			reportError(e);
+		},
+		(e) => {
+			toastError(e);
 			endpoints = [];
-		}
-	}
+		},
+	);
+}
 
-	async function loadDeliveries() {
-		try {
-			const res = await webhookApi.deliveries();
+async function loadDeliveries() {
+	await loadDeliveriesRequest.run(
+		async () => await webhookApi.deliveries(),
+		(res) => {
 			deliveries = res.deliveries ?? [];
-		} catch (e) {
-			reportError(e);
+		},
+		(e) => {
+			toastError(e);
 			deliveries = [];
-		}
-	}
+		},
+	);
+}
 
-	// user-scoped。マウント時に一度取得（activeBot 非依存）。
-	$effect(() => {
-		void loadEndpoints();
-		void loadDeliveries();
+// 選択中 Bot のエンドポイント・受信履歴を取得（Bot 切り替えで取り直す）。
+$effect(() => {
+	void $activeBot?.id;
+	void loadEndpoints();
+	void loadDeliveries();
+});
+
+async function copyUrl(url: string) {
+	try {
+		await navigator.clipboard.writeText(url);
+		pushToast("コピーしました", "success");
+	} catch {
+		pushToast(
+			"コピーに失敗しました。手動で選択してコピーしてください。",
+			"error",
+		);
+	}
+}
+
+async function toggleEnabled(ep: WebhookEndpointView) {
+	try {
+		await webhookApi.update({ id: ep.id, enabled: !ep.enabled });
+		await loadEndpoints();
+	} catch (e) {
+		toastError(e);
+	}
+}
+
+async function deleteEndpoint(ep: WebhookEndpointView) {
+	const ok = await confirmDialog({
+		message: `Webhook「${ep.name}」を削除しますか？\n発行済みURLは無効になります。`,
+		danger: true,
+		confirmLabel: "削除",
 	});
-
-	async function copyUrl(url: string) {
-		try {
-			await navigator.clipboard.writeText(url);
-			pushToast("コピーしました", "success");
-		} catch {
-			pushToast(
-				"コピーに失敗しました。手動で選択してコピーしてください。",
-				"error",
-			);
-		}
+	if (!ok) return;
+	try {
+		await webhookApi.delete(ep.id);
+		await loadEndpoints();
+	} catch (e) {
+		toastError(e);
 	}
+}
 
-	async function toggleEnabled(ep: WebhookEndpointView) {
-		try {
-			await webhookApi.update({ id: ep.id, enabled: !ep.enabled });
-			await loadEndpoints();
-		} catch (e) {
-			reportError(e);
-		}
+async function createEndpoint(payload: {
+	name: string;
+	secret: string;
+	notifyTargetType: "dm" | "channel";
+	notifyTargetId: string;
+	template: string;
+	filterKeyword: string;
+	createTodo: boolean;
+	createReminder: boolean;
+}) {
+	try {
+		const res = await webhookApi.create(payload);
+		pushToast(res.message ?? "Webhookを作成しました。", "success");
+		adding = false;
+		await loadEndpoints();
+	} catch (e) {
+		toastError(e);
 	}
+}
 
-	async function deleteEndpoint(ep: WebhookEndpointView) {
-		const ok = await confirmDialog({
-			message: `Webhook「${ep.name}」を削除しますか？\n発行済みURLは無効になります。`,
-			danger: true,
-			confirmLabel: "削除",
-		});
-		if (!ok) return;
-		try {
-			await webhookApi.delete(ep.id);
-			await loadEndpoints();
-		} catch (e) {
-			reportError(e);
-		}
-	}
+setHeaderExtra(headerTabs);
 
-	async function createEndpoint(payload: {
-		name: string;
-		secret: string;
-		notifyTargetType: "dm" | "channel";
-		notifyTargetId: string;
-		template: string;
-		filterKeyword: string;
-		createTodo: boolean;
-		createReminder: boolean;
-	}) {
-		try {
-			const res = await webhookApi.create(payload);
-			pushToast(res.message ?? "Webhookを作成しました。", "success");
-			createOpen = false;
-			await loadEndpoints();
-		} catch (e) {
-			reportError(e);
-		}
-	}
+const loadEndpointsRequest = asyncState();
+const loadDeliveriesRequest = asyncState();
+onDestroy(() => {
+	loadEndpointsRequest.cancel();
+	loadDeliveriesRequest.cancel();
+});
 </script>
 
-<section class="tab-view">
-	<div class="view-actions-card card">
-		<div class="filters-group">
-			<span class="label-text">
-				外部サービスからの通知を受け取るWebhookエンドポイントを管理します。
-			</span>
-		</div>
-		<Button variant="primary" onclick={() => (createOpen = true)}>＋ Webhook作成</Button>
-	</div>
+{#snippet headerTabs()}
+	<PageTabs tabs={VIEWS} bind:active={view} label="Webhook の設定" flush />
+{/snippet}
 
+<section class="tab-view webhooks-tab">
 	<!-- エンドポイント一覧 -->
-	<div class="card webhook-card-spacer">
-		<div class="column-header">
-			<h3><Icon name="webhook" class="header-icon-symbol" />エンドポイント一覧</h3>
-		</div>
-		<div class="webhook-list">
-			{#if endpoints.length > 0}
-				{#each endpoints as ep (ep.id)}
-					<div class="card-item glass webhook-item">
-						<div class="webhook-item-head">
-							<div class="webhook-item-title">
-								<span class="webhook-name">{ep.name}</span>
-								{#if ep.enabled}
-									<Badge tone="status-active">有効</Badge>
-								{:else}
-									<Badge tone="status-suspended">無効</Badge>
-								{/if}
-								{#if ep.has_secret}
-									<Badge tone="status-default">署名検証</Badge>
-								{/if}
+	{#if view === "list"}
+		{#if adding}
+			<WebhookForm onsave={createEndpoint} oncancel={() => (adding = false)} />
+		{:else}
+			<div class="action-column card">
+				<div class="column-header actions-end">
+					<Button variant="primary" onclick={() => (adding = true)}
+						><Icon name="add" />追加</Button
+					>
+				</div>
+				<div class="entry-list">
+					{#if endpoints.length > 0}
+						{#each endpoints as ep (ep.id)}
+							<div class="card-item glass entry">
+								<div class="entry-body">
+									<div class="entry-title">
+										<span class="entry-name">{ep.name}</span>
+										{#if ep.has_secret}
+											<Badge tone="status-default">署名検証</Badge>
+										{/if}
+									</div>
+									<div class="wh-url-row">
+										<span class="wh-url">{ep.url}</span>
+										<button
+											type="button"
+											class="icon-plain"
+											title="URLをコピー"
+											aria-label="URLをコピー"
+											onclick={() => copyUrl(ep.url)}
+										>
+											<Icon name="content_copy" size={18} />
+										</button>
+									</div>
+									<div class="wh-meta">
+										<span>通知先: {ep.notify_target_type === "channel" ? "チャンネル" : "DM"}</span>
+										{#if ep.filter_keyword}
+											<span>フィルタ: {ep.filter_keyword}</span>
+										{/if}
+										{#if ep.create_todo}<span>ToDo自動作成</span>{/if}
+										{#if ep.create_reminder}<span>リマインダー自動作成</span>{/if}
+									</div>
+								</div>
+								<div class="entry-actions">
+									<button
+										type="button"
+										class="btn-mini"
+										class:is-on={ep.enabled}
+										onclick={() => toggleEnabled(ep)}
+									>
+										{ep.enabled ? "有効" : "無効"}
+									</button>
+									<button
+										type="button"
+										class="icon-plain danger"
+										aria-label="削除"
+										onclick={() => deleteEndpoint(ep)}
+									>
+										<Icon name="delete" />
+									</button>
+								</div>
 							</div>
-							<div class="webhook-item-actions">
-								<button
-									type="button"
-									class="btn-mini"
-									onclick={() => toggleEnabled(ep)}
-								>
-									{ep.enabled ? "無効化" : "有効化"}
-								</button>
-								<button
-									type="button"
-									class="btn-trash"
-									aria-label="削除"
-									onclick={() => deleteEndpoint(ep)}
-								>
-									<Icon name="delete" />
-								</button>
-							</div>
-						</div>
-						<div class="webhook-url-row">
-							<input
-								type="text"
-								class="webhook-url-input"
-								readonly
-								value={ep.url}
-							/>
-							<Button variant="secondary" small onclick={() => copyUrl(ep.url)}
-								>URLコピー</Button
-							>
-						</div>
-						<div class="webhook-meta">
-							<span>通知先: {ep.notify_target_type === "channel" ? "チャンネル" : "DM"}</span>
-							{#if ep.filter_keyword}
-								<span>フィルタ: {ep.filter_keyword}</span>
-							{/if}
-							{#if ep.create_todo}<span>ToDo自動作成</span>{/if}
-							{#if ep.create_reminder}<span>リマインダー自動作成</span>{/if}
-						</div>
-					</div>
-				{/each}
-			{:else}
-				<EmptyState
-					icon="webhook"
-					message="Webhookエンドポイントはありません。「＋ Webhook作成」から発行できます。"
-				/>
-			{/if}
-		</div>
-	</div>
-
-	<!-- 受信履歴 -->
-	<div class="card webhook-card-spacer">
-		<div class="column-header action-right">
-			<h3><Icon name="history" class="header-icon-symbol" />受信履歴 (直近50件)</h3>
-			<Button variant="secondary" small onclick={loadDeliveries}>更新</Button>
-		</div>
-		<div class="table-responsive webhook-table-wrap">
-			<table class="expense-table">
-				<thead>
-					<tr>
-						<th>受信日時</th>
-						<th>ステータス</th>
-						<th>詳細</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#if deliveries.length > 0}
-						{#each deliveries as d (d.id)}
-							<tr>
-								<td class="webhook-mono">{d.created_at}</td>
-								<td>
-									<Badge tone={deliveryStatusTone(d.status)}>
-										{deliveryStatusLabel(d.status)}
-									</Badge>
-								</td>
-								<td>{d.detail || "—"}</td>
-							</tr>
 						{/each}
 					{:else}
-						<tr>
-							<td colspan="3" class="webhook-empty">受信履歴はありません。</td>
-						</tr>
+						<EmptyState
+							icon="webhook"
+							message="Webhookエンドポイントはありません。「追加」から発行できます。"
+						/>
 					{/if}
-				</tbody>
-			</table>
+				</div>
+			</div>
+		{/if}
+	{/if}
+
+	<!-- 受信履歴 -->
+	{#if view === "deliveries"}
+		<div class="card">
+			<div class="column-header actions-end">
+				<Button variant="secondary" small onclick={loadDeliveries}>更新</Button>
+			</div>
+			<div class="run-list">
+				{#if deliveries.length > 0}
+					{#each deliveries as d (d.id)}
+						<div
+							class="run-entry"
+							class:failed={d.status === "failed"}
+							class:success={d.status === "notified"}
+						>
+							<div class="wh-run-head">
+								<Badge tone={deliveryStatusTone(d.status)}>
+									{deliveryStatusLabel(d.status)}
+								</Badge>
+								<span class="wh-run-meta">{d.created_at}</span>
+							</div>
+							{#if d.detail}
+								<div class="wh-run-detail">{d.detail}</div>
+							{/if}
+						</div>
+					{/each}
+				{:else}
+					<EmptyState icon="history" message="受信履歴はありません。" />
+				{/if}
+			</div>
 		</div>
-	</div>
+	{/if}
 </section>
 
-<WebhookCreateModal bind:open={createOpen} onsave={createEndpoint} />
-
 <style>
-	.webhook-card-spacer {
-		margin-top: 20px;
-	}
-	.webhook-list {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		margin-top: 12px;
-	}
-	.webhook-item {
-		flex-direction: column;
-		align-items: stretch;
-		gap: 10px;
-	}
-	.webhook-item-head {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.webhook-item-title {
+	.wh-url-row {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		flex-wrap: wrap;
+		gap: 4px;
+		margin-top: 4px;
 	}
-	.webhook-name {
-		font-weight: 600;
-	}
-	.webhook-item-actions {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-	}
-	.webhook-url-row {
-		display: flex;
-		gap: 8px;
-		align-items: center;
-	}
-	.webhook-url-input {
-		flex: 1;
+	.wh-url {
+		min-width: 0;
 		font-family: var(--font-family-mono);
-		font-size: 0.8rem;
+		font-size: 0.75rem;
+		color: var(--color-primary);
+		word-break: break-all;
 	}
-	.webhook-meta {
+	.wh-meta {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 12px;
+		margin-top: 4px;
 		font-size: 0.75rem;
 		color: var(--color-zinc-muted);
 	}
-	.webhook-table-wrap {
-		margin-top: 12px;
+	.wh-run-head {
+		display: flex;
+		align-items: center;
+		gap: 8px;
 	}
-	.webhook-mono {
+	.wh-run-meta {
 		font-family: var(--font-family-mono);
-		font-size: 0.8rem;
-	}
-	.webhook-empty {
-		text-align: center;
-		font-size: 0.8rem;
+		font-size: 0.72rem;
 		color: var(--color-zinc-muted);
+	}
+	.wh-run-detail {
+		margin-top: 4px;
+		font-size: 0.8rem;
+		overflow-wrap: anywhere;
 	}
 </style>

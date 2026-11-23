@@ -5,6 +5,8 @@
 //! **残（別増分）**: usage（利用量集計）・modules（enabled_modules）・assistant-*（gemini-key/persona/
 //! guilds/members/roles/guild-note〔暗号・ギルド設定サブシステム〕）。
 
+use yuuka_web::error::{bad_request, server_error, status_json};
+
 use std::sync::Arc;
 
 use axum::extract::{Extension, Query, State};
@@ -72,6 +74,7 @@ pub fn routes_with(
         .route("/api/bots/assistant/members", post(set_member))
         .route("/api/bots/assistant/roles", post(set_role))
         .route("/api/bots/assistant/gemini-key", post(set_gemini_key))
+        .route("/api/bots/assistant/llm", post(set_llm))
         .route("/api/bots/modules", get(get_modules).post(set_modules))
         .route("/api/bots/usage", get(get_usage))
         .route(
@@ -129,11 +132,11 @@ async fn get_usage(
     State(db): State<Db>,
     Query(q): Query<UsageQuery>,
 ) -> Response {
-    // botId をアクセス認可つきで解決（未指定・アクセス不可は system_default へフォールバック＝
+    // botId をアクセス認可つきで解決（未指定・system_default は 403、アクセス不可は 404＝
     // 他人の Bot の利用量を覗かせない・Node `resolveBotId`）。書き込みは無いので owner 限定にしない。
     let bot_id = match yuuka_web::resolve_scope(&user.0, &db, q.bot_id.as_deref()).await {
         Ok(scope) => scope.bot_id().as_str().to_owned(),
-        Err(_) => return server_error(),
+        Err(e) => return e.into_response(),
     };
     // days = parseInt(days || "14"); 有限>0 なら min(,90)、それ以外は 14（Node）。
     let days = match q.days.as_deref().and_then(parse_int_prefix) {
@@ -329,6 +332,46 @@ fn not_found_bot() -> Response {
 
 // ─── POST /api/bots/assistant/gemini-key（Bot 専用 Gemini キー・owner/Admin） ─
 
+// Provider/model settings are independent of the key, so saving a model never clears it.
+async fn set_llm(
+    user: AuthenticatedUser,
+    State(db): State<Db>,
+    Json(body): Json<Value>,
+) -> Response {
+    let uid = user.0.discord_id;
+    let bot = match owned_bot_from_body(&db, &uid, &body).await {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let settings = if body.get("inheritDefaults").and_then(Value::as_bool) == Some(true) {
+        None
+    } else {
+        let provider = body
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        match yuuka_gemini::LlmSettings::validate(provider, model) {
+            Ok(s) => Some(s),
+            Err(e) => return bad_request(&e.to_string()),
+        }
+    };
+    if crate::llm_settings::save(&db, &bot.id, settings)
+        .await
+        .is_err()
+    {
+        return server_error();
+    }
+    yuuka_auth::audit::add_audit_log(&db, &uid, "bot.llm_change", Some(&bot.id), Some("updated"))
+        .await;
+    ok_message("AI設定を保存しました。次のメッセージから反映されます。")
+}
+
 async fn set_gemini_key(
     user: AuthenticatedUser,
     State(db): State<Db>,
@@ -338,7 +381,7 @@ async fn set_gemini_key(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let api_key = body.get("apiKey").and_then(Value::as_str).unwrap_or("");
 
@@ -367,7 +410,7 @@ async fn set_gemini_key(
     // 形式検証。
     if !is_likely_gemini_key(api_key.trim()) {
         return bad_request(
-            "Gemini APIキーの形式が正しくありません。「AIza」で始まるキーを入力してください（Google AI Studio で取得）。",
+            "Gemini APIキーの形式が正しくありません。Google AI Studio で取得したキー（「AIzaSy」または「AQ.」で始まるもの）をそのまま入力してください。",
         );
     }
     // 暗号化して保存。
@@ -396,16 +439,16 @@ async fn set_gemini_key(
     ok_message("Bot専用のGemini APIキーを保存しました。")
 }
 
-/// Gemini API キーらしさ（Node `isLikelyGeminiKey` = `^AIza[0-9A-Za-z_-]{30,}$`）。
+/// Gemini API キーの形式検証（`^(AIzaSy[A-Za-z0-9_-]{33}|AQ\.[A-Za-z0-9_-]{35,})$`）。
+/// 旧形式（`AIzaSy` + 33 文字）と新形式（`AQ.` + 35 文字以上）の両方を受け付ける。
 fn is_likely_gemini_key(value: &str) -> bool {
-    match value.strip_prefix("AIza") {
-        Some(rest) => {
-            rest.len() >= 30
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        }
-        None => false,
+    let is_key_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    if let Some(rest) = value.strip_prefix("AIzaSy") {
+        rest.len() == 33 && rest.bytes().all(is_key_char)
+    } else if let Some(rest) = value.strip_prefix("AQ.") {
+        rest.len() >= 35 && rest.bytes().all(is_key_char)
+    } else {
+        false
     }
 }
 
@@ -426,7 +469,7 @@ async fn owned_bot_from_body(
     db: &Db,
     uid: &str,
     body: &Value,
-) -> Result<bot_repo::BotRow, Response> {
+) -> Result<bot_repo::BotRow, Box<Response>> {
     let bot_id = body.get("botId").and_then(Value::as_str).unwrap_or("");
     require_owned_bot(db, uid, bot_id).await
 }
@@ -441,7 +484,7 @@ async fn set_guild(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = trimmed(&body, "guildId");
     let remove = is_remove(&body);
@@ -493,7 +536,7 @@ async fn set_channel(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = trimmed(&body, "guildId");
     let channel_id = trimmed(&body, "channelId");
@@ -554,7 +597,7 @@ async fn set_muted_channel(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = trimmed(&body, "guildId");
     let channel_id = trimmed(&body, "channelId");
@@ -614,7 +657,7 @@ async fn set_member(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = trimmed(&body, "guildId");
     let member_id = trimmed(&body, "userId");
@@ -676,7 +719,7 @@ async fn set_role(
     let uid = user.0.discord_id;
     let bot = match owned_bot_from_body(&db, &uid, &body).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = trimmed(&body, "guildId");
     let role_id = trimmed(&body, "roleId");
@@ -781,7 +824,7 @@ async fn set_persona(
         .to_owned();
     let bot = match require_owned_bot(&db, &uid, &bot_id).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // personaId: null/未指定/空文字は解除・それ以外は整数必須。
@@ -1025,7 +1068,7 @@ async fn guild_note_get(
     let bot =
         match require_owned_bot(&db, &user.0.discord_id, q.bot_id.as_deref().unwrap_or("")).await {
             Ok(b) => b,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     let guild_id = q.guild_id.unwrap_or_default();
     if !is_snowflake(&guild_id) {
@@ -1060,7 +1103,7 @@ async fn guild_note_set(
         .to_owned();
     let bot = match require_owned_bot(&db, &user.0.discord_id, &bot_id).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = body
         .get("guildId")
@@ -1113,7 +1156,7 @@ async fn assistant_config_get(
     .await
     {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let caps = bot.capability_set();
     let preset = preset::preset_id_for_capabilities(&caps).as_str();
@@ -1236,8 +1279,15 @@ async fn assistant_config_get(
         Err(_) => return server_error(),
     };
 
+    let llm = match crate::llm_settings::get(&db, &bot.id).await {
+        Ok(s) => s,
+        Err(_) => return server_error(),
+    };
     Json(json!({
         "success": true,
+        "llm": llm,
+        "llm_defaults": yuuka_gemini::LlmSettings::default(),
+        "llm_models": yuuka_gemini::ALLOWED_MODELS,
         "preset": preset,
         "capabilities": caps.granted(),
         "has_gemini_key": bot.has_gemini_key,
@@ -1282,7 +1332,7 @@ async fn guild_options_get(
     .await
     {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let guild_id = q.guild_id.unwrap_or_default();
     if !is_snowflake(&guild_id) {
@@ -1299,35 +1349,50 @@ async fn guild_options_get(
         .iter()
         .map(|e| json!({ "id": e.id, "name": e.name }))
         .collect();
+    let channels: Vec<Value> = opts
+        .channels
+        .iter()
+        .map(|e| json!({ "id": e.id, "name": e.name }))
+        .collect();
     Json(json!({
         "success": true,
         "roles": roles,
         "members": members,
+        "channels": channels,
         "members_complete": opts.members_complete,
         "available": opts.available,
     }))
     .into_response()
 }
 
-/// requireOwnedBot（botId 必須→404→owner/Admin 403・Node）。エラー時は応答を `Err` で返す。
-async fn require_owned_bot(db: &Db, uid: &str, bot_id: &str) -> Result<bot_repo::BotRow, Response> {
+/// requireOwnedBot（botId 必須→404→owner/Admin 403・Node）。エラー時は応答を `Err`（Box 化）で返す。
+async fn require_owned_bot(
+    db: &Db,
+    uid: &str,
+    bot_id: &str,
+) -> Result<bot_repo::BotRow, Box<Response>> {
     if bot_id.is_empty() {
-        return Err(bad_request("botId が必要です。"));
+        return Err(Box::new(bad_request("botId が必要です。")));
     }
     let bot = match bot_repo::get_bot(db, bot_id).await {
         Ok(Some(b)) => b,
-        Ok(None) => return Err(status_json(StatusCode::NOT_FOUND, "Botが見つかりません。")),
-        Err(_) => return Err(server_error()),
+        Ok(None) => {
+            return Err(Box::new(status_json(
+                StatusCode::NOT_FOUND,
+                "Botが見つかりません。",
+            )))
+        }
+        Err(_) => return Err(Box::new(server_error())),
     };
     let is_admin = match bot_repo::is_admin(db, uid).await {
         Ok(v) => v,
-        Err(_) => return Err(server_error()),
+        Err(_) => return Err(Box::new(server_error())),
     };
     if bot.owner_id != uid && !is_admin {
-        return Err(status_json(
+        return Err(Box::new(status_json(
             StatusCode::FORBIDDEN,
             "Botの作成者のみが設定を変更できます。",
-        ));
+        )));
     }
     Ok(bot)
 }
@@ -1550,25 +1615,6 @@ fn js_positive_int(v: &Value) -> Option<i64> {
     (n > 0).then_some(n)
 }
 
-fn status_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-fn bad_request(message: &str) -> Response {
-    status_json(StatusCode::BAD_REQUEST, message)
-}
-
-fn server_error() -> Response {
-    status_json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "内部エラーが発生しました。",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,8 +1667,8 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).expect("seed conn");
             for (uid, role) in [("owner", "user"), ("admin", "admin"), ("other", "user")] {
                 conn.execute(
-                    "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt, role) \
-                     VALUES (?1, ?1, 'x', 'x', ?2)",
+                    "INSERT OR IGNORE INTO users (discord_id, username, salt, role) \
+                     VALUES (?1, ?1, 'x', ?2)",
                     rusqlite::params![uid, role],
                 )
                 .expect("seed user");
@@ -2136,13 +2182,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_settings_validate_authorize_and_preserve_key() {
+        let db = seed_db();
+        let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), db.clone());
+        let app = super::routes_with(None, Arc::new(NullDiscordLive)).with_state(state);
+        let path = "/api/bots/assistant/llm";
+        bot_repo::update_bot_gemini_key(
+            &db,
+            "b1",
+            Some(EncryptedTriplet {
+                encrypted: "existing-key".to_owned(),
+                iv: "iv".to_owned(),
+                tag: "tag".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        let key_before = bot_repo::bot_gemini(&db, "b1")
+            .await
+            .unwrap()
+            .map(|k| k.encrypted);
+        for body in [
+            r#"{"botId":"b1","provider":"openai","model":"gemini-3.5-flash-lite"}"#,
+            r#"{"botId":"b1","provider":"gemini","model":"invalid"}"#,
+        ] {
+            let (st, _) = send(&app, "POST", path, "owner", body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+        }
+        let body = r#"{"botId":"b1","provider":"gemini","model":"gemini-3.5-flash-lite"}"#;
+        let (st, _) = send(&app, "POST", path, "other", body).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(&app, "POST", path, "owner", body).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            crate::llm_settings::get(&db, "b1").await.unwrap().model,
+            "gemini-3.5-flash-lite"
+        );
+        assert_eq!(
+            bot_repo::bot_gemini(&db, "b1")
+                .await
+                .unwrap()
+                .map(|k| k.encrypted),
+            key_before
+        );
+        let (st, _) = send(
+            &app,
+            "POST",
+            path,
+            "owner",
+            r#"{"botId":"b1","inheritDefaults":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            crate::llm_settings::get(&db, "b1").await.unwrap().model,
+            yuuka_gemini::LlmSettings::default().model
+        );
+    }
+
+    #[tokio::test]
     async fn gemini_key_set_clear_validate() {
         use secrecy::SecretString;
         use yuuka_crypto::SystemCrypto;
         let crypto = Arc::new(SystemCrypto::new(SecretString::from("test-secret-xyz")).unwrap());
         let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), seed_db());
-        let app =
-            super::routes_with(Some(crypto), Arc::new(NullDiscordLive)).with_state(state);
+        let app = super::routes_with(Some(crypto), Arc::new(NullDiscordLive)).with_state(state);
 
         // 形式不正 → 400。
         let (st, _) = send(
@@ -2165,8 +2269,19 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(j["message"], "APIキーは変更されていません。");
-        // 正規キー → 保存。
-        let key = format!("AIza{}", "a".repeat(35));
+        // 新形式（AQ.…）→ 保存。
+        let (st, j) = send(
+            &app,
+            "POST",
+            "/api/bots/assistant/gemini-key",
+            "owner",
+            r#"{"botId":"b1","apiKey":"AQ.Ab8RN6Lx3kQ9vT2mP7wZ4yH1cF5jD0sG8nB"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(j["message"], "Bot専用のGemini APIキーを保存しました。");
+        // 旧形式（AIzaSy…）→ 保存。
+        let key = format!("AIzaSy{}", "a".repeat(33));
         let (st, j) = send(
             &app,
             "POST",
@@ -2269,8 +2384,8 @@ mod tests {
     #[tokio::test]
     async fn usage_route_shape_days_clamp_and_auth() {
         let app = app();
-        // 既定 days=14・ログ無し system_default（未指定 botId）→ 全0・rate_limits あり。
-        let (st, j) = send(&app, "GET", "/api/bots/usage", "owner", "").await;
+        // 既定 days=14・ログ無しの所有 Bot → 全0・rate_limits あり。
+        let (st, j) = send(&app, "GET", "/api/bots/usage?botId=b1", "owner", "").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(j["success"], serde_json::json!(true));
         assert_eq!(j["days"], serde_json::json!(14));
@@ -2283,16 +2398,45 @@ mod tests {
         assert!(p0["requests"].is_number() && p0["responses"].is_number());
 
         // days=5 → 長さ5。
-        let (_, j) = send(&app, "GET", "/api/bots/usage?days=5", "owner", "").await;
+        let (_, j) = send(&app, "GET", "/api/bots/usage?botId=b1&days=5", "owner", "").await;
         assert_eq!(j["days"], serde_json::json!(5));
         assert_eq!(j["series"].as_array().unwrap().len(), 5);
         // days>90 → 90 にクランプ。
-        let (_, j) = send(&app, "GET", "/api/bots/usage?days=365", "owner", "").await;
+        let (_, j) = send(
+            &app,
+            "GET",
+            "/api/bots/usage?botId=b1&days=365",
+            "owner",
+            "",
+        )
+        .await;
         assert_eq!(j["days"], serde_json::json!(90));
         assert_eq!(j["series"].as_array().unwrap().len(), 90);
         // 非数値 days → 14（Node parseInt NaN フォールバック）。
-        let (_, j) = send(&app, "GET", "/api/bots/usage?days=abc", "owner", "").await;
+        let (_, j) = send(
+            &app,
+            "GET",
+            "/api/bots/usage?botId=b1&days=abc",
+            "owner",
+            "",
+        )
+        .await;
         assert_eq!(j["days"], serde_json::json!(14));
+
+        // Bot 未指定・システム Bot は 403、アクセスできない Bot は 404（システム Bot へ落とさない）。
+        let (st, _) = send(&app, "GET", "/api/bots/usage", "owner", "").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(
+            &app,
+            "GET",
+            "/api/bots/usage?botId=system_default",
+            "owner",
+            "",
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(&app, "GET", "/api/bots/usage?botId=b1", "other", "").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
 
         // 認証必須（不明トークン → 401）。
         let (st, _) = send(&app, "GET", "/api/bots/usage", "nobody", "").await;
@@ -2316,16 +2460,21 @@ mod tests {
         {
             let conn = rusqlite::Connection::open(&path).expect("seed conn");
             conn.execute(
-                "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt, role) \
-                 VALUES ('owner', 'owner', 'x', 'x', 'user')",
+                "INSERT OR IGNORE INTO users (discord_id, username, salt, role) \
+                 VALUES ('owner', 'owner', 'x', 'user')",
                 [],
             )
             .expect("seed user");
-            // 未指定 botId → system_default 宛の今日ぶん（user×1, assistant×1）。
+            conn.execute(
+                "INSERT INTO bots (id, user_id, name) VALUES ('b1', 'owner', 'TestBot')",
+                [],
+            )
+            .expect("seed bot");
+            // b1 宛の今日ぶん（user×1, assistant×1）。
             for role in ["user", "assistant"] {
                 conn.execute(
                     "INSERT INTO message_logs (user_id, bot_id, role, content) \
-                     VALUES ('owner', 'system_default', ?1, 'c')",
+                     VALUES ('owner', 'b1', ?1, 'c')",
                     rusqlite::params![role],
                 )
                 .expect("seed log");
@@ -2334,7 +2483,7 @@ mod tests {
         let app =
             super::routes().with_state(AppState::new(Arc::new(FakeAuth), WebConfig::default(), db));
 
-        let (st, j) = send(&app, "GET", "/api/bots/usage?days=1", "owner", "").await;
+        let (st, j) = send(&app, "GET", "/api/bots/usage?botId=b1&days=1", "owner", "").await;
         assert_eq!(st, StatusCode::OK);
         let series = j["series"].as_array().unwrap();
         assert_eq!(series.len(), 1);

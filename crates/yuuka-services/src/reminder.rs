@@ -1,6 +1,6 @@
 //! リマインドエンジン（§3.3.2・現行 `reminderEngine.ts`）。
 //!
-//! 毎分＋起動直後（取りこぼし復帰・§10）に 3 種を処理する:
+//! `REMINDER_CRON`（既定毎分）＋起動直後（取りこぼし復帰・§10）に 3 種を処理する:
 //!   1. 時刻指定リマインド（`reminders` の期限到来 pending・繰り返しは cron 式で再スケジュール）
 //!   2. ToDo 期限リマインド（24 時間以内に迫った未通知 ToDo）
 //!   3. 予定リマインド（Google カレンダー同期予定のイベント前通知）
@@ -17,12 +17,23 @@ use yuuka_schedule::repo::ScheduleRepo;
 use yuuka_todo::repo::TodoRepo;
 
 use crate::context::ServiceContext;
-use crate::cron_util;
 use crate::notifier::{Notification, NotifyTarget};
 use crate::schedule::{CronService, Schedule};
+use yuuka_core::cron_util;
 
 /// リマインドエンジンサービス。
-pub struct ReminderService;
+pub struct ReminderService {
+    /// 実行周期の cron 式（config `REMINDER_CRON`・起動時に検証済み・Node `config.reminderCron`）。
+    cron: String,
+}
+
+impl ReminderService {
+    /// 実行周期（`REMINDER_CRON`）を指定して作る。
+    #[must_use]
+    pub fn new(cron: impl Into<String>) -> Self {
+        Self { cron: cron.into() }
+    }
+}
 
 #[async_trait]
 impl CronService for ReminderService {
@@ -31,7 +42,7 @@ impl CronService for ReminderService {
     }
 
     fn schedule(&self) -> Schedule {
-        Schedule::EveryMinute // config.reminderCron 既定 "* * * * *"
+        Schedule::Cron(self.cron.clone())
     }
 
     async fn tick(&self, ctx: &ServiceContext) {
@@ -97,15 +108,16 @@ async fn advance_after_send(
 }
 
 /// リマインドの送信先を解決する（現行 `resolveTarget`）。
+/// 保存済みの `dm` は DM。登録時にユーザー既定送信先を保存済みのため、ここでは既定送信先を見ない。
 fn resolve_target(reminder: &DueReminder) -> NotifyTarget {
     if reminder.target_type.as_deref() == Some("channel") {
         match reminder.target_id.as_deref() {
             Some(id) if !id.is_empty() => NotifyTarget::Channel(id.to_owned()),
-            // チャンネル指定だが ID 不明 → 既定送信先（→DM）へ委ねる。
+            // チャンネル指定だが ID 不明 → ユーザー既定送信先（→DM）へ委ねる。
             _ => NotifyTarget::Default,
         }
     } else {
-        NotifyTarget::Default
+        NotifyTarget::Dm
     }
 }
 
@@ -207,9 +219,9 @@ mod tests {
     use std::sync::Arc;
     use yuuka_db::map_sqlite;
 
-    const REMINDERS_DDL: &str = "CREATE TABLE reminders (
+    const REMINDERS_DDL: &str = "DROP TABLE IF EXISTS reminders; CREATE TABLE reminders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL, bot_id TEXT NOT NULL DEFAULT 'system_default',
+        user_id TEXT NOT NULL, bot_id TEXT NOT NULL,
         message TEXT NOT NULL, trigger_at TEXT NOT NULL, repeat_rule TEXT,
         target_type TEXT NOT NULL DEFAULT 'dm', target_id TEXT,
         status TEXT NOT NULL DEFAULT 'pending', source TEXT NOT NULL DEFAULT 'manual',
@@ -230,6 +242,85 @@ mod tests {
         assert_eq!(format_display_datetime(None), "未設定");
         assert_eq!(format_display_datetime(Some("  ")), "未設定");
         assert_eq!(format_display_datetime(Some("later")), "later");
+    }
+
+    /// 既定送信先をチャンネル `c-default` にしたユーザー `u` を作る（users 表はマイグレーションが作る）。
+    async fn seed_user_with_channel_default(db: &yuuka_web::Db) {
+        db.writer
+            .execute(|conn| {
+                conn.execute(
+                    "INSERT INTO users \
+                       (discord_id, username, salt, notify_target_type, notify_target_id) \
+                     VALUES ('u', 'u', '', 'channel', 'c-default')",
+                    [],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// R17: 保存済みの dm は DM、ID 不明のチャンネル指定はユーザー既定送信先へ届ける。
+    #[tokio::test]
+    async fn due_reminder_targets_follow_saved_type() {
+        let (db, _dir) = seeded_db(REMINDERS_DDL);
+        seed_user_with_channel_default(&db).await;
+        db.writer
+            .execute(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO reminders (user_id, bot_id, message, trigger_at, target_type, status) \
+                     VALUES ('u','system_default','dm','2000-01-01 00:00:00','dm','pending'); \
+                     INSERT INTO reminders (user_id, bot_id, message, trigger_at, target_type, status) \
+                     VALUES ('u','system_default','chan','2000-01-01 00:00:01','channel','pending');",
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rec = Arc::new(RecordingNotifier::new(true));
+        let ctx = ctx_with(db, rec.clone());
+        process_due_reminders(&ctx).await.unwrap();
+
+        let sent = rec.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].target, NotifyTarget::Dm);
+        assert_eq!(
+            sent[1].target,
+            NotifyTarget::Channel("c-default".to_owned())
+        );
+    }
+
+    /// R17: 送信先を持たない ToDo 期限通知はユーザー既定送信先へ届ける。
+    #[tokio::test]
+    async fn todo_due_uses_user_default_target() {
+        let (db, _dir) = seeded_db(REMINDERS_DDL);
+        seed_user_with_channel_default(&db).await;
+        db.writer
+            .execute(|conn| {
+                conn.execute(
+                    "INSERT INTO todos (user_id, bot_id, title, due_date) \
+                     VALUES ('u', 'system_default', '資料', datetime('now', 'localtime', '+1 hours'))",
+                    [],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rec = Arc::new(RecordingNotifier::new(true));
+        let ctx = ctx_with(db, rec.clone());
+        process_todo_due(&ctx).await.unwrap();
+
+        let sent = rec.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].target,
+            NotifyTarget::Channel("c-default".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -340,5 +431,28 @@ mod tests {
             .unwrap();
         assert_eq!(status, "pending");
         assert_ne!(trigger, "2000-01-01 00:00:00");
+    }
+
+    /// 実行周期は config `REMINDER_CRON` に従う（R26。以前は毎分固定）。
+    #[test]
+    fn schedule_follows_configured_cron() {
+        assert!(matches!(
+            ReminderService::new("*/5 * * * *").schedule(),
+            Schedule::Cron(expr) if expr == "*/5 * * * *"
+        ));
+    }
+
+    /// 既定（`build_services` に既定値を渡した場合）は毎分。
+    #[test]
+    fn default_schedule_is_every_minute() {
+        let svcs = crate::build_services(yuuka_core::config::DEFAULT_REMINDER_CRON);
+        let reminder = svcs
+            .iter()
+            .find(|s| s.name() == "reminder")
+            .expect("reminder service");
+        assert!(matches!(
+            reminder.schedule(),
+            Schedule::Cron(expr) if expr == "* * * * *"
+        ));
     }
 }

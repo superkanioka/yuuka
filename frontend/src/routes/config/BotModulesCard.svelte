@@ -1,120 +1,131 @@
 <script lang="ts">
-	// 有効な機能（モジュール選択）カード（旧 loadBotModules + saveBotModules）。
-	// ユーザー個別設定。アクセス権のある全 Bot（デフォルト含む）で表示。
-	import { botAttributeApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { Button, Checkbox } from "$lib/components/ui";
-	import type { ModuleItem, ModulesResp } from "./configTypes";
+// 有効な機能（モジュール選択）カード（旧 loadBotModules + saveBotModules）。
+// ユーザー個別設定。アクセス権のある全 Bot（デフォルト含む）で表示。
 
-	interface Props {
-		botId: string;
-	}
-	let { botId }: Props = $props();
+import { botAttributeApi } from "$lib/api/services";
+import { Button, Checkbox, confirmDialog, Icon } from "$lib/components/ui";
+import { syncDisabledTabs } from "$lib/stores/disabledTabs";
+import { pushToast, toastError } from "$lib/stores/toast";
+import type { ModuleItem, ModulesResp } from "./configTypes";
 
-	// enabled はローカルで bind するため id→boolean のマップで保持し、表示は元配列順。
-	let modules = $state<ModuleItem[]>([]);
-	let enabledMap = $state<Record<string, boolean>>({});
-	let visible = $state(false);
+interface Props {
+	botId: string;
+}
+let { botId }: Props = $props();
 
-	const onCount = $derived(
-		modules.filter((m) => enabledMap[m.id]).length,
-	);
+// enabled はローカルで bind するため id→boolean のマップで保持し、表示は元配列順。
+let modules = $state<ModuleItem[]>([]);
+let enabledMap = $state<Record<string, boolean>>({});
+let visible = $state(false);
 
-	$effect(() => {
-		void botId;
-		void load();
-	});
+const onCount = $derived(modules.filter((m) => enabledMap[m.id]).length);
 
-	async function load() {
-		try {
-			const res = (await botAttributeApi.modules(botId)) as ModulesResp;
-			if (!res.success) {
-				visible = false;
-				return;
-			}
-			modules = res.modules ?? [];
-			const map: Record<string, boolean> = {};
-			for (const m of modules) map[m.id] = !!m.enabled;
-			enabledMap = map;
-			visible = true;
-		} catch {
+$effect(() => {
+	void botId;
+	void load();
+});
+
+async function load() {
+	try {
+		const res = (await botAttributeApi.modules(botId)) as ModulesResp;
+		if (!res.success) {
 			visible = false;
+			return;
 		}
+		modules = res.modules ?? [];
+		const map: Record<string, boolean> = {};
+		for (const m of modules) map[m.id] = !!m.enabled;
+		enabledMap = map;
+		syncDisabledTabs(modules);
+		visible = true;
+	} catch {
+		visible = false;
 	}
+}
 
-	async function save(enabled: string[] | "all") {
-		try {
-			const res = await botAttributeApi.updateModules({
-				botId,
-				enabledModules: enabled,
-			});
-			pushToast(res.message ?? "保存しました。", res.success ? "success" : "error");
-			if (res.success) await load();
-		} catch (err) {
+async function save(enabled: string[] | "all", toastOnSuccess: boolean) {
+	try {
+		const res = await botAttributeApi.updateModules({
+			botId,
+			enabledModules: enabled,
+		});
+		if (!res.success || toastOnSuccess)
 			pushToast(
-				err instanceof ApiError ? err.message : "通信エラーが発生しました。",
-				"error",
+				res.message ?? "保存しました。",
+				res.success ? "success" : "error",
 			);
-		}
+		await load();
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
+		await load();
 	}
+}
 
-	function saveSelected() {
-		const enabled = modules.filter((m) => enabledMap[m.id]).map((m) => m.id);
-		void save(enabled);
-	}
+// チェックの切り替えごとに即時保存する（失敗時は load で元に戻る）。
+function saveSelected() {
+	const enabled = modules.filter((m) => enabledMap[m.id]).map((m) => m.id);
+	void save(enabled, false);
+}
+
+async function resetToDefault() {
+	const ok = await confirmDialog({
+		message: "有効な機能を既定に戻しますか？",
+		confirmLabel: "既定に戻す",
+	});
+	if (ok) void save("all", true);
+}
 </script>
 
 {#if visible}
-	<details class="config-card card" open>
-		<summary class="column-header badge-right">
-			<h3><span class="material-symbols-outlined header-icon-symbol">tune</span>有効な機能（あなた専用）</h3>
+	<section class="config-card card">
+		<div class="column-header badge-right">
 			<span class="badge badge-accent">{onCount} / {modules.length}</span>
-		</summary>
-		<p class="description-text">
-			あなたがこのBotで使う機能だけを選べます（この設定はあなた個人にのみ適用されます）。オフにした機能はAIに渡されず、左メニューの該当タブも非表示になります。変更は次のメッセージ処理から反映されます。
-		</p>
+			<Button
+				variant="icon-sm"
+				title="既定に戻す"
+				aria-label="既定に戻す"
+				onclick={resetToDefault}><Icon name="restart_alt" /></Button
+			>
+		</div>
 		<div class="modules-grid">
 			{#each modules as m (m.id)}
 				<label class="module-toggle">
-					<Checkbox bind:checked={enabledMap[m.id]} aria-label={m.label} />
-					<div>
-						<div class="module-label">{m.label}</div>
-						<div class="field-sub">{m.description || ""}</div>
-					</div>
+					<Checkbox
+						bind:checked={enabledMap[m.id]}
+						onchange={saveSelected}
+						aria-label={m.label}
+					/>
+					<div class="module-label">{m.label}</div>
+					{#if m.description}
+						<div class="field-sub module-desc">{m.description}</div>
+					{/if}
 				</label>
 			{/each}
 		</div>
-		<div class="modules-actions">
-			<Button variant="primary" onclick={saveSelected}>機能を保存</Button>
-			<Button variant="secondary" onclick={() => save("all")}>既定に戻す</Button>
-		</div>
-	</details>
+	</section>
 {/if}
 
 <style>
 	.modules-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-		gap: 8px;
+		display: flex;
+		flex-direction: column;
 		margin-top: 12px;
 	}
 	.module-toggle {
-		display: flex;
-		gap: 8px;
-		align-items: flex-start;
-		padding: 8px;
-		border: 1px solid var(--border-matte);
-		border-radius: 8px;
+		display: grid;
+		grid-template-columns: auto 1fr;
+		column-gap: 8px;
+		align-items: center;
+		padding: 10px 0;
 		cursor: pointer;
+	}
+	.module-toggle + .module-toggle {
+		border-top: 1px solid var(--border-matte);
+	}
+	.module-desc {
+		grid-column: 2;
 	}
 	.module-label {
 		font-weight: 600;
-	}
-	.modules-actions {
-		display: flex;
-		gap: 12px;
-		margin-top: 16px;
-		align-items: center;
 	}
 </style>

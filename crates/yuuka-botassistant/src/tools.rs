@@ -295,7 +295,7 @@ impl Tool for AddBotMemberTool {
             .await
             .map_err(exec_err)?;
         let message = if added {
-            format!("<@{target}> を利用メンバーに追加しました。メンションで利用できるようになったことを伝えてください。")
+            format!("<@{target}> を利用メンバーに追加しました。Bot にメンションすれば利用できるようになったことを伝えてください（返答中のメンションでは本人に通知は届きません）。")
         } else {
             "メンバーの追加に失敗しました。".to_owned()
         };
@@ -500,8 +500,8 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute(
-                "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-                 VALUES ('owner', 'owner', 'x', 'x')",
+                "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+                 VALUES ('owner', 'owner', 'x')",
                 [],
             )
             .unwrap();

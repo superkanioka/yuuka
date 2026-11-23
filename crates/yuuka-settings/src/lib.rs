@@ -28,6 +28,7 @@ use yuuka_web::AppState;
 mod discord;
 mod dto;
 mod google;
+mod package;
 mod repo;
 mod routes;
 mod status;
@@ -83,11 +84,19 @@ impl SettingsRuntime {
 pub fn routes(runtime: Arc<SettingsRuntime>) -> Router<AppState> {
     Router::new()
         .route("/api/settings/profile", post(routes::profile))
-        .route("/api/settings/password", post(routes::password))
         .route("/api/settings/delete-account", post(routes::delete_account))
-        .route("/api/settings/user", post(routes::user_settings))
-        .route("/api/settings/gemini", post(routes::gemini))
-        .route("/api/settings/backup", post(routes::backup))
+        .route(
+            "/api/settings/user",
+            get(routes::user_settings_get).post(routes::user_settings),
+        )
+        .route(
+            "/api/settings/gemini",
+            get(routes::gemini_get).post(routes::gemini),
+        )
+        .route(
+            "/api/settings/backup",
+            get(routes::backup_get).post(routes::backup),
+        )
         .route("/api/status", get(status::status))
         .route(
             "/api/settings/discord",
@@ -100,5 +109,6 @@ pub fn routes(runtime: Arc<SettingsRuntime>) -> Router<AppState> {
         )
         .route("/api/settings/calendars", post(google::calendars))
         .route("/api/settings/backup/trigger", post(google::backup_trigger))
+        .route("/api/settings/package/download", post(package::download))
         .layer(Extension(runtime))
 }

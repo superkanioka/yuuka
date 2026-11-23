@@ -316,8 +316,8 @@ mod tests {
         {
             let conn = rusqlite::Connection::open(&path).expect("seed conn");
             conn.execute(
-                "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-                 VALUES ('u', 'u', 'x', 'x')",
+                "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+                 VALUES ('u', 'u', 'x')",
                 [],
             )
             .expect("seed user");
@@ -398,6 +398,7 @@ mod tests {
             capabilities: yuuka_core::CapabilitySet::from_granted(vec!["memory".to_owned()]),
             mode: yuuka_core::TurnMode::Secretary,
             rich_reply_enabled: true,
+            conversation_attachments: Vec::new(),
         };
 
         // 条件なし → fail。

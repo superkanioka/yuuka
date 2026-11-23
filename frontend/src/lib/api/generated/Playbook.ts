@@ -3,15 +3,15 @@
 /**
  * クライアントへ返す playbook（クリーンビュー・snake_case）。
  */
-export type Playbook = { 
+export type Playbook = {
 /**
  * 正規化済みマクロ名（英数・`-`・`_` のみ／小文字。スコープ内で一意）。
  */
-name: string, title: string, 
+name: string, title: string,
 /**
  * パース済みキーワード（DB は JSON 文字列 `keywords` で保持）。
  */
-keywords: Array<string>, description: string, 
+keywords: Array<string>, description: string,
 /**
  * Markdown 手順 または Function Call 列の記述。
  */

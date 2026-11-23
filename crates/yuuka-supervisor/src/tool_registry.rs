@@ -7,14 +7,23 @@
 
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+use yuuka_briefing::DeliveryRunner;
 use yuuka_core::{ActionRecorder, Tool, ToolError};
 use yuuka_crypto::SystemCrypto;
+use yuuka_google::CalendarEventsPort;
+use yuuka_synapse::SynapseEngine;
 use yuuka_tools::{NativeProvider, ToolRegistry};
 use yuuka_web::Db;
 
 /// 全ドメインの Native ツールを登録した [`NativeProvider`] を作る。
 ///
 /// `recorder` は操作履歴レコーダー（`getRecentActionHistory` が読む）。FC ループにも同じ Arc を渡す。
+/// `calendar` は予定の Google カレンダー同期に使う（未配線なら `None`）。
+/// `briefing_delivery` は `runPeriodicReportNow` の `deliver: true`（設定した配信先へのテスト配信）に使う
+/// （未配線なら `None`＝常に未配信）。
+/// `synapse` は会話記憶の RAM 索引（`forgetMemory` が DB から消した記憶を索引からも除くのに使う。
+/// 会話エンジンと同じ `Arc<Mutex>` を渡す。`None` なら forgetMemory は登録しない）。
 ///
 /// # Errors
 /// ドメインの `tools(db)` 構築失敗、または名前重複時に [`ToolError`]。
@@ -22,9 +31,12 @@ pub fn build_native_provider(
     db: &Db,
     crypto: Option<Arc<SystemCrypto>>,
     recorder: Option<Arc<ActionRecorder>>,
+    calendar: Option<Arc<dyn CalendarEventsPort>>,
+    briefing_delivery: Option<Arc<dyn DeliveryRunner>>,
+    synapse: Option<Arc<Mutex<SynapseEngine>>>,
 ) -> Result<NativeProvider, ToolError> {
     let mut provider = NativeProvider::new();
-    for tool in all_domain_tools(db, crypto, recorder)? {
+    for tool in all_domain_tools(db, crypto, recorder, calendar, briefing_delivery, synapse)? {
         provider.register(tool)?;
     }
     Ok(provider)
@@ -38,8 +50,12 @@ pub fn build_tool_registry(
     db: &Db,
     crypto: Option<Arc<SystemCrypto>>,
     recorder: Option<Arc<ActionRecorder>>,
+    calendar: Option<Arc<dyn CalendarEventsPort>>,
+    briefing_delivery: Option<Arc<dyn DeliveryRunner>>,
+    synapse: Option<Arc<Mutex<SynapseEngine>>>,
 ) -> Result<ToolRegistry, ToolError> {
-    let provider = build_native_provider(db, crypto, recorder)?;
+    let provider =
+        build_native_provider(db, crypto, recorder, calendar, briefing_delivery, synapse)?;
     Ok(ToolRegistry::new().with_provider(Arc::new(provider)))
 }
 
@@ -53,6 +69,9 @@ fn all_domain_tools(
     db: &Db,
     crypto: Option<Arc<SystemCrypto>>,
     recorder: Option<Arc<ActionRecorder>>,
+    calendar: Option<Arc<dyn CalendarEventsPort>>,
+    briefing_delivery: Option<Arc<dyn DeliveryRunner>>,
+    synapse: Option<Arc<Mutex<SynapseEngine>>>,
 ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
     // 対話ブラウザの共有マネージャ。browser 対話 6 ツールと credential の browserFillCredential が
     // **同一 chromium セッション**を共有するため、ここで 1 つ作って両方へ注入する。
@@ -61,23 +80,35 @@ fn all_domain_tools(
     let mut all: Vec<Arc<dyn Tool>> = Vec::new();
     all.extend(yuuka_todo::tools(db.clone())?);
     all.extend(yuuka_finance::tools(db.clone())?);
-    all.extend(yuuka_schedule::tools(db.clone())?);
+    // 予定は Google カレンダーと同期する（連携しているエージェントのみ・`calendar` が None なら同期しない）。
+    all.extend(yuuka_schedule::tools_with_calendar(db.clone(), calendar)?);
     all.extend(yuuka_timeline::tools(db.clone())?);
     all.extend(yuuka_reminder::tools(db.clone())?);
     all.extend(yuuka_personal::tools(db.clone())?);
     // credential: browserFillCredential が復号値を対話ブラウザへ入力するため manager を注入。
     all.extend(yuuka_credential::tools(
         db.clone(),
-        crypto,
-        Some(Arc::clone(&browser_manager)),
+        crypto.clone(),
+        Some(Arc::clone(&browser_manager) as Arc<dyn yuuka_browser::SiteCredentialFiller>),
     )?);
     all.extend(yuuka_playbook::tools(db.clone(), recorder)?);
     // guild-assistant（汎用モード）ツール。露出は Tool::exposure（guild_assistant + memory 能力）で
     // 選別されるため、秘書経路のスナップショットには現れない。
     all.extend(yuuka_botassistant::tools(db.clone())?);
-    all.extend(yuuka_briefing::tools(db.clone())?);
+    // runPeriodicReportNow の `deliver: true` は /api/periodic-reports/test と同じ配信 runner で送る（未配線なら未配信）。
+    let briefing_delivery: Arc<dyn DeliveryRunner> =
+        briefing_delivery.unwrap_or_else(|| Arc::new(yuuka_briefing::NullDeliveryRunner));
+    all.extend(yuuka_briefing::tools_with_aux_text(
+        db.clone(),
+        briefing_delivery,
+        Arc::new(crate::webhook::GeminiAuxText::new(db.clone(), crypto)),
+    )?);
     // 会話ログ要約（秘書経路・memory 能力）。
     all.extend(yuuka_conversation::tools(db.clone())?);
+    // 会話記憶を忘れる forgetMemory（memory 能力・秘書/汎用モード両経路）。索引が無い構成では登録しない。
+    if let Some(engine) = synapse {
+        all.extend(yuuka_orchestrator::memory_tools(db.clone(), engine)?);
+    }
     // リッチ返信 Embed（core・秘書/汎用モード両経路で常時露出・db 非依存）。
     all.extend(yuuka_richcontent::tools()?);
     // sendChart（secretary・image+ab_glyph でローカル PNG 生成・db 非依存）。
@@ -102,9 +133,10 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     // 参照系ツールの dispatch に必要な最小スキーマ（addTodo の縦スライス検証用に todos のみ）。
-    const DDL: &str = "CREATE TABLE todos (
+    const DDL: &str =
+        "DROP TABLE IF EXISTS todos; CREATE TABLE todos (list TEXT NOT NULL DEFAULT '個人',
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default', title TEXT NOT NULL, description TEXT,
+        bot_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT,
         due_date TEXT, start_date TEXT, priority TEXT, tags TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL DEFAULT 'open', progress INTEGER NOT NULL DEFAULT 0,
         parent_id INTEGER, linked_payment_id INTEGER, due_reminded INTEGER NOT NULL DEFAULT 0,
@@ -118,7 +150,9 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = Connection::open(&path).unwrap();
+            let mut conn = Connection::open(&path).unwrap();
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(DDL).unwrap();
         }
         Db::open(&path).unwrap()
@@ -135,7 +169,7 @@ mod tests {
     fn registry_aggregates_all_domains_without_name_collision() {
         let db = seed_db();
         // build_native_provider が Ok = 全ドメイン横断で重複ツール名が無いことの保証。
-        let provider = build_native_provider(&db, None, None).unwrap();
+        let provider = build_native_provider(&db, None, None, None, None, None).unwrap();
         let decls = provider.list(&ctx());
         let names: Vec<String> = decls.iter().map(|d| d.name.to_string()).collect();
 
@@ -190,7 +224,7 @@ mod tests {
         // ★Phase 2 全鎖の統合検証: gemini FC ループ → RegistrySnapshot → NativeProvider →
         //   yuuka-todo の addTodo ツール → TodoRepo → 実 SQLite。
         let db = seed_db();
-        let registry = build_tool_registry(&db, None, None).unwrap();
+        let registry = build_tool_registry(&db, None, None, None, None, None).unwrap();
         let snapshot = registry.snapshot(&ctx());
 
         let resp = |v: serde_json::Value| -> GenerateContentResponse {

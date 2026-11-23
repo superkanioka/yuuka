@@ -9,20 +9,24 @@
 //! snake_case**（`due_date`・Node の Gemini 宣言と一致）。ツール名は Node の system prompt が
 //! 参照する **bare 名**（`addTodo` 等・namespace 無し）を使う（MCP/WASM のみ namespace 接頭辞）。
 //!
-//! 移植済み: addTodo / listTodos / completeTodo / deleteTodo（コア 4 経路）。
-//! 未移植（後続・repo 拡張要）: addSubtask / updateTodo / タグ系 / 優先度整理 / ルーチン停止 等
-//! 11 ツール、および自動タグ付与（scheduleAutoTagging＝バックグラウンドサービス）。
+//! ToDo・サブタスク・タグ・進捗・優先度・ルーチンの15ツール。
+//! 自動タグはDBトリガーで予約し、supervisorのバックグラウンドサービスが生成する。
+//!
+//! 登録・更新・進捗・完了・削除は管理画面・PWA と共通の [`TodoService`] を通す（D02 #126）。
+//! タグ編集・優先度の整理・ルーチン停止はツールにしか入口が無いため repo を直接使う。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use yuuka_core::cron_util;
 use yuuka_core::tool::FunctionDeclaration;
-use yuuka_core::{DbError, Tool, ToolContext, ToolError, ToolName, ToolOutcome, UserScope};
+use yuuka_core::{Tool, ToolContext, ToolError, ToolName, ToolOutcome, UserScope};
 use yuuka_web::Db;
 
 use crate::dto::{normalize_priority, NewTodo, PriorityUpdate, Todo, TodoUpdate};
 use crate::repo::{effective_progress, TodoRepo};
+use crate::service::{ProgressUpdate, TodoService};
 
 /// このドメインが公開する Native ツール一式を作る。
 ///
@@ -197,14 +201,8 @@ fn due_label(due_date: Option<&str>) -> String {
     }
 }
 
-/// 最小 cron 妥当性（5 フィールド・空でない）。厳密な範囲検証は後続（Node `isValidCron` の簡約）。
-fn is_valid_cron_basic(rule: &str) -> bool {
-    let fields: Vec<&str> = rule.split_whitespace().collect();
-    fields.len() == 5 && fields.iter().all(|f| !f.is_empty())
-}
-
-/// DbError をツール実行エラーへ（握り潰さず Gemini へ `{success:false}` として返る・§8.4）。
-fn exec_err(e: DbError) -> ToolError {
+/// DB・サービスの失敗をツール実行エラーへ（握り潰さず Gemini へ `{success:false}` として返る・§8.4）。
+fn exec_err(e: impl std::fmt::Display) -> ToolError {
     ToolError::Execution(e.to_string())
 }
 
@@ -259,8 +257,10 @@ impl Tool for AddTodoTool {
 
         let repeat_rule = arg_str(&args, "repeat_rule");
         let due_date = arg_str(&args, "due_date");
+        // サービスも同じ parser で検証するが、エージェントが書式を直せるよう先に案内文で返す。
+        // 初回期日の必須はツールだけの指示（管理画面は期日なしのルーチンも登録できる）。
         if let Some(rule) = &repeat_rule {
-            if !is_valid_cron_basic(rule) {
+            if !cron_util::is_valid(rule) {
                 return Ok(fail_payload(
                     "repeat_rule は cron式（分 時 日 月 曜日。例 '0 9 * * 1'=毎週月曜）で指定してください。",
                 ));
@@ -291,14 +291,15 @@ impl Tool for AddTodoTool {
             repeat_until: repeat_rule.as_ref().and(arg_str(&args, "repeat_until")),
             repeat_count: repeat_rule.as_ref().and(repeat_count),
             repeat_rule,
+            list: None,
         };
 
-        let todo = TodoRepo::new(&self.db)
+        let todo = TodoService::new(&self.db)
             .add(&scope_of(ctx), new)
             .await
             .map_err(exec_err)?;
 
-        // NOTE: 自動タグ付与（scheduleAutoTagging）はバックグラウンドサービス。後続で services 側へ。
+        // 自動タグは INSERT トリガーで予約済み（応答は生成を待たない）。
         let message = format!(
             "ToDo「{}」を追加しました (ID: #{}、優先度: {})。タグはバックグラウンドで自動付与されます。",
             todo.title,
@@ -406,7 +407,7 @@ impl Tool for CompleteTodoTool {
         let Some(id) = arg_i64(&args, "todo_id") else {
             return Ok(fail_payload("todo_id を指定してください。"));
         };
-        match TodoRepo::new(&self.db)
+        match TodoService::new(&self.db)
             .complete(&scope_of(ctx), id)
             .await
             .map_err(exec_err)?
@@ -447,7 +448,7 @@ impl Tool for DeleteTodoTool {
         let Some(id) = arg_i64(&args, "todo_id") else {
             return Ok(fail_payload("todo_id を指定してください。"));
         };
-        let deleted = TodoRepo::new(&self.db)
+        let deleted = TodoService::new(&self.db)
             .delete(&scope_of(ctx), id)
             .await
             .map_err(exec_err)?;
@@ -524,8 +525,12 @@ impl Tool for AddSubtaskTool {
             repeat_rule: None,
             repeat_until: None,
             repeat_count: None,
+            list: None,
         };
-        let subtask = repo.add(&scope, new).await.map_err(exec_err)?;
+        let subtask = TodoService::new(&self.db)
+            .add(&scope, new)
+            .await
+            .map_err(exec_err)?;
 
         // 親（付け替えの可能性を考慮し subtask.parent_id 基準）の兄弟サブタスク完了数を返す。
         let effective_parent = subtask.parent_id.unwrap_or(parent.id);
@@ -628,7 +633,7 @@ impl Tool for UpdateTodoTool {
             priority,
             status,
         };
-        match TodoRepo::new(&self.db)
+        match TodoService::new(&self.db)
             .update(&scope_of(ctx), todo_id, update)
             .await
             .map_err(exec_err)?
@@ -684,32 +689,24 @@ impl Tool for UpdateTaskProgressTool {
                 "todo_id と progress（0〜100の数値）を指定してください。",
             ));
         };
-        let scope = scope_of(ctx);
-        let repo = TodoRepo::new(&self.db);
-        let Some(todo) = repo.get(&scope, todo_id).await.map_err(exec_err)? else {
-            return Ok(fail_payload(format!(
-                "タスク #{todo_id} が見つかりません。"
-            )));
-        };
-        // サブタスクを持つ親は進捗が自動算出のため弾く（Node パリティ）。
-        let subtasks = repo
-            .list_subtasks_tree(&scope, todo_id)
-            .await
-            .map_err(exec_err)?;
-        if !subtasks.is_empty() {
-            let done = subtasks.iter().filter(|s| s.status == "done").count();
-            return Ok(fail_payload(format!(
-                "タスク#{}「{}」はサブタスクを {} 件持つため、進捗は『完了サブタスク数/全体』(現在 {}/{}) で自動算出されます。該当サブタスクを完了/進捗更新してください。",
-                todo_id, todo.title, subtasks.len(), done, subtasks.len(),
-            )));
-        }
         let note = arg_str(&args, "note");
-        match repo
-            .update_progress(&scope, todo_id, progress, note.clone())
+        match TodoService::new(&self.db)
+            .update_progress(&scope_of(ctx), todo_id, progress, note.clone())
             .await
             .map_err(exec_err)?
         {
-            Some(updated) => {
+            ProgressUpdate::NotFound => Ok(fail_payload(format!(
+                "タスク #{todo_id} が見つかりません。"
+            ))),
+            // サブタスクを持つ親は進捗が自動算出のため弾く（Node パリティ）。
+            ProgressUpdate::HasSubtasks { task, subtasks } => {
+                let done = subtasks.iter().filter(|s| s.status == "done").count();
+                Ok(fail_payload(format!(
+                    "タスク#{}「{}」はサブタスクを {} 件持つため、進捗は『完了サブタスク数/全体』(現在 {}/{}) で自動算出されます。該当サブタスクを完了/進捗更新してください。",
+                    todo_id, task.title, subtasks.len(), done, subtasks.len(),
+                )))
+            }
+            ProgressUpdate::Updated(updated) => {
                 let done_suffix = if updated.status == "done" {
                     "（完了にしました✅）"
                 } else {
@@ -725,9 +722,6 @@ impl Tool for UpdateTaskProgressTool {
                     json!({ "todo": updated }),
                 )))
             }
-            None => Ok(fail_payload(format!(
-                "タスク #{todo_id} の進捗更新に失敗しました。"
-            ))),
         }
     }
 }
@@ -1013,33 +1007,13 @@ impl Tool for EditTodoTagsTool {
         }
         let scope = scope_of(ctx);
         let repo = TodoRepo::new(&self.db);
-        let Some(todo) = repo.get(&scope, todo_id).await.map_err(exec_err)? else {
+        if repo.get(&scope, todo_id).await.map_err(exec_err)?.is_none() {
             return Ok(fail_payload(format!(
                 "タスク #{todo_id} が見つかりません。"
             )));
-        };
-        let current = todo.tags;
-        let next: Vec<String> = match mode.as_str() {
-            "set" => input_tags,
-            "add" => {
-                // 既存 + 入力を再正規化（重複除去・最大 8）。
-                let merged: Vec<Value> = current
-                    .iter()
-                    .chain(input_tags.iter())
-                    .map(|t| Value::String(t.clone()))
-                    .collect();
-                normalize_tags(&Value::Array(merged))
-            }
-            _ => {
-                let remove: std::collections::HashSet<&String> = input_tags.iter().collect();
-                current
-                    .into_iter()
-                    .filter(|t| !remove.contains(t))
-                    .collect()
-            }
-        };
+        }
         match repo
-            .update_tags(&scope, todo_id, next)
+            .edit_tags(&scope, todo_id, &mode, input_tags)
             .await
             .map_err(exec_err)?
         {
@@ -1291,21 +1265,23 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    const TODOS_DDL: &str = "CREATE TABLE todos (
+    const TODOS_DDL: &str =
+        "DROP TABLE IF EXISTS todos; CREATE TABLE todos (list TEXT NOT NULL DEFAULT '個人',
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         title TEXT NOT NULL, description TEXT, due_date TEXT, start_date TEXT,
         priority TEXT, tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open',
         progress INTEGER NOT NULL DEFAULT 0, parent_id INTEGER, linked_payment_id INTEGER,
         due_reminded INTEGER NOT NULL DEFAULT 0, repeat_rule TEXT, repeat_until TEXT,
         repeat_count INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);";
 
-    // task_progress_logs を FK 無しで先に作る（V17 の users/todos FK を避ける・lib.rs テストと同方針）。
-    const PROGRESS_LOGS_DDL: &str = "CREATE TABLE task_progress_logs (
+    // task_progress_logs を migration 後に FK 無しで置き換える（V17 の users/todos FK を避ける・lib.rs テストと同方針）。
+    const PROGRESS_LOGS_DDL: &str =
+        "DROP TABLE IF EXISTS task_progress_logs; CREATE TABLE task_progress_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         todo_id INTEGER NOT NULL,
         progress INTEGER NOT NULL,
         note TEXT,
@@ -1319,8 +1295,10 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(TODOS_DDL).unwrap();
+            let mut conn = Connection::open(&path).unwrap();
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
+            yuuka_db::test_support::execute_unit_ddl(&conn, TODOS_DDL).unwrap();
             conn.execute_batch(PROGRESS_LOGS_DDL).unwrap();
         }
         Db::open(&path).unwrap()
@@ -1398,6 +1376,16 @@ mod tests {
         // repeat_rule だけで due_date 無し → fail。
         let out = add
             .call(&ctx(), json!({"title": "x", "repeat_rule": "0 9 * * 1"}))
+            .await
+            .unwrap();
+        assert_eq!(out.payload["success"], false);
+
+        // 5 フィールドでも実行時 parser が解釈できない repeat_rule → fail。
+        let out = add
+            .call(
+                &ctx(),
+                json!({"title": "x", "repeat_rule": "0 9 * * 8", "due_date": "2026-07-13"}),
+            )
             .await
             .unwrap();
         assert_eq!(out.payload["success"], false);
@@ -1525,7 +1513,7 @@ mod tests {
         let by_tag = find(&tools, "listTasksByTag");
         let guide = find(&tools, "getTaskUsageGuide");
 
-        // タグ付き ToDo を repo 直挿し（addTodo ツールは tags=[]・自動タグは deferred のため）。
+        // タグ付き ToDo を repo 直挿し（このテストではバックグラウンド worker は起動しない）。
         let scope = scope_of(&ctx());
         let repo = TodoRepo::new(&seed);
         for (title, tags) in [
@@ -1545,6 +1533,7 @@ mod tests {
                     repeat_rule: None,
                     repeat_until: None,
                     repeat_count: None,
+                    list: None,
                 },
             )
             .await

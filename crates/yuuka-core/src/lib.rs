@@ -5,9 +5,15 @@
 //! 本クレートの契約は Phase 0（契約凍結）で確定し、以後変更しない（§12.2）。
 
 pub mod action_history;
+pub mod aux_text;
 pub mod config;
+pub mod cron_util;
+pub mod datetime;
 pub mod error;
 pub mod ids;
+pub mod metrics;
+/// レシート専用入口で共有する添付検証。
+pub mod receipt_image;
 pub mod scope;
 pub mod secrets;
 pub mod telemetry;
@@ -21,6 +27,7 @@ pub use error::{
     PluginError, RepoError, Retryability, ToolError, ValidationError, WebError,
 };
 pub use ids::{BotId, GuildId, UserId};
+pub use metrics::MetricsSink;
 pub use scope::{CronScan, CrossUserAccess, ScopedRepo, UserScope};
 pub use tool::{
     CapabilitySet, EmbedFieldPart, EmbedPart, FunctionDeclaration, ResponsePart, Tool, ToolContext,

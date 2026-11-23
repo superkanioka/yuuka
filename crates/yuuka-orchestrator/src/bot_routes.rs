@@ -9,14 +9,17 @@
 //! `discord_application_id` はトークン復号（[`SystemCrypto::decrypt_text`]）→先頭 base64url セグメントで
 //! 導出する（crypto 未注入・復号失敗時は同期済み値のみ／なければ null）。
 
+use yuuka_web::error::{bad_request, server_error, status_json};
+
 use std::sync::Arc;
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use yuuka_core::CapabilitySet;
 use yuuka_crypto::SystemCrypto;
@@ -165,7 +168,7 @@ async fn create_bot(
         Err(_) => return server_error(),
     };
     let message = if preset == BotPresetId::McpAssistant {
-        "Botを作成しました。汎用モードの利用にはBot専用のGemini APIキーの設定が必要です（Bot設定から設定してください）。"
+        "Botを作成しました。汎用モードの利用にはBot専用のGemini APIキーの設定が必要です（Bot設定の「機能と AI」から設定してください）。"
     } else {
         "Botを作成しました。"
     };
@@ -182,14 +185,27 @@ async fn create_bot(
 
 // ─── DELETE /api/bots ────────────────────────────────────────────────────────
 
+/// `DELETE /api/bots` の query（管理画面は `?botId=` で送り、body は付けない）。
+#[derive(Deserialize)]
+struct DeleteBotQuery {
+    #[serde(default, rename = "botId")]
+    bot_id: Option<String>,
+}
+
 async fn delete_bot(
     user: AuthenticatedUser,
     State(db): State<Db>,
     Extension(rt): Extension<Arc<dyn BotViewRuntime>>,
-    Json(body): Json<Value>,
+    Query(q): Query<DeleteBotQuery>,
+    body: Option<Json<Value>>,
 ) -> Response {
     let uid = user.0.discord_id;
-    let bot_id = str_field(&body, "botId");
+    // botId は body 優先・無ければ query（Content-Type 無しの DELETE を 415 にしない）。
+    let bot_id = body
+        .map(|Json(b)| str_field(&b, "botId"))
+        .filter(|id| !id.is_empty())
+        .or_else(|| q.bot_id.map(|id| id.trim().to_owned()))
+        .unwrap_or_default();
     if bot_id.is_empty() {
         return bad_request("Bot IDが必要です。");
     }
@@ -223,6 +239,7 @@ async fn delete_bot(
 async fn update_profile(
     user: AuthenticatedUser,
     State(db): State<Db>,
+    Extension(live): Extension<Arc<dyn DiscordLive>>,
     Json(body): Json<Value>,
 ) -> Response {
     let uid = user.0.discord_id;
@@ -240,26 +257,66 @@ async fn update_profile(
         Ok(b) => b,
         Err(_) => return server_error(),
     };
-    let is_owner = bot.is_some_and(|b| b.user_id == uid);
-    if !is_owner {
+    let Some(bot) = bot.filter(|b| b.user_id == uid) else {
         return status_json(StatusCode::FORBIDDEN, "Botの所有者のみが変更できます。");
+    };
+    let linked = match body.get("nameLinkedToDiscord") {
+        None => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return bad_request("nameLinkedToDiscord は真偽値で指定してください。"),
+    };
+    if linked.is_some() && body.get("name").is_some() {
+        return bad_request("同期の切り替えと名前の保存は別々に行ってください。");
     }
-    let name = str_field(&body, "name");
-    if name.is_empty() {
-        return bad_request("Botの名前は必須です。");
+    let name = if linked.is_some() {
+        bot.name.clone()
+    } else {
+        str_field(&body, "name")
+    };
+    if linked.is_none() && (name.is_empty() || name.chars().count() > 50) {
+        return bad_request("Botの名前は1〜50文字で入力してください。");
     }
     let avatar = str_field(&body, "avatarUrl");
-    let avatar_opt = if avatar.is_empty() {
-        None
+    let avatar_opt = (!avatar.is_empty()).then_some(avatar.as_str());
+    let effective_linked = linked.unwrap_or(bot.name_linked_to_discord);
+    let saved_name = if effective_linked {
+        // ON への切り替えは現在の Discord 名。ON 中の保存は Discord を先に更新。
+        let account = if linked == Some(true) {
+            live.fetch_bot_account(&bot_id).await
+        } else {
+            live.rename_bot_account(&bot_id, &name).await
+        };
+        let account = match account {
+            Ok(account) if !account.username.trim().is_empty() => account,
+            Ok(_) => return bad_request("DiscordのBotアカウント名を取得できませんでした。"),
+            Err(message) => return bad_request(&message),
+        };
+        if let Err(error) = bot_repo::save_discord_account_name(
+            &db,
+            &bot_id,
+            &account.username,
+            &account.id,
+            avatar_opt,
+        )
+        .await
+        {
+            tracing::error!(%error, %bot_id, "Discord アカウント名の保存に失敗");
+            return server_error();
+        }
+        account.username
     } else {
-        Some(avatar.as_str())
+        // OFF は Discord の稼働状態に依存しない。同期解除だけなら保存済み名を保持する。
+        if bot_repo::update_bot_profile(&db, &bot_id, &name, avatar_opt, linked)
+            .await
+            .is_err()
+        {
+            return server_error();
+        }
+        name
     };
-    if let Err(_e) = bot_repo::update_bot_profile(&db, &bot_id, &name, avatar_opt).await {
-        return server_error();
-    }
     (
         StatusCode::OK,
-        Json(json!({ "success": true, "message": "Botのプロフィールを更新しました。" })),
+        Json(json!({ "success": true, "name": saved_name, "name_linked_to_discord": effective_linked, "message": "Botのプロフィールを更新しました。" })),
     )
         .into_response()
 }
@@ -355,6 +412,7 @@ fn bot_view(
         "id": bot.id,
         "user_id": bot.user_id,
         "name": bot.name,
+        "name_linked_to_discord": bot.name_linked_to_discord,
         "recommended_persona_id": bot.recommended_persona_id,
         "persona_id": bot.persona_id,
         "capabilities": bot.capabilities,
@@ -457,25 +515,6 @@ fn str_field(body: &Value, key: &str) -> String {
         .to_owned()
 }
 
-fn status_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-fn bad_request(message: &str) -> Response {
-    status_json(StatusCode::BAD_REQUEST, message)
-}
-
-fn server_error() -> Response {
-    status_json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "内部エラーが発生しました。",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,8 +563,8 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).expect("seed conn");
             for uid in ["owner", "other"] {
                 conn.execute(
-                    "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-                     VALUES (?1, ?1, 'x', 'x')",
+                    "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+                     VALUES (?1, ?1, 'x')",
                     rusqlite::params![uid],
                 )
                 .expect("seed user");
@@ -567,6 +606,142 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         (status, json)
+    }
+
+    #[derive(Default)]
+    struct AccountLive {
+        name: std::sync::Mutex<String>,
+        unavailable: std::sync::atomic::AtomicBool,
+        renames: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl DiscordLive for AccountLive {
+        async fn custom_bot_user(&self, _: &str) -> Option<crate::discord_live::DiscordBotUser> {
+            None
+        }
+        async fn default_bot_user(&self) -> Option<crate::discord_live::DiscordBotUser> {
+            None
+        }
+        async fn guild_options(&self, _: &str, _: &str) -> crate::discord_live::GuildOptions {
+            crate::discord_live::GuildOptions::default()
+        }
+        async fn fetch_bot_account(
+            &self,
+            _: &str,
+        ) -> Result<crate::discord_live::DiscordBotUser, String> {
+            if self.unavailable.load(Ordering::Relaxed) {
+                return Err("Discord unavailable".into());
+            }
+            Ok(crate::discord_live::DiscordBotUser {
+                id: "discord-account".into(),
+                username: self.name.lock().unwrap().clone(),
+                avatar_url: String::new(),
+            })
+        }
+        async fn rename_bot_account(
+            &self,
+            id: &str,
+            name: &str,
+        ) -> Result<crate::discord_live::DiscordBotUser, String> {
+            if self.unavailable.load(Ordering::Relaxed) {
+                return Err("Discord update failed".into());
+            }
+            *self.name.lock().unwrap() = name.to_owned();
+            self.renames.fetch_add(1, Ordering::Relaxed);
+            self.fetch_bot_account(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn account_name_sync_transitions_and_failures() {
+        let db = seed_db();
+        bot_repo::create_bot(&db, "sync-bot", "owner", "Local")
+            .await
+            .unwrap();
+        let live = Arc::new(AccountLive::default());
+        *live.name.lock().unwrap() = "Discord".into();
+        let state = AppState::new(Arc::new(FakeAuth), WebConfig::default(), db.clone());
+        let app = routes_with(Arc::new(NullBotViewRuntime), None, live.clone()).with_state(state);
+        let read = || bot_repo::get_bot_detail(&db, "sync-bot");
+
+        // OFF 保存は Discord に依存しない。
+        live.unavailable.store(true, Ordering::Relaxed);
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/profile",
+            "owner",
+            r#"{"botId":"sync-bot","name":"Offline local"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(live.renames.load(Ordering::Relaxed), 0);
+        // 取得失敗で ON にしない（古いキャッシュの名前も使わない）。
+        let enable = r#"{"botId":"sync-bot","nameLinkedToDiscord":true}"#;
+        let (st, _) = send(&app, "POST", "/api/bots/profile", "owner", enable).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(!read().await.unwrap().unwrap().name_linked_to_discord);
+        live.unavailable.store(false, Ordering::Relaxed);
+        let (st, response) = send(&app, "POST", "/api/bots/profile", "owner", enable).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(response["name"], "Discord");
+        assert_eq!(read().await.unwrap().unwrap().name, "Discord");
+
+        // ON 中の保存は Discord アカウントと登録名の両方を更新。
+        let rename = r#"{"botId":"sync-bot","name":"Renamed account"}"#;
+        let (st, _) = send(&app, "POST", "/api/bots/profile", "owner", rename).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(*live.name.lock().unwrap(), "Renamed account");
+        assert_eq!(read().await.unwrap().unwrap().name, "Renamed account");
+        // Discord 側の拒否では登録名も設定も変えない。
+        live.unavailable.store(true, Ordering::Relaxed);
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/profile",
+            "owner",
+            r#"{"botId":"sync-bot","name":"Rejected"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let saved = read().await.unwrap().unwrap();
+        assert_eq!(saved.name, "Renamed account");
+        assert!(saved.name_linked_to_discord);
+        // OFF は名前不要で切断中でも成功し、再接続の同期でも名前を保持。
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/profile",
+            "owner",
+            r#"{"botId":"sync-bot","nameLinkedToDiscord":false}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        bot_repo::update_discord_profile(&db, "sync-bot", "External", "", "discord-account")
+            .await
+            .unwrap();
+        let saved = read().await.unwrap().unwrap();
+        assert_eq!(saved.name, "Renamed account");
+        assert!(!saved.name_linked_to_discord);
+        // 空白名・型不正・他人の操作を拒否。
+        for body in [
+            r#"{"botId":"sync-bot","name":"   "}"#,
+            r#"{"botId":"sync-bot","nameLinkedToDiscord":"true"}"#,
+        ] {
+            assert_eq!(
+                send(&app, "POST", "/api/bots/profile", "owner", body)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            send(&app, "POST", "/api/bots/profile", "other", enable)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -636,6 +811,40 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
 
+        // リンク設定だけの更新と一覧への永続化。
+        for linked in [true, false] {
+            let body = json!({ "botId": bot_id, "nameLinkedToDiscord": linked }).to_string();
+            let (st, _) = send(&app, "POST", "/api/bots/profile", "other", &body).await;
+            assert_eq!(st, StatusCode::FORBIDDEN);
+            let (st, _) = send(&app, "POST", "/api/bots/profile", "owner", &body).await;
+            assert_eq!(
+                st,
+                if linked {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let (_, list) = send(&app, "GET", "/api/bots", "owner", "").await;
+            let bot = list["bots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["id"] == bot_id)
+                .unwrap();
+            assert_eq!(bot["name_linked_to_discord"], false);
+            assert_eq!(bot["name"], "Renamed");
+        }
+        let (st, _) = send(
+            &app,
+            "POST",
+            "/api/bots/profile",
+            "owner",
+            &json!({ "botId": bot_id, "nameLinkedToDiscord": "true" }).to_string(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
         // 削除ガード。
         let (st, _) = send(
             &app,
@@ -656,16 +865,24 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
-        // 所有者削除。
-        let (st, j) = send(
-            &app,
-            "DELETE",
-            "/api/bots",
-            "owner",
-            &format!(r#"{{"botId":"{bot_id}"}}"#),
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
+        // 所有者削除（管理画面と同じ `?botId=`・body/Content-Type 無し）。
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/bots?botId={bot_id}"))
+                    .header("cookie", "__Host-yuuka-session=owner")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let j: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(j["success"], true);
         // 一覧は 1 件に。
         let (_st, j) = send(&app, "GET", "/api/bots", "owner", "").await;
@@ -685,6 +902,7 @@ mod tests {
             id: "b1".to_owned(),
             user_id: "owner".to_owned(),
             name: "B".to_owned(),
+            name_linked_to_discord: false,
             recommended_persona_id: None,
             persona_id: None,
             capabilities: r#"["persona","memory","mcp","secretary"]"#.to_owned(),

@@ -121,27 +121,6 @@ pub async fn add_desktop_token(
         .await
 }
 
-/// あるユーザーの全デスクトップトークンを物理削除する（Node `revokeAllDesktopTokensForUser`）。
-///
-/// パスワード変更時に全端末を強制再ログインさせるために呼ぶ（`DELETE FROM desktop_tokens
-/// WHERE user_id = ?`）。
-///
-/// # Errors
-/// 書き込み失敗時 [`DbError`](yuuka_core::DbError)。
-pub async fn revoke_all_for_user(db: &Db, user_id: &str) -> Result<(), yuuka_core::DbError> {
-    let user_id = user_id.to_owned();
-    db.writer
-        .transaction(move |tx| {
-            tx.execute(
-                "DELETE FROM desktop_tokens WHERE user_id = ?1",
-                params![user_id],
-            )
-            .map_err(map_sqlite)?;
-            Ok(())
-        })
-        .await
-}
-
 /// 端末管理一覧の 1 行（`GET /api/devices` 用・`token_hash` は current 判定にのみ使う）。
 #[derive(Debug, Clone)]
 pub struct DesktopTokenInfo {
@@ -226,20 +205,18 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        {
-            let conn = rusqlite::Connection::open(&path).expect("seed");
-            conn.execute_batch(
-                "CREATE TABLE users (discord_id TEXT PRIMARY KEY, username TEXT NOT NULL, \
-                    role TEXT NOT NULL DEFAULT 'user');
-                 CREATE TABLE desktop_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                    user_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, device_name TEXT, \
-                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), \
-                    last_used_at TEXT, revoked INTEGER NOT NULL DEFAULT 0);
-                 INSERT INTO users(discord_id, username, role) VALUES('123','alice','admin');",
+        // 実スキーマ（migrations）で作り、sk-account に紐付いた利用者を 1 件置く。
+        std::fs::File::create(&path).expect("create");
+        let db = Db::open(&path).expect("open");
+        rusqlite::Connection::open(&path)
+            .expect("seed")
+            .execute(
+                "INSERT INTO users(discord_id, username, salt, role, sk_account_id) \
+                 VALUES('123', 'alice', '00', 'admin', 'acc-123')",
+                [],
             )
-            .expect("ddl");
-        }
-        Db::open(&path).expect("open")
+            .expect("seed user");
+        db
     }
 
     #[tokio::test]
@@ -314,5 +291,36 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// `CompositeAuth` は既定 90 日、`with_desktop_token_ttl_days` で config の TTL に従う（R26）。
+    #[tokio::test]
+    async fn composite_auth_uses_configured_ttl() {
+        use crate::{CompositeAuth, SessionStore};
+        use yuuka_web::AuthBackend;
+
+        let db = seed_db();
+        // 最終利用 30 日前のトークン（既定 90 日なら有効・7 日なら失効）。
+        let hash = sha256_hex("tok-30d");
+        db.writer
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO desktop_tokens(user_id, token_hash, created_at) \
+                     VALUES('123', ?1, datetime('now','localtime','-30 days'))",
+                    rusqlite::params![hash],
+                )
+                .map_err(yuuka_db::map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let short = CompositeAuth::new(db.clone(), SessionStore::in_memory(), 7)
+            .with_desktop_token_ttl_days(7);
+        assert!(short.desktop_user("tok-30d").await.unwrap().is_none());
+
+        // 既定（90 日）では有効（検証で last_used_at が now へ touch される）。
+        let default = CompositeAuth::new(db, SessionStore::in_memory(), 7);
+        assert!(default.desktop_user("tok-30d").await.unwrap().is_some());
     }
 }

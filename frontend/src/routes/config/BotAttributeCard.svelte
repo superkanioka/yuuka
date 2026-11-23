@@ -1,103 +1,78 @@
 <script lang="ts">
-	// Bot属性（プリセット）カード（旧 fetchBotAttributeConfig attr 部分 + btn-save-bot-attribute）。
-	import { botAttributeApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { confirmDialog, Button } from "$lib/components/ui";
-	import { activeBot, selectBot } from "$lib/stores/activeBot";
-	import { get } from "svelte/store";
-	import type { BotAttrView, PresetItem, PresetsResp } from "./configTypes";
+// チェック状態でパーソナル秘書 / 汎用モードを選択する。
 
-	interface Props {
-		botId: string;
-		bot: BotAttrView;
-		/** 変更成功後に親の属性系カードを再取得 */
-		onchanged?: () => void;
-	}
-	let { botId, bot, onchanged }: Props = $props();
+import { get } from "svelte/store";
+import { botAttributeApi } from "$lib/api/services";
+import { Checkbox } from "$lib/components/ui";
+import { activeBot, selectBot } from "$lib/stores/activeBot";
+import { pushToast, toastError } from "$lib/stores/toast";
+import type { BotAttrView } from "./configTypes";
 
-	let presets = $state<PresetItem[]>([]);
-	let selected = $state("");
-	const currentBadge = $derived(bot.preset_display_name ?? "");
+interface Props {
+	botId: string;
+	bot: BotAttrView;
+	/** 変更成功後に親の属性系カードを再取得 */
+	onchanged?: () => void;
+}
+let { botId, bot, onchanged }: Props = $props();
 
-	// bot 変更でプリセット一覧を取得し、現在値を選択。
-	$effect(() => {
-		void botId;
-		void load(bot.preset ?? "secretary");
-	});
+let secretaryEnabled = $state(false);
+let saving = $state(false);
+const currentPreset = $derived(bot.preset ?? "secretary");
 
-	async function load(current: string) {
-		try {
-			// presets() の戻り型（types.ts PresetOption）は config タブが読む形状（id/displayName/
-			// capabilities）と異なるため unknown 経由でこのタブ用の PresetsResp に読み替える。
-			const res = (await botAttributeApi.presets()) as unknown as PresetsResp;
-			presets = res.presets ?? [];
-		} catch {
-			presets = [];
-		}
-		selected = current;
-	}
+// Bot 切替・保存後の再取得時に現在のモードを反映。
+$effect(() => {
+	void botId;
+	secretaryEnabled = currentPreset === "secretary";
+});
 
-	function labelFor(p: PresetItem): string {
-		return `${p.displayName}（${p.capabilities.join(" + ")}）`;
-	}
-
-	async function save() {
-		if (!selected) return;
-		const p = presets.find((x) => x.id === selected);
-		const presetLabel = p ? labelFor(p) : selected;
-		const ok = await confirmDialog({
-			message: `Botの属性を「${presetLabel}」へ変更しますか？\n機能セットが切り替わります（会話の文脈は属性ごとに分離されます）。`,
-			confirmLabel: "変更する",
+async function save(enabled: boolean) {
+	if (saving) return;
+	const preset = enabled ? "secretary" : "mcp_assistant";
+	if (preset === currentPreset) return;
+	const id = botId;
+	const previousPreset = currentPreset;
+	saving = true;
+	try {
+		const res = await botAttributeApi.updateAttributes({
+			botId: id,
+			preset,
 		});
-		if (!ok) return;
-		try {
-			const res = await botAttributeApi.updateAttributes({
-				botId,
-				preset: selected,
-			});
-			pushToast(res.message ?? "変更しました。", "success");
-			// activeBot の preset も更新（サイドバーのタブフィルタに反映）。
-			const cur = get(activeBot);
-			if (cur && cur.id === botId) selectBot({ ...cur, preset: selected });
-			onchanged?.();
-		} catch (err) {
-			pushToast(
-				err instanceof ApiError ? err.message : "変更に失敗しました。",
-				"error",
-			);
-		}
+		pushToast(res.message ?? "変更しました。", "success");
+		// activeBot の preset も更新（サイドバーのタブフィルタに反映）。
+		const cur = get(activeBot);
+		if (cur && cur.id === id) selectBot({ ...cur, preset });
+		onchanged?.();
+	} catch (err) {
+		if (botId === id) secretaryEnabled = previousPreset === "secretary";
+		toastError(err, "変更に失敗しました。");
+	} finally {
+		saving = false;
 	}
+}
 </script>
 
-<details class="config-card card">
-	<summary class="column-header badge-right">
-		<h3><span class="material-symbols-outlined header-icon-symbol">category</span>Bot属性（プリセット）</h3>
-		{#if currentBadge}<span class="badge badge-accent">{currentBadge}</span>{/if}
-	</summary>
-	<p class="description-text">
-		このBotの機能セットを選択します。変更は次のメッセージ処理から即時反映されます。
-	</p>
-	<div class="attr-row">
-		<select bind:value={selected}>
-			{#each presets as p (p.id)}
-				<option value={p.id}>{labelFor(p)}</option>
-			{/each}
-		</select>
-		<Button variant="primary" onclick={save}>属性を変更</Button>
+<section class="config-card card">
+	<div class="column-header">
+		<h3><span class="material-symbols-outlined header-icon-symbol">category</span>Botモード</h3>
 	</div>
-	<span class="field-sub">
-		※「汎用モード」はサーバー常駐の簡易Bot（MCP接続 + ペルソナ + メモリ）です。タスク・家計などの秘書機能は無効になります。
-	</span>
-</details>
+	<div class="attr-row">
+		<Checkbox
+			bind:checked={secretaryEnabled}
+			disabled={saving}
+			label="Enable secretary mode"
+			onchange={save}
+		/>
+		{#if saving}<span role="status">変更中…</span>{/if}
+	</div>
+</section>
 
 <style>
 	.attr-row {
 		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
 		gap: 12px;
 		margin-top: 12px;
-	}
-	.attr-row select {
-		flex-grow: 1;
 	}
 </style>

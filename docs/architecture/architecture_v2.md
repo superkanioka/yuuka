@@ -1,7 +1,22 @@
-# Yuuka v2 アーキテクチャ規範（仕様書 docs/spec/discordbot_spec.md v0.6.2 準拠 / DB schema v16 / Rust refinery V21）
+# Yuuka v2 アーキテクチャ（旧 Node/TypeScript 実装・DB schema v16 時点の履歴資料）
 
-本書は仕様書（docs/spec/discordbot_spec.md）を既存コードベースへ落とし込むための**実装規範**である。
-実装エージェント・開発者は必ず本書のコントラクトに従うこと。仕様書と本書が矛盾する場合は本書を優先する（本書は仕様書を既存実装と調和させた結果である）。
+> **⚠️ 履歴資料です。現行の実装規範ではありません。**
+>
+> 本書は、バックエンドを Rust へ全面移行する**前**の Node.js / TypeScript 実装（仕様書 docs/spec/discordbot_spec.md v0.6.2 準拠・DB schema v16）に対する設計・実装規範として書かれたものです。
+> Node バックエンドは [#68](https://github.com/kawaii-music-moe/yuuka/pull/68) で撤去済みのため、本書が前提とする `src/*.ts`（`src/services/browserService.ts`・`src/db/migrations.ts`・`src/types/contracts.ts`・`src/utils/crypto.ts` 等）、TypeScript / ESM の規約、`SCHEMA_VERSION="16"` は**現行リポジトリには存在しません**。以下の本文は旧実装のまま**未更新**であり、「必ず従う規範」「他の文書より優先する文書」としては扱わないでください（旧版にあった「本書を優先する」旨の記述は撤回しました）。
+> 設計意図（why）・不変条件の考え方・旧実装との対応を辿るための参照用として残しています。撤去前のソースは `git show 390df39^:<path>`（例: `git show 390df39^:src/db/migrations.ts`）で参照できます。Rust 版に合わせた全面的な書き直しは未実施です。
+>
+> **現行の情報源（source of truth）**
+>
+> | 知りたいこと | 現行の参照先 |
+> |---|---|
+> | 実装（バックエンド） | `crates/`（Rust workspace。クレート一覧は [Cargo.toml](../../Cargo.toml) の `[workspace] members`、全体像は [project_overview.md](../project_overview.md)） |
+> | DB スキーマ | `crates/yuuka-db/migrations/`（`V17__baseline.sql`＝Node 版最終スキーマ〔本書の v16 より新しい v17〕を冪等に作成し、`V18`〜`V22` を前方専用で追加。`refinery` で適用） |
+> | フロントとの型の共有 | `crates/yuuka-types` の DTO を `cargo run -p xtask -- gen-types` で `frontend/src/lib/api/generated/` へ生成 |
+> | 管理画面 / PWA | `frontend/`（Svelte 5 + Vite）/ `clients/pwa/`（Vue 3 + Vite。[README](../../clients/pwa/README.md)） |
+> | セットアップ・運用 | [docs/guide/setup.md](../guide/setup.md) / [features.md](../guide/features.md) / [deployment.md](../guide/deployment.md) |
+> | 機能仕様 | [docs/spec/](../spec/discordbot_spec.md) |
+> | Rust 移行の経緯・現況 | [docs/rust-rewrite/](../rust-rewrite/README.md)（[remaining-work.md](../rust-rewrite/remaining-work.md)） |
 
 ---
 
@@ -98,7 +113,7 @@ export interface SessionUser { discordId: string; username: string; role: "user"
 | audit_logs | user_id | action, target, detail（PW本体は記録禁止） |
 | invite_codes / system_settings | 既存どおり |
 
-**シナプス認知アーキテクチャ（v10。設計: docs/design/synapse_cognitive_architecture.md・architecture_renewal_v3.md。詳細は §13）**。すべて `user_id`（汎用モードは `bot_id × guild_id` も）でスコープし、`message_logs` と同一 .db。**書き手は Node のみ**（Rust エンジンは read-only 参照）:
+**シナプス認知アーキテクチャ（v10。設計背景は旧資料 `docs/design/synapse_cognitive_architecture.md` 等を参照。詳細は §13）**。すべて `user_id`（汎用モードは `bot_id × guild_id` も）でスコープし、`message_logs` と同一 .db。**書き手は Node のみ**（Rust エンジンは read-only 参照）:
 
 | テーブル | キー/スコープ | 用途 |
 |---|---|---|
@@ -231,7 +246,7 @@ v2=初版全面再構築 / v3=ユーザーデータ各表へ bot_id 付与（`mi
 
 ## 13. シナプス認知アーキテクチャ（schema v10 / R0・R1 実装済み）
 
-設計思想は [`docs/design/synapse_cognitive_architecture.md`](../design/synapse_cognitive_architecture.md)（why/what）、システム実装面は [`docs/design/architecture_renewal_v3.md`](../design/architecture_renewal_v3.md)（how/topology）。本節は**実装済み部分（R0/R1）**を実装規範へ昇格したもの。R2（2nd Hop 勝率提示）・R3（ローカル SLM ハイブリッド）・R4（投機/キャッシュ）は未実装の将来フェーズ。
+設計思想は [`docs/design/synapse_cognitive_architecture.md`](../design/synapse_cognitive_architecture.md) を参照。旧Node構成の詳細提案書は整理済み。本節は当時の実装済み部分（R0/R1）を記録した履歴です。現在の実装・機能状況は Rust の `crates/yuuka-synapse` と `crates/yuuka-orchestrator` を参照してください。
 
 ### 13.1 構成（プロセス分離）
 - **Node オーケストレータ（既存）**: Discord I/O・ツール dispatch・Gemini 本推論＋ペルソナ・**SQLite の唯一の書き手**。
@@ -270,11 +285,11 @@ L2 連想想起は「過去の知見を能動的・連想的に思い出す」�
 設計の全文は [`docs/design/function_modularization.md`](../design/function_modularization.md)。本節は実装規範への要点。
 
 - **目的**: ユーザーが Bot ごとに「有効にする機能モジュール」を選び、有効モジュールの宣言のみ LLM へ渡し、管理 UI も該当設定のみ表示する。
-- **粒度**: 機能モジュール単位（todo / finance / schedule … 約14モジュール）。安定 ID（永続化キー＝**リネーム禁止**）を [`src/functions/moduleCatalog.ts`](../../src/functions/moduleCatalog.ts) の `MODULE_CATALOG` が一元管理し、`MODULE_CAPABILITY_MAP` はこれから導出する（重複定義しない）。
+- **粒度**: 機能モジュール単位（todo / finance / schedule … 約14モジュール）。安定 ID（永続化キー＝**リネーム禁止**）を `src/functions/moduleCatalog.ts` の `MODULE_CATALOG` が一元管理し、`MODULE_CAPABILITY_MAP` はこれから導出する（重複定義しない）。
 - **二段フィルタ**: ① capability フィルタ（Bot が持つ capability のモジュール）→ ② enabled-module フィルタ（ユーザーが ON にしたモジュール）。`core`（`richContent` 等 `selectable=false`）は常時有効・選択不可でフィルタ対象外。
 - **解決順（P6 ユーザー×Bot 上書き層）**: ① `bot_user_modules(bot_id, user_id)` に行があればそれを採用（`[]`=全 OFF も尊重）→ ② 無ければ `bots.enabled_modules`（Bot 既定）→ ③ どちらも未設定なら全有効（後方互換）。デフォルト Bot（`system_default`）含む全 Bot でユーザー個別に切替可能。編集権限は**アクセス権のある各ユーザーが自分の上書きのみ**。
-- **解決ロジック/キャッシュ**: [`src/services/botModules.ts`](../../src/services/botModules.ts)（`resolveEnabledModulesForUser` / `setUserModules` / `resolveBotEnabledModules` / `invalidate*Cache`）。`gemini.ts` が `getFunctionModulesForCapabilities(caps, enabledModules)` 経由で適用。永続化は [`src/db/botUserModulesRepo.ts`](../../src/db/botUserModulesRepo.ts)。
-- **API**: `GET/POST /api/bots/modules`（[`botAttributeRoutes.ts`](../../src/server/routes/botAttributeRoutes.ts)）。保存後にモジュール/能力キャッシュを invalidate。
+- **解決ロジック/キャッシュ**: `src/services/botModules.ts`（`resolveEnabledModulesForUser` / `setUserModules` / `resolveBotEnabledModules` / `invalidate*Cache`）。`gemini.ts` が `getFunctionModulesForCapabilities(caps, enabledModules)` 経由で適用。永続化は `src/db/botUserModulesRepo.ts`。
+- **API**: `GET/POST /api/bots/modules`（`botAttributeRoutes.ts`）。保存後にモジュール/能力キャッシュを invalidate。
 - **不変条件**: 「未設定＝全有効」を破らない（既存 Bot は挙動不変）。capability に属さない ID は適用しない。
 
 ---
@@ -283,7 +298,7 @@ L2 連想想起は「過去の知見を能動的・連想的に思い出す」�
 
 設計は [`docs/design/desktop_client/`](../design/desktop_client/index.md)。Discord 非依存の会話コア `processMessage()` を**無改修で再利用**し、クライアント非依存の汎用チャット入口を新設する。バックエンド（Phase 0/1）は実装済み・**実クライアント（egui）は Phase 2 以降で未実装**。
 
-- **認証（Phase 0）**: OAuth デバイスフロー。`/api/device/*`（[`deviceAuthRoutes.ts`](../../src/server/routes/deviceAuthRoutes.ts)）でコード発行→Web 承認→長命トークン交付。トークンは [`desktopAuthService.ts`](../../src/services/desktopAuthService.ts) がハッシュ保存（`desktop_tokens`、[`desktopTokenRepo.ts`](../../src/db/desktopTokenRepo.ts)）。デバイス管理は [`deviceMgmtRoutes.ts`](../../src/server/routes/deviceMgmtRoutes.ts)、クライアント配布は [`desktopClientRoutes.ts`](../../src/server/routes/desktopClientRoutes.ts)。
-- **WS チャット（Phase 1）**: `GET /ws/chat`（[`chatWebSocket.ts`](../../src/server/chatWebSocket.ts)）。`server.ts` の upgrade を Bearer トークン + `?botId=` の所有/共有検証で受理（1 接続 = 1 Bot 束縛）。[`chatChannelService.ts`](../../src/services/chatChannelService.ts) が WS フレーム ↔ `processMessage` を橋渡しし、ボタン等コンポーネントは [`componentInteractionService.ts`](../../src/services/componentInteractionService.ts) で処理。
+- **認証（Phase 0）**: OAuth デバイスフロー。`/api/device/*`（`deviceAuthRoutes.ts`）でコード発行→Web 承認→長命トークン交付。トークンは `desktopAuthService.ts` がハッシュ保存（`desktop_tokens`、`desktopTokenRepo.ts`）。デバイス管理は `deviceMgmtRoutes.ts`、クライアント配布は `desktopClientRoutes.ts`。
+- **WS チャット（Phase 1）**: `GET /ws/chat`（`chatWebSocket.ts`）。`server.ts` の upgrade を Bearer トークン + `?botId=` の所有/共有検証で受理（1 接続 = 1 Bot 束縛）。`chatChannelService.ts` が WS フレーム ↔ `processMessage` を橋渡しし、ボタン等コンポーネントは `componentInteractionService.ts` で処理。
 - **プロトコル**: 受信 `msg`/`reset`/`ping`/`interaction`、送信 `ready`/`status`/`interim`/`done`/`push`/`update`/`error`（詳細は [backend_api.md](../design/desktop_client/backend_api.md)）。
 - **不変条件**: 会話コア（`gemini.ts` / `turnPlanner.ts` / `llmClient.ts` / `functions/*`）は触らない。`primary` は Bot プライマリ概念が未導入のため `id === "system_default"` を暫定採用。

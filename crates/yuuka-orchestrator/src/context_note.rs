@@ -8,6 +8,8 @@
 //!
 //! 注: 読み取りは orchestrator の慣習（`persona`/`message_log`/`synapse_repo` と同様に DB を直接引く）に
 //! 従い、`yuuka-personal::ContextNoteRepo` へは依存しない（domain CRUD クレートへの DAG エッジを増やさない）。
+//! ノートの保存と PWA の共有ノート（`/api/client/shared-note`）の読み書きは
+//! `yuuka-personal::service::ContextNoteService` が持つ（D02 #126）。ここは読み取り専用で、失敗時は空に縮退する。
 
 use rusqlite::{params, OptionalExtension};
 use yuuka_db::map_sqlite;
@@ -64,14 +66,15 @@ mod tests {
         (db, dir)
     }
 
-    async fn set_note(db: &Db, uid: &str, bid: &str, content: &str) {
+    // テスト専用の直接 INSERT ヘルパー（`title` 列なし・LLM 注入テスト用）。
+    async fn seed_note_content(db: &Db, uid: &str, bid: &str, content: &str) {
         let (uid, bid, content) = (uid.to_owned(), bid.to_owned(), content.to_owned());
         db.writer
             .transaction(move |tx| {
                 // context_notes.user_id は users(discord_id) への FK（ON DELETE CASCADE）。先に user を用意する。
                 tx.execute(
-                    "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-                     VALUES (?1, ?1, 'x', 'x')",
+                    "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+                     VALUES (?1, ?1, 'x')",
                     params![uid],
                 )
                 .map_err(map_sqlite)?;
@@ -96,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn whitespace_only_note_yields_empty_section() {
         let (db, _dir) = open_db().await;
-        set_note(&db, "u1", "b1", "   \n  ").await;
+        seed_note_content(&db, "u1", "b1", "   \n  ").await;
         assert_eq!(build_context_note_section(&db, "u1", "b1").await, "");
     }
 
@@ -104,7 +107,7 @@ mod tests {
     async fn note_is_formatted_as_section_node_parity() {
         let (db, _dir) = open_db().await;
         // 前後空白は trim される（Node `note.trim()`）。
-        set_note(&db, "u1", "b1", "  乳製品アレルギー\n仕事はエンジニア  ").await;
+        seed_note_content(&db, "u1", "b1", "  乳製品アレルギー\n仕事はエンジニア  ").await;
         let section = build_context_note_section(&db, "u1", "b1").await;
         assert_eq!(
             section,
@@ -117,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn scope_is_isolated_per_user_and_bot() {
         let (db, _dir) = open_db().await;
-        set_note(&db, "u1", "b1", "u1のノート").await;
+        seed_note_content(&db, "u1", "b1", "u1のノート").await;
         // 別ユーザー・別 Bot は空（PK(user_id, bot_id) スコープ）。
         assert_eq!(build_context_note_section(&db, "u2", "b1").await, "");
         assert_eq!(build_context_note_section(&db, "u1", "b2").await, "");

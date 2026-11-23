@@ -1,7 +1,8 @@
 <script lang="ts">
-	// 利用規約（旧 index.html #terms-overlay）。公開ルート・API 不要。
-	import { goto } from "$lib/router";
-	import { Icon } from "$lib/components/ui";
+// 利用規約（旧 index.html #terms-overlay）。公開ルート・API 不要。
+
+import { Icon } from "$lib/components/ui";
+import { goto } from "$lib/router";
 </script>
 
 <div class="overlay active">
@@ -28,10 +29,10 @@
 				<h3>2. 利用資格とアカウント管理</h3>
 				<ul>
 					<li>
-						本サービスは、管理者が発行した「招待コード」を所持しているユーザー、または初期管理者として登録されたユーザーのみが利用できます。
+						本サービスへのログインは sk-account で行います。Yuuka はパスワード等の認証情報を保持しません。
 					</li>
 					<li>
-						ユーザーは、自己の責任においてDiscordユーザーIDおよびログインパスワード、招待コードを厳重に管理するものとします。
+						ユーザーは、自己の責任において sk-account とそのパスキーを厳重に管理するものとします。
 					</li>
 					<li>アカウントの第三者への譲渡、貸与、共有は一切禁止します。</li>
 				</ul>

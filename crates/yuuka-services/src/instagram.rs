@@ -1,8 +1,8 @@
-//! Instagram 新規投稿の Discord 転送（§3.15）。
+//! Instagram 新規投稿の Discord 転送（§3.16）。
 //!
 //! Instagram API with Instagram Login（`graph.instagram.com`）でオーナー自身の投稿を定期取得し、
 //! 新規投稿を転送先チャンネルへ流す。オーナー個人の単一アカウント運用（`instagram_account` は
-//! id = 1 の 1 行のみ・V21）で、設定は `config.yaml` / `.env` から [`InstagramSettings`] として
+//! id = 1 の 1 行のみ）で、設定は `config.yaml` / `.env` から [`InstagramSettings`] として
 //! 注入される（`INSTAGRAM_CHANNEL_ID` 未設定なら本サービスは登録されない）。
 //!
 //! # 新規投稿の判定
@@ -14,9 +14,16 @@
 //!
 //! # トークン
 //! 長期トークンは 60 日で失効し、リフレッシュすると値自体が変わるため `.env` では運用できない。
-//! システム鍵で暗号化して DB に保存し（V21・§6.2）、失効前に自動リフレッシュする。
+//! システム鍵で暗号化して DB に保存し（§6.2）、失効前に自動リフレッシュする。
 //! アクセストークンは単体で Graph API を呼べる資格情報のため、ログ・エラーメッセージへ本体を
 //! 出力してはならない（URL 全体のログ出力も禁止＝クエリにトークンが乗る）。
+//!
+//! # テーブルの作成
+//! `instagram_account` は fork（superkanioka/yuuka）だけの機能なので、upstream と番号を取り合う
+//! refinery マイグレーションには置かず、各 tick の先頭で [`TABLE_DDL`]（`CREATE TABLE IF NOT EXISTS`）
+//! を流して用意する。upstream が新しい `V*` を足しても衝突しない。
+//! 旧版はこれを `V21__instagram_account.sql` として持っていたため、その DB は
+//! `refinery_schema_history` の 21 番の行を消してから現行版へ移す（テーブル自体は残す）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,7 +157,7 @@ impl CronService for InstagramFeedService {
     }
 
     fn schedule(&self) -> Schedule {
-        Schedule::CronExpr(self.settings.poll_cron.clone())
+        Schedule::Cron(self.settings.poll_cron.clone())
     }
 
     async fn tick(&self, ctx: &ServiceContext) {
@@ -162,7 +169,32 @@ impl CronService for InstagramFeedService {
 
 // ─── ポーリング本体 ──────────────────────────────────────────────────────────
 
+/// 連携状態のテーブル。単一アカウント運用のため id = 1 の 1 行だけを CHECK 制約で許す。
+/// 新規投稿の判定は投稿 ID ではなく `last_post_timestamp`（この時刻より新しい投稿が未送信）で行う。
+pub(crate) const TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS instagram_account (
+  id                     INTEGER PRIMARY KEY CHECK (id = 1),
+  access_token_encrypted TEXT NOT NULL,
+  access_token_iv        TEXT NOT NULL,
+  access_token_tag       TEXT NOT NULL,
+  token_expires_at       TEXT,
+  last_refreshed_at      TEXT,
+  last_post_id           TEXT,
+  last_post_timestamp    TEXT,
+  last_checked_at        TEXT,
+  created_at             TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  updated_at             TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);";
+
+/// [`TABLE_DDL`] を流す（既にあれば何もしない）。
+async fn ensure_table(ctx: &ServiceContext) -> Result<(), DbError> {
+    ctx.db
+        .writer
+        .execute(|conn| conn.execute_batch(TABLE_DDL).map_err(map_sqlite))
+        .await
+}
+
 async fn run(ctx: &ServiceContext, cfg: &InstagramSettings) -> Result<(), DbError> {
+    ensure_table(ctx).await?;
     if !ensure_account(ctx, cfg).await? {
         return Ok(());
     }
@@ -265,7 +297,11 @@ fn parse_ts(ts: &str) -> Option<DateTime<FixedOffset>> {
 ///
 /// 時刻で判定するため、カーソルの投稿が削除されていても取りこぼし・再送が起きない。
 #[must_use]
-pub fn select_new_posts(media: &[Media], cursor_ts: Option<&str>, cursor_id: Option<&str>) -> Vec<Media> {
+pub fn select_new_posts(
+    media: &[Media],
+    cursor_ts: Option<&str>,
+    cursor_id: Option<&str>,
+) -> Vec<Media> {
     let Some(cursor) = cursor_ts.and_then(parse_ts) else {
         return Vec::new();
     };
@@ -299,10 +335,17 @@ pub fn primary_image_url(post: &Media) -> Option<String> {
     match post.media_type.as_str() {
         "VIDEO" => post.thumbnail_url.clone(),
         "CAROUSEL_ALBUM" => post.children.first().map_or_else(
-            || post.media_url.clone().or_else(|| post.thumbnail_url.clone()),
+            || {
+                post.media_url
+                    .clone()
+                    .or_else(|| post.thumbnail_url.clone())
+            },
             child_image_url,
         ),
-        _ => post.media_url.clone().or_else(|| post.thumbnail_url.clone()),
+        _ => post
+            .media_url
+            .clone()
+            .or_else(|| post.thumbnail_url.clone()),
     }
 }
 
@@ -333,7 +376,12 @@ pub fn render_post(post: &Media, inline_image_url: Option<&str>) -> String {
 
     lines.push("📸 新規投稿を1件確認しました。".to_owned());
 
-    if let Some(caption) = post.caption.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    if let Some(caption) = post
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         lines.push(String::new());
         lines.push(truncate_chars(caption, MAX_CAPTION_CHARS));
     }
@@ -386,7 +434,10 @@ async fn fetch_attachment(post: &Media, url: &str) -> Option<NotifyFile> {
     }
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() > MAX_ATTACHMENT_BYTES {
-        tracing::warn!(len = bytes.len(), "[Instagram] 画像が上限を超えるため添付しません");
+        tracing::warn!(
+            len = bytes.len(),
+            "[Instagram] 画像が上限を超えるため添付しません"
+        );
         return None;
     }
     Some(NotifyFile {
@@ -511,7 +562,10 @@ async fn fetch_recent_media(token: &str) -> Result<Vec<Media>, String> {
 }
 
 /// 短期トークンを長期トークン（60 日）へ交換する。
-async fn exchange_long_lived(token: &str, app_secret: &str) -> Result<(String, Option<i64>), String> {
+async fn exchange_long_lived(
+    token: &str,
+    app_secret: &str,
+) -> Result<(String, Option<i64>), String> {
     let body = graph_get(
         "/access_token",
         &[
@@ -619,8 +673,9 @@ async fn refresh_if_needed(
         Some(exp) => exp.with_timezone(&Utc) - now < chrono::Duration::days(REFRESH_THRESHOLD_DAYS),
         // 失効予定が不明（外部発行トークンを投入した場合）。発行直後はリフレッシュできないため、
         // 保存から 1 日以上経過していれば試みる。
-        None => last_refreshed
-            .is_none_or(|r| now - r.with_timezone(&Utc) > chrono::Duration::days(1)),
+        None => {
+            last_refreshed.is_none_or(|r| now - r.with_timezone(&Utc) > chrono::Duration::days(1))
+        }
     };
     if !needs {
         return Ok(());
@@ -751,15 +806,6 @@ async fn mark_checked(ctx: &ServiceContext) -> Result<(), DbError> {
 mod tests {
     use super::*;
     use crate::test_support::{ctx_null, seeded_db};
-
-    const DDL: &str = "CREATE TABLE instagram_account (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        access_token_encrypted TEXT NOT NULL, access_token_iv TEXT NOT NULL,
-        access_token_tag TEXT NOT NULL, token_expires_at TEXT, last_refreshed_at TEXT,
-        last_post_id TEXT, last_post_timestamp TEXT, last_checked_at TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-    );";
 
     fn post(id: &str, ts: &str) -> Media {
         Media {
@@ -1036,16 +1082,22 @@ mod tests {
 
     #[tokio::test]
     async fn token_round_trips_encrypted_and_cursor_survives_refresh() {
-        let (db, _dir) = seeded_db(DDL);
+        let (db, _dir) = seeded_db(TABLE_DDL);
         let ctx = ctx_null(db);
-        let crypto = Arc::new(SystemCrypto::new(SecretString::from("master-secret-for-test")).unwrap());
+        let crypto =
+            Arc::new(SystemCrypto::new(SecretString::from("master-secret-for-test")).unwrap());
         let cfg = settings(crypto);
 
         assert!(load_account(&ctx).await.unwrap().is_none());
 
-        save_token(&ctx, &cfg, "IG_TOKEN_1", Some("2026-11-18T00:00:00+00:00".to_owned()))
-            .await
-            .unwrap();
+        save_token(
+            &ctx,
+            &cfg,
+            "IG_TOKEN_1",
+            Some("2026-11-18T00:00:00+00:00".to_owned()),
+        )
+        .await
+        .unwrap();
         let row = load_account(&ctx).await.unwrap().unwrap();
         // 平文で保存されていない。
         assert!(!row.token_encrypted.contains("IG_TOKEN_1"));
@@ -1070,14 +1122,52 @@ mod tests {
 
     #[tokio::test]
     async fn service_is_registered_only_when_configured() {
-        let (db, _dir) = seeded_db(DDL);
+        let (db, _dir) = seeded_db(TABLE_DDL);
         let ctx = ctx_null(db);
-        let before = crate::build_services(&ctx).len();
+        assert!(crate::build_optional_services(&ctx).is_empty());
 
-        let crypto = Arc::new(SystemCrypto::new(SecretString::from("master-secret-for-test")).unwrap());
+        let crypto =
+            Arc::new(SystemCrypto::new(SecretString::from("master-secret-for-test")).unwrap());
         let ctx = ctx.with_instagram(Arc::new(settings(crypto)));
-        let svcs = crate::build_services(&ctx);
-        assert_eq!(svcs.len(), before + 1);
+        let svcs = crate::build_optional_services(&ctx);
+        assert_eq!(svcs.len(), 1);
         assert!(svcs.iter().any(|s| s.name() == "instagram"));
+    }
+
+    #[tokio::test]
+    async fn ensure_table_creates_and_keeps_existing_row() {
+        let (db, _dir) = seeded_db("");
+        let ctx = ctx_null(db);
+        ensure_table(&ctx).await.unwrap();
+        ctx.db
+            .writer
+            .execute(|conn| {
+                conn.execute(
+                    "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
+                     VALUES (1, 'e', 'i', 't')",
+                    [],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // 2 回目は既存テーブル・既存行に触れない。
+        ensure_table(&ctx).await.unwrap();
+        assert!(load_account(&ctx).await.unwrap().is_some());
+        // 単一アカウント運用の番人（CHECK(id = 1)）。
+        let second = ctx
+            .db
+            .writer
+            .execute(|conn| {
+                conn.execute(
+                    "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
+                     VALUES (2, 'e', 'i', 't')",
+                    [],
+                )
+                .map_err(map_sqlite)
+            })
+            .await;
+        assert!(second.is_err());
     }
 }

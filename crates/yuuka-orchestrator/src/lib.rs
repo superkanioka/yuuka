@@ -18,16 +18,24 @@ pub mod discord_ports;
 pub mod embed_recover;
 pub mod engine;
 pub mod guild_prompt;
+mod llm_settings;
 pub mod member_routes;
+pub mod memory_routes;
+pub mod memory_tools;
 pub mod message_log;
 pub mod module_catalog;
 pub mod persona;
 pub mod preset;
+pub mod receipt_extract;
 pub mod share_routes;
 pub mod synapse_extract;
+pub mod synapse_maintain;
 pub mod synapse_recall;
 pub mod synapse_repo;
 pub mod system_prompt;
+pub mod tool_outcome;
+pub mod tool_outcome_repo;
+pub mod turn_plan;
 pub mod user;
 
 pub use bot_attr_routes::{
@@ -39,10 +47,17 @@ pub use bot_routes::{
 };
 pub use discord_live::{DiscordBotUser, DiscordLive, GuildEntry, GuildOptions, NullDiscordLive};
 pub use discord_ports::{DbBotDirectory, DbMembership, InMemoryRateLimiter};
-pub use engine::{ChatEngine, GeminiFactory, RealGeminiFactory};
+pub use engine::{Channel, ChatEngine, GeminiFactory, RealGeminiFactory, TurnPermit};
 pub use member_routes::{
     routes as member_request_routes, routes_with as member_request_routes_with, NullMemberDmSender,
 };
+pub use memory_routes::routes_with as memory_routes_with;
+pub use memory_tools::tools as memory_tools;
+pub use receipt_extract::{ReceiptDraft, ReceiptExtractError};
 pub use share_routes::{
     routes as bot_share_routes, routes_with as bot_share_routes_with, NullShareInviteDm,
 };
+pub use synapse_maintain::{MemoryLlm, NullMemoryLlm};
+pub use synapse_recall::RecallSettings;
+pub use synapse_repo::ScopeKey as MemoryScope;
+pub use tool_outcome::DbToolOutcomeSink;

@@ -1,14 +1,11 @@
 //! システムプロンプト組立（Node `gemini.ts` `buildSystemInstruction` パリティ・§3.1.2）。
 //!
 //! 構成順: ペルソナ → 情報保存ルール → 承認フロー → リッチ返信ルール → 音声ルール → ファクトチェック →
-//! （検索スキル：縮退シーム）→ 機能一覧 → システムルール（現在日時・未実行の完了報告禁止）→
-//! （コンテキストノート／カレンダー：縮退シーム）。空セクションは除去して `\n` 結合する。
+//! 検索スキル → 機能一覧 → システムルール（現在日時・未実行の完了報告禁止）。空セクションは除去して
+//! `\n` 結合する。カレンダー情報・コンテキストノート・シナプス想起は engine 層で末尾へ追記する。
 //!
-//! **縮退シーム（現状は空で移植・remaining-work.md P2-E）**: 検索スキル（`docs/skills/search_skills.md`
-//! インライン・Docker に docs/ 非同梱のため配線時は `include_str!` 埋込）・カレンダー情報（Google
-//! カレンダー連携）・コンテキストノート（`personal` 連携）。いずれも Node で「未設定/エンジン不在」を
-//! 第一級サポートしており、未設定ユーザーには空文字で挙動が一致する（設定済みユーザーには機能低下）。
-//! シナプス想起は engine 層で配線済み（2026-07-16・`synapse_recall` を systemInstruction 末尾へ追記）。
+//! **検索スキル（R12・#109）**: Node は実行時に `docs/skills/search_skills.md` を読み、実行時の作業ディレクトリに
+//! `docs/` があるとは限らないため、ビルド時に `include_str!` で埋め込む（反映には再ビルドが要る）。
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
 
@@ -63,16 +60,29 @@ const FACT_CHECK: &str = "# リアルタイム情報の正確性とファクト�
 - ユーザーから天気予報、電車の運行情報、ニュース、最新技術トレンド、または事実確認を求められた場合、不正確な推測や無根拠なデータを伝えてはいけません。
 - 異なるソース同士で情報が食い違う場合は、数値の論理的整合性を確認し、必ず最も公式で最新のデータを優先してください。不確かな情報でユーザーの予定を狂わせないよう、徹底的に検証された正確な情報を伝えること。";
 
+/// 検索クロールスキル仕様書（`docs/skills/search_skills.md`・ビルド時埋込）。
+const SEARCH_SKILLS: &str = include_str!("../../../docs/skills/search_skills.md");
+
+/// 検索スキルセクション（Node `searchSkillsSection`）。資料が空なら Node と同じく空文字。
+fn search_skills_section(skills: &str) -> String {
+    if skills.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n# 検索クロールスキル仕様書（インデックス）\n外部検索（searchWeb）や情報収集を行う際は、以下のスキル仕様書に合致するカテゴリがあれば、その推奨ドメイン・推奨クエリパターン・巡回（fetchDynamicPage）フローに従って調査を組み立ててください。\n\n{skills}"
+    )
+}
+
 const CAPABILITIES: &str = "# あなたの機能（Discordアシスタントボットとしてのツール）
 あなたはDiscord上の優秀なアシスタントボットとして以下の機能を持っています。ツールを適切に使い、論理的かつ効率的にユーザーをサポートしてください。
 
 1. **タスク管理（ToDo）:** タスクの追加・一覧・完了・削除・タグ別表示・優先度整理。タグはバックグラウンドで自動付与されます。
-2. **予定管理（スケジュール）:** 予定の登録・一覧・削除。Googleカレンダーと自動的に双方向同期されます。
+2. **予定管理（スケジュール）:** 予定の登録・一覧・削除。予定は Yuuka 内に保存され、Googleカレンダーが連携されている場合はそちらにも同期されます。
 3. **リマインド:** 時刻指定・繰り返し（cron式）のリマインドを設定できます。
 4. **家計管理:** 収入・支出の記録、月間サマリー、カテゴリ別内訳、予算上限、支払い予定の登録と消込。
 5. **メモ:** コンテキストノート（長期）、クリップボード（短期・TTL付き）、連絡先管理。
 6. **会話ログ要約:** 過去の会話履歴を話題（キーワード）や期間で振り返り、時系列でまとめられます（summarizeConversationTopic）。
-7. **朝報・日報・週報:** 天気・ニュースの定期配信や日次・週次レポートの設定を変更できます（configureBriefing / configureReport）。
+7. **定期報告:** 天気・ニュース・タスク・予定・支払い予定・家計・会話トピックから内容を選んで、名前を付けた報告（朝報・日報など）を定時に配信できます（listPeriodicReports / savePeriodicReport / deletePeriodicReport）。タスク・予定・支払い予定・家計を含む報告は DM にだけ送ります。登録済みの報告はこの会話にすぐ表示することも、設定した配信先へテスト配信することもできます（runPeriodicReportNow）。
 8. **インタラクティブブラウザ操作（ブラウザ自動化）:** ユーザーの代わりに特定のWebサイトを開き、入力、クリック、待機、ステータス確認などのインタラクティブ操作を行います。";
 
 /// システムルール（現在日時と「未実行の完了報告禁止」を含む）。`{dt}` に日時文字列を差し込む。
@@ -84,7 +94,7 @@ fn system_rules(date_time_str: &str) -> String {
 - **【重要】時制の制御と基準日時**: 検索を行う際、および検索結果を分析・要約する際は、**必ず上記の「現在の日時」を絶対的な基準として使用してください**。検索結果（Webページやニュース記事等）に記載されている「今日」「昨日」「3日前」「今年」「昨年」「最新」などの表現や日付情報は、この現在の日時から正確に逆算し、時系列や時制（過去・現在・未来）を正確に認識した上で、正しい時制で回答してください。
 - 「明日」「来週月曜」などの相対的な日時表現は、適切なISO 8601形式に変換してツールを呼び出してください。
 - ユーザーが「n時間後に教えて」「n分後にリマインドして」のように簡易タイマーを求めた場合は addReminder を使用してください。カレンダーに登録すべき「予定」は addSchedule を使用してください（カレンダーを汚したくない単発タイマーに addSchedule を使う場合は local_only を true に設定）。
-- カレンダーに登録されるような通常の予定を追加または削除した際は「Googleカレンダーにも同期（削除）しました」と自然に一言添えてください。local_only やリマインダーの場合はカレンダー同期の旨は言わないでください。
+- 予定を追加・削除したときに Googleカレンダーとの同期について触れてよいのは、addSchedule / deleteSchedule の結果の google_sync が \"synced\" の場合だけです（その場合は「Googleカレンダーにも同期（削除）しました」と自然に一言添えてください）。google_sync が \"not_linked\"・\"local_only\" のときは同期について言わず、\"failed\" のときは Googleカレンダーへの反映に失敗したことを正直に伝えてください。結果に無いのに同期した・反映したと述べてはいけません。
 - 金額は日本円（整数）で扱ってください。
 - 家計のカテゴリは「食費, 日用品, 交通費, 光熱費, 通信費, 医療費, 娯楽, 衣服, その他」です。
 - レシート画像を受け取った場合、各商品を適切なカテゴリに分類し、'addExpense'関数（source: receipt_ocr）を使って記録してください。記録前に読み取り内容のプレビューを提示し、対応する支払い予定が存在しそうなら findSettlementCandidates で消込候補を確認してください（§3.4.2）。
@@ -156,15 +166,17 @@ pub fn build_system_instruction(
         RICH_REPLY_OFF
     };
     let rules = system_rules(date_time_str);
+    let search_skills = search_skills_section(SEARCH_SKILLS);
 
     // Node の parts 配列（空要素は filter 除去）を `\n` 結合する。
-    let parts: [&str; 8] = [
+    let parts: [&str; 9] = [
         &persona_section,
         MEMORY_RULE,
         CONFIRMATION_RULE,
         rich,
         VOICE_RULE,
         FACT_CHECK,
+        &search_skills,
         CAPABILITIES,
         &rules,
     ];
@@ -176,9 +188,61 @@ pub fn build_system_instruction(
         .join("\n")
 }
 
+/// システム Bot（`system_default`）の役割。個人の秘書ではなく、Yuuka の使い方・設定方法を説明・案内する。
+const SYSTEM_BOT_ROLE: &str = "# あなたの役割
+あなたは Yuuka（Discord と Web で使える AI エージェント基盤）のシステム案内役です。ユーザーの個人的な秘書ではありません。
+Yuuka の使い方・設定方法・できることについての質問に答え、管理画面のどこで設定できるかを案内してください。
+
+# 守ること
+- できるのは説明と案内だけです。設定の変更、タスク・予定・家計・メモなどの個人データの記録や参照は行えません。頼まれたら、そのユーザー自身のエージェント（Bot）か管理画面で行うよう案内してください。
+- まだ自分の Bot を持っていないユーザーには、管理画面の「ホーム（Bot一覧）」で Bot を作成するよう案内してください。
+- 下の一覧に無い機能や画面について、推測で断定してはいけません。分からないことは分からないと伝え、管理者に確認するよう案内してください。
+- 丁寧・簡潔に、手順は番号付きで答えてください。";
+
+/// 管理画面の構成（`frontend/src/lib/managementSections.ts`・`botTabs.ts` と一致させる）。
+const SYSTEM_BOT_GUIDE: &str = "# Yuuka の構成（案内に使う情報）
+## エージェント（Bot）
+- ユーザーは自分専用の Bot を作成でき、他のユーザーと共有もできます。種類（プリセット）は2つです。
+  - **パーソナル秘書**: タスク・予定・リマインド・家計・メモ・朝報/日報・ブラウザ操作などを個人向けに支援する。
+  - **汎用モード**: Discord サーバーで MCP ツール等を使うアシスタント。Bot 専用の Gemini API キーが必要。
+- Web アプリ（PWA）では、自分の Bot・共有された Bot を切り替えて、チャット・タスク・予定・家計・共有ノートを使えます。
+
+## 管理画面（/admin）
+- **ホーム（Bot一覧）**: Bot の一覧・作成・切り替えと、自分の Bot の起動・停止。Bot を選ぶとその Bot の画面が開き、サイドバーの「Bot設定」から設定ハブへ進めます。
+  - Bot設定 › このBot: 基本情報と共有（登録名・属性・共有メンバー）／人格（ペルソナ・会話履歴のクリア）／機能と AI（有効な機能・汎用モードの Bot 専用 API キーとモデル）／連携の利用許可（この Bot に使わせる MCP サーバー・認証情報・Google アカウント）。
+  - Bot設定 › 自動化（秘書のみ）: Playbook（手順書・定期実行・実行履歴）／定期報告（天気・ニュース・タスクなどを組み合わせた報告）／Webhook。
+  - Bot設定 › Discord: Bot トークン・招待リンク。汎用モードは応答する場所（ギルド・チャンネル）／応答する相手（メンバー・ロール・利用申請）／ギルドノートも。
+- **あなたの設定**: 表示名とテーマ／時刻と通知（通知先・リマインド既定・リッチ返信。利用者ごとのタイムゾーン変更は未対応）／AI モデル（秘書で使う個人の API キーとモデル）／バックアップと移行（Google Drive バックアップ・Bot移行パッケージ）／ログイン中の端末（デスクトップアプリ）／アカウントの削除。
+- **連携サービス**: Google アカウント（複数可・カレンダー設定・各 Bot で使うアカウント）／MCP サーバー（登録と使える Bot）／認証情報（パスワードマネージャ・使える Bot）。
+- **管理者設定**（管理者のみ）: システムデフォルト Bot（Discord トークン更新）／全体設定（利用規約・プライバシーポリシー）／Bot属性と利用上限（プリセット表示名・汎用モードのレート制限）／ユーザー管理／Bot モデレーション／公開ペルソナ管理／監査ログ。
+- ログインは sk-account（sk-9 Account）で行います。初回ログイン時に Yuuka の利用者として登録されます。";
+
+/// システム Bot（`system_default`）のシステムプロンプト。ペルソナ・個人向けの機能ルールは含めず、
+/// 役割・管理画面の構成・リッチ返信可否・現在日時だけで組む（ツールは core のみ＝個人データに触れない）。
+#[must_use]
+pub fn build_system_bot_instruction(rich_reply: bool, date_time_str: &str) -> String {
+    let rich = if rich_reply {
+        "
+# リッチ返信
+手順や設定項目の一覧など、文章だけより見やすく伝えたい場合は showRichContent（Embed）を使ってかまいません。Embed の JSON を本文のコードブロックとして書き出してはいけません。"
+    } else {
+        RICH_REPLY_OFF
+    };
+    [
+        SYSTEM_BOT_ROLE,
+        SYSTEM_BOT_GUIDE,
+        rich,
+        &format!("# 現在の日時\n{date_time_str}"),
+    ]
+    .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_system_instruction, format_date_time_ja, DEFAULT_PERSONA};
+    use super::{
+        build_system_bot_instruction, build_system_instruction, format_date_time_ja,
+        search_skills_section, CAPABILITIES, DEFAULT_PERSONA, FACT_CHECK, SEARCH_SKILLS,
+    };
     use chrono::{Local, TimeZone};
 
     #[test]
@@ -211,5 +275,51 @@ mod tests {
         assert!(!sys.contains(DEFAULT_PERSONA));
         assert!(sys.contains("リッチ返信は無効"));
         assert!(!sys.contains("リッチ返信の使い分け"));
+    }
+
+    /// R12（#109）: 検索スキル資料がファクトチェックと機能一覧の間に注入される（Node `searchSkillsSection`）。
+    #[test]
+    fn injects_search_skills_between_fact_check_and_capabilities() {
+        assert!(SEARCH_SKILLS.contains("検索スキル・インデックス"));
+        for sys in [
+            build_system_instruction(None, true, "d"),
+            build_system_instruction(Some("ペルソナ"), false, "d"),
+        ] {
+            let heading = sys
+                .find("# 検索クロールスキル仕様書（インデックス）")
+                .expect("search skills heading");
+            let body = sys.find(SEARCH_SKILLS).expect("search skills body");
+            let fact = sys.find(FACT_CHECK).expect("fact check");
+            let caps = sys.find(CAPABILITIES).expect("capabilities");
+            assert!(fact < heading && heading < body && body < caps);
+        }
+        // 現行に存在しないツール（Node 時代の readCodeFile）を呼ぶよう指示しない。
+        assert!(!SEARCH_SKILLS.contains("readCodeFile"));
+    }
+
+    #[test]
+    fn search_skills_section_is_empty_for_empty_document() {
+        assert_eq!(search_skills_section(""), "");
+        assert_eq!(search_skills_section(" \n"), "");
+    }
+
+    #[test]
+    fn system_bot_instruction_excludes_search_skills() {
+        let sys = build_system_bot_instruction(true, "d");
+        assert!(!sys.contains("検索クロールスキル仕様書"));
+    }
+
+    #[test]
+    fn system_bot_instruction_is_a_guide_without_personal_features() {
+        let sys = build_system_bot_instruction(true, "2026年1月1日 (木) 00時00分00秒");
+        assert!(sys.contains("システム案内役"));
+        assert!(sys.contains("管理者設定"));
+        assert!(sys.contains("2026年1月1日"));
+        // 個人向け秘書のルール・機能一覧・既定ペルソナは含めない。
+        assert!(!sys.contains(DEFAULT_PERSONA));
+        assert!(!sys.contains("addTodo"));
+        assert!(!sys.contains("appendContextNote"));
+        let plain = build_system_bot_instruction(false, "x");
+        assert!(plain.contains("リッチ返信は無効"));
     }
 }

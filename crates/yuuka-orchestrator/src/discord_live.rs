@@ -23,6 +23,8 @@ pub struct DiscordBotUser {
 pub struct GuildOptions {
     pub roles: Vec<GuildEntry>,
     pub members: Vec<GuildEntry>,
+    /// テキストで発言できるチャンネル候補（Discord の表示順）。
+    pub channels: Vec<GuildEntry>,
     /// メンバー一覧が完全か（GuildMembers intent 無しでは false）。
     pub members_complete: bool,
     /// Bot がオンラインかつ当該ギルドに在籍しているか。
@@ -43,6 +45,18 @@ pub struct GuildEntry {
 /// 返すので、縮退実装（[`NullDiscordLive`]）は上書き不要。
 #[async_trait]
 pub trait DiscordLive: Send + Sync {
+    /// REST で専用 Bot の現在のアカウント名を取得する（共有クライアントへの代替なし）。
+    async fn fetch_bot_account(&self, _bot_id: &str) -> Result<DiscordBotUser, String> {
+        Err("DiscordのBotアカウントを取得できません。連携と起動状態を確認してください。".into())
+    }
+    /// Bot アカウント名を変更する。サーバーのニックネームは変更しない。
+    async fn rename_bot_account(
+        &self,
+        _bot_id: &str,
+        _name: &str,
+    ) -> Result<DiscordBotUser, String> {
+        Err("DiscordのBotアカウント名を更新できません。".into())
+    }
     /// 独自クライアント（`customClients.get(bot_id)?.user`）の Bot ユーザー。未起動は `None`。
     async fn custom_bot_user(&self, bot_id: &str) -> Option<DiscordBotUser>;
     /// デフォルトクライアント（`defaultBotClient.user`）の Bot ユーザー。未準備は `None`。

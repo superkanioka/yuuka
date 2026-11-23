@@ -2,13 +2,16 @@
 //!
 //! 認可は [`AuthenticatedUser`] extractor で型強制、DB は `State<Db>` サブステートで取得、
 //! スコープは **共通の [`resolve_scope`]**（`?botId=` を bot アクセス認可つきで解決・
-//! 未アクセスは system_default にフォールバック）で束ねて repo に渡す。
+//! 未指定・system_default は 403、未アクセスは 404）で束ねて repo に渡す。
 //! 本ルータは supervisor 側で共通レイヤ（CSRF/body 上限）配下にマージされる。
 //!
 //! 参照スコープ = コア CRUD の list/add に加え、予算上限（budget_limits）・支払い予定
 //! （planned_payments・消込含む）・月次集計（`GET /api/expenses` の total/incomeTotal/
 //! breakdown/trend）・receipt OCR（upload-receipt・`ReceiptParser` シーム経由・supervisor が実
 //! `ChatEngine` へ配線）。
+//!
+//! 収支の記帳（add）は PWA・ツールと共通の [`FinanceService`] を通す（D02 #126）。予算上限・
+//! 支払い予定は D02 の対象外で、まだ入口ごとに repo を呼ぶ。
 
 use std::sync::Arc;
 
@@ -19,11 +22,9 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use yuuka_core::WebError;
+use yuuka_core::{cron_util, WebError};
 use yuuka_types::{EmptyData, Envelope};
-use yuuka_web::{
-    has_bot_access, resolve_scope, ApiError, AppState, AuthenticatedUser, Db, ScopedJson,
-};
+use yuuka_web::{resolve_scope, ApiError, AppState, AuthenticatedUser, Db, ScopeError, ScopedJson};
 
 use crate::dto::{
     BudgetLimitListData, DeleteBudgetLimit, ExpenseData, ExpenseListData, NewExpense,
@@ -32,17 +33,7 @@ use crate::dto::{
 };
 use crate::receipt::{ReceiptError, ReceiptParser};
 use crate::repo::ExpenseRepo;
-
-/// レシート画像の MIME 許可リスト（LLM に渡せる画像形式に限定・Node `ALLOWED_RECEIPT_MIME`）。
-const ALLOWED_RECEIPT_MIME: [&str; 7] = [
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "image/webp",
-    "image/heic",
-    "image/heif",
-    "image/gif",
-];
+use crate::service::FinanceService;
 
 #[derive(Debug, Deserialize)]
 struct BotQuery {
@@ -125,37 +116,24 @@ async fn upload_receipt(
 ) -> Response {
     let image = body.image_base64.unwrap_or_default();
     let mime = body.mime_type.unwrap_or_default();
-    if image.is_empty() || mime.is_empty() {
-        return receipt_error(
-            StatusCode::BAD_REQUEST,
-            "画像データ(base64)とMIMEタイプが必要です。",
-        );
-    }
-    // MIME 検証: `toLowerCase().split(";")[0].trim()` で画像形式のみ許可する。
-    let mime_key = mime
-        .to_lowercase()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if !ALLOWED_RECEIPT_MIME.contains(&mime_key.as_str()) {
-        return receipt_error(
-            StatusCode::BAD_REQUEST,
-            "対応していない画像形式です（png/jpeg/webp/heic/gif）。",
-        );
-    }
+    let mime = match yuuka_core::receipt_image::validate(&image, &mime) {
+        Ok(mime) => mime,
+        Err(message) => return receipt_error(StatusCode::BAD_REQUEST, message),
+    };
 
-    // resolvedBotId = botId && hasBotAccess ? botId : system_default。
-    let bot_id = match body.bot_id.as_deref() {
-        Some(b) if !b.is_empty() => match has_bot_access(&db, &user.0.discord_id, b).await {
-            Ok(true) => b.to_owned(),
-            Ok(false) => "system_default".to_owned(),
-            Err(_) => {
-                return receipt_error(StatusCode::INTERNAL_SERVER_ERROR, "処理に失敗しました。")
-            }
-        },
-        _ => "system_default".to_owned(),
+    // 取引の下書きはユーザーの Bot にだけ置く。未指定・system_default は 403、アクセス不可は 404
+    // （システム Bot へは落とさない・issue #141）。
+    let bot_id = match resolve_scope(&user.0, &db, body.bot_id.as_deref()).await {
+        Ok(scope) => scope.bot_id().as_str().to_owned(),
+        Err(ScopeError::BotRequired) => {
+            return receipt_error(StatusCode::FORBIDDEN, "Bot を選択してください。")
+        }
+        Err(ScopeError::BotNotFound) => {
+            return receipt_error(StatusCode::NOT_FOUND, "Bot が見つかりません。")
+        }
+        Err(ScopeError::Db(_)) => {
+            return receipt_error(StatusCode::INTERNAL_SERVER_ERROR, "処理に失敗しました。")
+        }
     };
 
     // Node: additionalText || undefined（空文字は None）。
@@ -214,14 +192,10 @@ async fn add(
         value: input,
     }: ScopedJson<NewExpense>,
 ) -> Result<Json<Envelope<ExpenseData>>, ApiError> {
-    // Node parity: amount と category は必須（amount は 0 も金額として不正扱い＝truthy 判定）。
-    if input.amount == 0 || input.category.trim().is_empty() {
-        return Err(ApiError(WebError::Validation(
-            "amount and category are required".to_owned(),
-        )));
-    }
+    // Node parity: amount（0 は不正・負の調整は可）と category は必須。判定は PWA・ツールと共通の
+    // サービスで行う（D02 #126）。
     let scope = resolve_scope(&user.0, &db, bot_id.as_deref()).await?;
-    let expense = ExpenseRepo::new(&db).add(&scope, input).await?;
+    let expense = FinanceService::new(&db).add_entry(&scope, input).await?;
     Ok(Json(Envelope::ok(ExpenseData { expense })))
 }
 
@@ -314,7 +288,7 @@ async fn add_plan(
     State(db): State<Db>,
     ScopedJson {
         bot_id,
-        value: input,
+        value: mut input,
     }: ScopedJson<NewPlannedPayment>,
 ) -> Result<Json<Envelope<PlannedPaymentData>>, ApiError> {
     // Node parity: 期日は dueDate ?? plannedDate（旧 UI 互換）。空文字は falsy 扱い。
@@ -335,6 +309,18 @@ async fn add_plan(
             )));
         }
     };
+    // R19: 繰り返しの cron 式はツールと同じく実行時の parser で検証する（空は単発扱い）。
+    input.repeat_rule = input
+        .repeat_rule
+        .map(|rule| rule.trim().to_owned())
+        .filter(|rule| !rule.is_empty());
+    if let Some(rule) = &input.repeat_rule {
+        if !cron_util::is_valid(rule) {
+            return Err(ApiError(WebError::Validation(
+                "repeatRule must be a valid cron expression".to_owned(),
+            )));
+        }
+    }
     let scope = resolve_scope(&user.0, &db, bot_id.as_deref()).await?;
     let plan = ExpenseRepo::new(&db).add_plan(&scope, input, due).await?;
     Ok(Json(Envelope::ok(PlannedPaymentData { plan })))
@@ -366,10 +352,12 @@ async fn pay_plan(
         )));
     }
 
-    // 実支払いを Expense として記録し消込・紐付き ToDo を自動完了（1 トランザクション）。
-    let (expense_id, completed_todos) = repo.settle_plan(&scope, &plan).await?;
+    // 実支払いを Expense として記録し消込・紐付き ToDo を自動完了・紐付きリマインドを停止
+    // （1 トランザクション）。
+    let settled = repo.settle_plan(&scope, &plan).await?;
+    let completed_todos = settled.completed_todos;
     let expense = repo
-        .get(&scope, expense_id)
+        .get(&scope, settled.expense_id)
         .await?
         .ok_or(ApiError(WebError::Internal))?;
 
@@ -400,11 +388,15 @@ async fn delete_plan(
     }: ScopedJson<PlannedPaymentId>,
 ) -> Result<Json<Envelope<EmptyData>>, ApiError> {
     // Node parity: `!id`（0 含む）は 400。成否は bare `{success: ok}` で返す。
+    // 紐付く期日前リマインドは repo が同じトランザクションで止める（R15）。
     if input.id == 0 {
         return Err(ApiError(WebError::Validation("id is required".to_owned())));
     }
     let scope = resolve_scope(&user.0, &db, bot_id.as_deref()).await?;
-    let ok = ExpenseRepo::new(&db).cancel_plan(&scope, input.id).await?;
+    let ok = ExpenseRepo::new(&db)
+        .cancel_plan(&scope, input.id)
+        .await?
+        .is_some();
     Ok(Json(Envelope::bare(ok)))
 }
 

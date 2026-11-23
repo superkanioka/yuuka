@@ -4,7 +4,8 @@
 //! 「user_id/bot_id 無しクエリ」を型で不能化する。読みは [`ReadPool`]、書きは
 //! [`WriterHandle`]（BEGIN IMMEDIATE）へ送る。参照実装は yuuka-todo。
 
-use rusqlite::{params, Row};
+use rusqlite::{params, OptionalExtension, Row};
+use yuuka_core::datetime::input_to_db_jst;
 use yuuka_core::scope::ScopedRepo;
 use yuuka_core::{DbError, UserScope};
 use yuuka_db::{map_sqlite, ReadPool, WriterHandle};
@@ -18,6 +19,43 @@ const SCHEDULE_COLUMNS: &str =
 
 /// Node parity: `remind_before_minutes` 未指定時の既定値。
 const DEFAULT_REMIND_BEFORE_MINUTES: i64 = 10;
+
+/// [`ScheduleRepo::list_in_range`] 専用のビュー（PWA カレンダー表示用）。
+///
+/// [`Schedule`]（`wire DTO`・ts-rs 生成対象）とは別物: `google_calendar_id` を含むため
+/// **`yuuka-client-api` からの内部利用専用**で `TS`/`export_bindings` の対象にしない
+/// （一般ダッシュボードの `Schedule` クリーンビュー契約は変えない）。
+#[derive(Debug, Clone)]
+pub struct ScheduleForClient {
+    pub id: i64,
+    pub title: String,
+    /// `'YYYY-MM-DD HH:MM:SS'`（SQLite localtime）。
+    pub start_at: String,
+    pub end_at: Option<String>,
+    pub google_calendar_id: Option<String>,
+}
+
+/// Google カレンダーと紐付いた予定（同期処理用の内部ビュー）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleLinkedSchedule {
+    pub id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    pub start_at: String,
+    pub end_at: Option<String>,
+    pub google_event_id: String,
+    pub google_calendar_id: Option<String>,
+}
+
+/// Google から取り込む／更新する予定の内容（日時はローカル暦）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleScheduleFields {
+    pub title: String,
+    pub description: String,
+    pub start_at: String,
+    pub end_at: Option<String>,
+    pub google_calendar_id: String,
+}
 
 /// schedule リポジトリ（DB ハンドルを借用する軽量ラッパ・per-request 構築）。
 pub struct ScheduleRepo<'a> {
@@ -102,6 +140,10 @@ impl<'a> ScheduleRepo<'a> {
         let remind = input
             .remind_before_minutes
             .unwrap_or(DEFAULT_REMIND_BEFORE_MINUTES);
+        // 一覧・リマインド・PWA カレンダーが前提にするローカル暦の保存形式へ揃える
+        // （解釈できない値は呼び出し側の検証を通った前提でそのまま保存する）。
+        let start_at = input_to_db_jst(&input.start_at).unwrap_or(input.start_at);
+        let end_at = input.end_at.map(|end| input_to_db_jst(&end).unwrap_or(end));
         let id = self
             .writer
             .transaction(move |tx| {
@@ -115,8 +157,8 @@ impl<'a> ScheduleRepo<'a> {
                         bid,
                         input.title,
                         input.description,
-                        input.start_at,
-                        input.end_at,
+                        start_at,
+                        end_at,
                         remind,
                     ],
                 )
@@ -127,6 +169,247 @@ impl<'a> ScheduleRepo<'a> {
         self.get(scope, id)
             .await?
             .ok_or_else(|| DbError::Operation("inserted schedule not found".to_owned()))
+    }
+
+    /// `[from, to]`（`'YYYY-MM-DD HH:MM:SS'` ローカル・両端含む日境界）の予定を開始時刻昇順で返す
+    /// （PWA `GET /api/client/calendar/events`・issue #33/#43）。
+    ///
+    /// `to_exclusive_end` は「`to` の翌日 0 時」（呼び出し側で JST 日境界から組み立てる）。
+    /// [`Schedule`] の**フィールドに存在しない** `google_calendar_id`（クリーンビューが意図的に
+    /// 隠す内部・Google 同期列）を PWA の `calendar`/`calendarName` 表示用に**別途**返す
+    /// （[`ScheduleForClient`]・一般ダッシュボード向け `Schedule` の契約は変えない）。
+    ///
+    /// # Errors
+    /// クエリ失敗時 [`DbError`]。
+    pub async fn list_in_range(
+        &self,
+        scope: &UserScope,
+        from_inclusive: &str,
+        to_exclusive_end: &str,
+    ) -> Result<Vec<ScheduleForClient>, DbError> {
+        let (uid, bid) = scope_keys(scope);
+        let (from, to) = (from_inclusive.to_owned(), to_exclusive_end.to_owned());
+        self.read
+            .read(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, title, start_at, end_at, google_calendar_id FROM schedules \
+                         WHERE user_id = ?1 AND bot_id = ?2 \
+                           AND start_at >= ?3 AND start_at < ?4 \
+                         ORDER BY start_at ASC",
+                    )
+                    .map_err(map_sqlite)?;
+                let rows = stmt
+                    .query_map(params![uid, bid, from, to], |row| {
+                        Ok(ScheduleForClient {
+                            id: row.get("id")?,
+                            title: row.get("title")?,
+                            start_at: row.get("start_at")?,
+                            end_at: row.get("end_at")?,
+                            google_calendar_id: row.get("google_calendar_id")?,
+                        })
+                    })
+                    .map_err(map_sqlite)?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(map_sqlite)?);
+                }
+                Ok(out)
+            })
+            .await
+    }
+
+    /// 予定を Google カレンダーのイベントと紐付ける（Yuuka → Google の登録に成功したとき）。
+    ///
+    /// # Errors
+    /// 更新失敗時 [`DbError`]。
+    pub async fn set_google_link(
+        &self,
+        scope: &UserScope,
+        id: i64,
+        google_event_id: &str,
+        google_calendar_id: &str,
+    ) -> Result<(), DbError> {
+        let (uid, bid) = scope_keys(scope);
+        let (event_id, calendar_id) = (google_event_id.to_owned(), google_calendar_id.to_owned());
+        self.writer
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE schedules SET google_event_id = ?4, google_calendar_id = ?5 \
+                     WHERE id = ?1 AND user_id = ?2 AND bot_id = ?3",
+                    params![id, uid, bid, event_id, calendar_id],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// 予定に紐付く Google イベント（`(event_id, calendar_id)`・紐付いていなければ `None`）。
+    ///
+    /// # Errors
+    /// クエリ失敗時 [`DbError`]。
+    pub async fn google_link(
+        &self,
+        scope: &UserScope,
+        id: i64,
+    ) -> Result<Option<(String, Option<String>)>, DbError> {
+        let (uid, bid) = scope_keys(scope);
+        self.read
+            .read(move |conn| {
+                let row: Option<(Option<String>, Option<String>)> = conn
+                    .query_row(
+                        "SELECT google_event_id, google_calendar_id FROM schedules \
+                         WHERE id = ?1 AND user_id = ?2 AND bot_id = ?3",
+                        params![id, uid, bid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(map_sqlite)?;
+                Ok(row.and_then(|(event, calendar)| {
+                    event.filter(|e| !e.is_empty()).map(|e| (e, calendar))
+                }))
+            })
+            .await
+    }
+
+    /// `[from, to)`（ローカル暦）に始まる、Google と紐付いた予定。
+    ///
+    /// # Errors
+    /// クエリ失敗時 [`DbError`]。
+    pub async fn google_linked_between(
+        &self,
+        scope: &UserScope,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<GoogleLinkedSchedule>, DbError> {
+        let (uid, bid) = scope_keys(scope);
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.read
+            .read(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, title, description, start_at, end_at, google_event_id, \
+                                google_calendar_id FROM schedules \
+                         WHERE user_id = ?1 AND bot_id = ?2 AND google_event_id IS NOT NULL \
+                           AND google_event_id <> '' AND start_at >= ?3 AND start_at < ?4",
+                    )
+                    .map_err(map_sqlite)?;
+                let rows = stmt
+                    .query_map(params![uid, bid, from, to], |r| {
+                        Ok(GoogleLinkedSchedule {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            description: r.get(2)?,
+                            start_at: r.get(3)?,
+                            end_at: r.get(4)?,
+                            google_event_id: r.get(5)?,
+                            google_calendar_id: r.get(6)?,
+                        })
+                    })
+                    .map_err(map_sqlite)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)
+            })
+            .await
+    }
+
+    /// Google 側の変更を反映する（タイトル・説明・日時・カレンダー）。
+    ///
+    /// # Errors
+    /// 更新失敗時 [`DbError`]。
+    pub async fn apply_google_update(
+        &self,
+        scope: &UserScope,
+        id: i64,
+        fields: GoogleScheduleFields,
+    ) -> Result<(), DbError> {
+        let (uid, bid) = scope_keys(scope);
+        self.writer
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE schedules SET title = ?4, description = ?5, start_at = ?6, \
+                       end_at = ?7, google_calendar_id = ?8 \
+                     WHERE id = ?1 AND user_id = ?2 AND bot_id = ?3",
+                    params![
+                        id,
+                        uid,
+                        bid,
+                        fields.title,
+                        fields.description,
+                        fields.start_at,
+                        fields.end_at,
+                        fields.google_calendar_id
+                    ],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// 同じタイトル・開始日時で、まだ Google と紐付いていない予定の ID（取り込み時の重複防止）。
+    ///
+    /// # Errors
+    /// クエリ失敗時 [`DbError`]。
+    pub async fn find_unlinked(
+        &self,
+        scope: &UserScope,
+        title: &str,
+        start_at: &str,
+    ) -> Result<Option<i64>, DbError> {
+        let (uid, bid) = scope_keys(scope);
+        let (title, start_at) = (title.to_owned(), start_at.to_owned());
+        self.read
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT id FROM schedules WHERE user_id = ?1 AND bot_id = ?2 \
+                       AND title = ?3 AND start_at = ?4 \
+                       AND (google_event_id IS NULL OR google_event_id = '') \
+                     ORDER BY id LIMIT 1",
+                    params![uid, bid, title, start_at],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_sqlite)
+            })
+            .await
+    }
+
+    /// Google の予定を新しく取り込む。
+    ///
+    /// # Errors
+    /// 挿入失敗時 [`DbError`]。
+    pub async fn insert_from_google(
+        &self,
+        scope: &UserScope,
+        google_event_id: &str,
+        fields: GoogleScheduleFields,
+    ) -> Result<i64, DbError> {
+        let (uid, bid) = scope_keys(scope);
+        let event_id = google_event_id.to_owned();
+        self.writer
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO schedules \
+                       (user_id, bot_id, title, description, start_at, end_at, \
+                        remind_before_minutes, google_event_id, google_calendar_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        uid,
+                        bid,
+                        fields.title,
+                        fields.description,
+                        fields.start_at,
+                        fields.end_at,
+                        DEFAULT_REMIND_BEFORE_MINUTES,
+                        event_id,
+                        fields.google_calendar_id
+                    ],
+                )
+                .map_err(map_sqlite)?;
+                Ok(tx.last_insert_rowid())
+            })
+            .await
     }
 
     /// 予定を削除する（削除できたら `true`）。

@@ -19,13 +19,14 @@
 pub mod ports;
 
 mod idempotent;
-mod interaction;
+pub mod interaction;
 mod live;
 mod manager;
 mod message_flow;
 mod notify_bridge;
 mod presence;
 mod reply;
+mod streaming;
 mod tenant;
 mod text;
 mod turn_gate;
@@ -35,19 +36,21 @@ pub use live::{
     fetch_channel_name, fetch_guild_name, fetch_guild_options, fetch_member_display,
     GuildLiveEntry, GuildLiveOptions,
 };
-pub use turn_gate::TurnGate;
 pub use manager::{DiscordManager, DiscordMessenger, ManagerPorts, Prepared, TenantRunner};
 pub use presence::build_presence;
 pub use tenant::{default_intents, run_tenant, GatewayBotUser, TenantConfig, TenantStatus};
+pub use turn_gate::TurnGate;
 // supervisor（twilight 非依存）が REST クライアントを型名で扱えるよう再エクスポート。
-pub use twilight_http::Client as HttpClient;
+pub use message_flow::strip_reply_prefix;
 pub use text::{split_message, to_discord_markdown};
+pub use twilight_http::Client as HttpClient;
 
 // よく使う契約を crate ルートへ再エクスポート（実装側の import を短くする）。
 pub use ports::{
     rate_limit_message, ActionRow, BotDirectory, BotRecord, BotStatus, Button, ButtonStyle,
-    DecisionOutcome, DeliverTarget, EmbedField, FileAttachment, IncomingChat, InlineMedia,
-    MemberDecision, MemberDmSender, MembershipService, Notifier, PersonaRecord, RateDecision,
-    RateExceeded, RateLimiter, RichEmbed, ShareRecord, Speaker, StatusSink, SubmitOutcome,
-    TurnDelivery, TurnError, TurnProcessor, TurnReply,
+    DecidedRequest, DecisionOutcome, DeliverTarget, DmMessageRef, EmbedField, FileAttachment,
+    IncomingChat, InlineMedia, MemberDecision, MemberDmSender, MembershipService, Notifier,
+    PersonaRecord, RateDecision, RateExceeded, RateLimiter, ReplyAncestor, RichEmbed,
+    ShareInviteDm, ShareRecord, Speaker, StatusSink, SubmitOutcome, TurnDelivery, TurnError,
+    TurnProcessor, TurnReply,
 };

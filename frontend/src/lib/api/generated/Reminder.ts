@@ -3,23 +3,23 @@
 /**
  * クライアントへ返すリマインド（クリーンビュー・snake_case）。
  */
-export type Reminder = { id: bigint, message: string, 
+export type Reminder = { id: bigint, message: string,
 /**
  * 送信予定日時 `'YYYY-MM-DD HH:MM:SS'`（ローカルタイム）。
  */
-trigger_at: string, 
+trigger_at: string,
 /**
  * 繰り返しの cron 式。単発は `None`。
  */
-repeat_rule: string | null, 
+repeat_rule: string | null,
 /**
  * `"dm" | "channel"`。
  */
-target_type: string, target_id: string | null, 
+target_type: string, target_id: string | null,
 /**
  * `"pending" | "sent" | "cancelled"`。
  */
-status: string, 
+status: string,
 /**
  * `"manual" | "todo" | "schedule" | "payment" | "birthday" | "webhook"`。
  */

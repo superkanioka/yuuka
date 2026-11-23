@@ -1,95 +1,130 @@
 <script lang="ts">
-	// 汎用モード（MCPアシスタント）設定カード（旧 loadAssistantConfig の Gemini/MCP/usage 部分）。
-	// mcp_assistant プリセットの owner にのみ親が描画する。
-	import { botAttributeApi } from "$lib/api/services";
-	import { ApiError } from "$lib/api/client";
-	import { pushToast } from "$lib/stores/toast";
-	import { confirmDialog, Button } from "$lib/components/ui";
-	import type { AssistantConfigResp } from "./configTypes";
+// 汎用モード（MCPアシスタント）の LLM機能カード（旧 loadAssistantConfig の Gemini 部分）。
+// Bot設定 › LLM機能（BotLlm）に置く。MCP の選択は Bot設定 › 連携の利用許可（BotAccess）へ移した。
+// mcp_assistant プリセットの owner にのみ親が描画する。
 
-	interface Props {
-		botId: string;
-	}
-	let { botId }: Props = $props();
+import { botAttributeApi } from "$lib/api/services";
+import {
+	confirmDialog,
+	SecretInput,
+	SecretSetMark,
+	Select,
+} from "$lib/components/ui";
+import { pushToast, toastError } from "$lib/stores/toast";
+import type { AssistantConfigResp } from "./configTypes";
 
-	let data = $state<AssistantConfigResp | null>(null);
-	let geminiKey = $state("");
+interface Props {
+	botId: string;
+}
+let { botId }: Props = $props();
 
-	$effect(() => {
-		void botId;
-		void load();
-	});
+let data = $state<AssistantConfigResp | null>(null);
+let geminiKey = $state("");
+let provider = $state("gemini");
+let model = $state("");
+const PROVIDER_OPTIONS = [{ value: "gemini", label: "Google Gemini" }];
+const modelOptions = $derived(
+	(data?.llm_models ?? []).map((m) => ({ value: m, label: m })),
+);
+let savingLlm = $state(false);
+let savingKey = $state(false);
+// 保存済みキーは伏せ字で表示し、入力が変わったときだけ保存できる。
+const MASK = "••••••••••••";
+// 既定値のままなら「既定値に戻す」は押せない。
+const isDefaultLlm = $derived(
+	!!data?.llm_defaults &&
+		provider === data.llm_defaults.provider &&
+		model === data.llm_defaults.model,
+);
+const canSaveKey = $derived(
+	!!data && !savingKey && geminiKey !== (data.has_gemini_key ? MASK : ""),
+);
 
-	async function load() {
-		try {
-			const res = (await botAttributeApi.assistantConfig(
-				botId,
-			)) as AssistantConfigResp;
-			if (!res.success) {
-				data = null;
-				return;
-			}
-			data = res;
-			geminiKey = res.has_gemini_key ? "••••••••••••" : "";
-		} catch {
+$effect(() => {
+	void botId;
+	void load();
+});
+
+async function load() {
+	try {
+		const res = (await botAttributeApi.assistantConfig(
+			botId,
+		)) as AssistantConfigResp;
+		if (!res.success) {
 			data = null;
+			return;
 		}
+		data = res;
+		provider = res.llm?.provider ?? "gemini";
+		model = res.llm?.model ?? "";
+		geminiKey = res.has_gemini_key ? MASK : "";
+	} catch {
+		data = null;
 	}
+}
 
-	const warnings = $derived.by(() => {
-		if (!data) return [] as string[];
-		const w: string[] = [];
-		if (!data.has_gemini_key)
-			w.push(
-				"⚠️ Bot専用のGemini APIキーが未設定です。設定されるまでこのBotは応答しません。",
-			);
-		if (!data.has_discord_token)
-			w.push(
-				"⚠️ 独自のDiscord Botトークンが未設定です。汎用モードは専用のDiscordクライアントとして動作するため、「Discord連携」ページの「Discord 独自Bot設定」から設定してください。",
-			);
-		if ((data.guilds ?? []).length === 0)
-			w.push("⚠️ 応答許可ギルドが未設定です。許可したギルドでのみ応答します。");
-		return w;
-	});
+const warnings = $derived.by(() => {
+	if (!data) return [] as string[];
+	const w: string[] = [];
+	if (!data.has_discord_token)
+		w.push(
+			"⚠️ 独自のDiscord Botトークンが未設定です。汎用モードは専用のDiscordクライアントとして動作するため、Bot設定の「Discord」→「接続」から設定してください。",
+		);
+	return w;
+});
 
-	const rateText = $derived.by(() => {
-		const rl = data?.rate_limits;
-		if (!rl) return "";
-		return `レート制限: ユーザー ${rl.userPerMinute}回/分・${rl.userPerDay}回/日、ギルド ${rl.guildPerDay}回/日（Admin設定で変更可）`;
-	});
-
-	async function saveKey() {
-		if (!geminiKey.trim()) {
-			const ok = await confirmDialog({
-				message:
-					"APIキーを削除しますか？ 削除するとこのBotは応答を停止します。",
-				danger: true,
-				confirmLabel: "削除する",
-			});
-			if (!ok) return;
-		}
-		try {
-			const res = await botAttributeApi.setGeminiKey({ botId, apiKey: geminiKey });
-			pushToast(res.message ?? "保存しました。", res.success ? "success" : "error");
-			await load();
-		} catch (err) {
-			pushToast(
-				err instanceof ApiError ? err.message : "通信エラーが発生しました。",
-				"error",
-			);
-		}
+async function saveLlm(inheritDefaults = false) {
+	savingLlm = true;
+	try {
+		const res = await botAttributeApi.setLlm({
+			botId,
+			provider,
+			model,
+			inheritDefaults,
+		});
+		pushToast(
+			res.message ?? "AI設定を保存しました。",
+			res.success ? "success" : "error",
+		);
+		if (res.success) await load();
+	} catch (err) {
+		toastError(err, "AI設定を保存できませんでした。");
+	} finally {
+		savingLlm = false;
 	}
+}
+
+async function saveKey(e: SubmitEvent) {
+	e.preventDefault();
+	if (!canSaveKey) return;
+	if (!geminiKey.trim()) {
+		const ok = await confirmDialog({
+			message: "APIキーを削除しますか？ 削除するとこのBotは応答を停止します。",
+			danger: true,
+			confirmLabel: "削除する",
+		});
+		if (!ok) return;
+	}
+	savingKey = true;
+	try {
+		const res = await botAttributeApi.setGeminiKey({
+			botId,
+			apiKey: geminiKey,
+		});
+		pushToast(
+			res.message ?? "保存しました。",
+			res.success ? "success" : "error",
+		);
+		await load();
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
+	} finally {
+		savingKey = false;
+	}
+}
 </script>
 
-<details class="config-card card">
-	<summary class="column-header badge-right">
-		<h3><span class="material-symbols-outlined header-icon-symbol">extension</span>汎用モード設定</h3>
-		<span class="badge badge-accent">OWNER専用</span>
-	</summary>
-	<p class="description-text">
-		サーバー常駐アシスタントの動作設定です。応答には「Bot専用のGemini APIキー」「独自Discordトークン」「応答許可ギルド」の設定が必要です。
-	</p>
-
+<section class="config-card card plain-fields">
 	{#if warnings.length > 0}
 		<div class="warnings">
 			{#each warnings as w (w)}
@@ -98,64 +133,72 @@
 		</div>
 	{/if}
 
-	<details class="form-group collapsible-group" open>
-		<summary>Bot専用 Gemini APIキー（必須）</summary>
-		<div class="key-row">
-			<input
-				type="password"
-				placeholder="このBot専用のAPIキーを入力"
-				autocomplete="new-password"
-				bind:value={geminiKey}
-			/>
-			<Button variant="primary" onclick={saveKey}>保存</Button>
+	<div class="field">
+		<label class="field-label" for="bot-llm-provider">LLMプロバイダ</label>
+		<div class="field-row">
+			<div class="field-input">
+				<Select
+					id="bot-llm-provider"
+					options={PROVIDER_OPTIONS}
+					bind:value={provider}
+					disabled={!data || savingLlm}
+					onchange={() => saveLlm()}
+				/>
+			</div>
+			<span class="row-spacer" aria-hidden="true"></span>
 		</div>
-		<span class="field-sub">
-			※あなた個人のAPIキーとは別に管理・暗号化保存されます。空欄で保存すると削除され、Botは応答を停止します。
-		</span>
-	</details>
+	</div>
 
-	<details class="form-group collapsible-group">
-		<summary>利用中のMCPサーバー</summary>
-		<p class="description-text mcp-guide">
-			MCPサーバーの登録・編集・削除は「MCPサーバー」タブで、表示中のBotごとに行います。
-		</p>
-		{#if (data?.mcp_servers ?? []).length === 0}
-			<span class="field-sub">
-				このBot専用のMCPサーバーは未登録です。「MCPサーバー」タブ（このBotを選択した状態）から登録してください。
-			</span>
-		{:else}
-			{#each data?.mcp_servers ?? [] as s (s.id)}
-				<div class="mcp-row">
-					<span class="mcp-name">{s.name}</span>
-					{#if s.system || !s.enabled}
-						<span class="field-sub">
-							（{[s.system ? "システムレベル・常時利用可" : "", !s.enabled ? "無効化中" : ""].filter(Boolean).join("・")}）
-						</span>
-					{/if}
-				</div>
-			{/each}
-		{/if}
-	</details>
-
-	<details class="form-group collapsible-group">
-		<summary>利用量（直近14日）</summary>
-		<div class="usage">
-			{#if (data?.usage ?? []).length === 0}
-				<span class="field-sub">まだ利用がありません。</span>
-			{:else}
-				{#each data?.usage ?? [] as u (u.date)}
-					<div class="usage-row">
-						<span class="field-sub">{u.date}</span>
-						<span>{u.count} 回</span>
-					</div>
-				{/each}
-			{/if}
+	<div class="field">
+		<label class="field-label" for="bot-llm-model">モデル</label>
+		<div class="field-row">
+			<div class="field-input">
+				<Select
+					id="bot-llm-model"
+					options={modelOptions}
+					bind:value={model}
+					disabled={!data || savingLlm}
+					onchange={() => saveLlm()}
+				/>
+			</div>
+			<button
+				type="button"
+				class="icon-action"
+				aria-label="既定値に戻す"
+				title={data?.llm_defaults
+					? `既定値に戻す（${data.llm_defaults.provider} / ${data.llm_defaults.model}）`
+					: "既定値に戻す"}
+				disabled={!data || savingLlm || isDefaultLlm}
+				onclick={() => saveLlm(true)}
+				><span class="material-symbols-outlined" aria-hidden="true">restart_alt</span></button>
 		</div>
-		{#if rateText}<span class="field-sub">{rateText}</span>{/if}
-	</details>
-</details>
+		<span class="field-sub">無料枠・利用上限はGoogle AI Studioで確認できます。</span>
+	</div>
+
+	<form class="field" onsubmit={saveKey}>
+		<label class="field-label" for="bot-gemini-key">API キー<span class="required" aria-label="必須">*</span><SecretSetMark set={data?.has_gemini_key} /></label>
+		<div class="field-row">
+			<div class="field-input">
+				<SecretInput
+					id="bot-gemini-key"
+					placeholder="このBot専用のGemini APIキーを入力"
+					bind:value={geminiKey}
+					disabled={savingKey}
+				/>
+			</div>
+			<button
+				type="submit"
+				class="icon-action"
+				disabled={!canSaveKey}
+				aria-label="API キーを保存"
+				title="API キーを保存"
+			><span class="material-symbols-outlined" aria-hidden="true">check</span></button>
+		</div>
+	</form>
+</section>
 
 <style>
+	/* 入力欄は Bot登録名カード（BotNameCard）と同じ見た目にそろえる。 */
 	.warnings {
 		display: flex;
 		flex-direction: column;
@@ -165,31 +208,36 @@
 	.warn {
 		color: #f59e0b;
 	}
-	.key-row {
+	.field {
+		margin-top: 12px;
+	}
+	.field-label {
+		display: block;
+		margin-bottom: 4px;
+		font-size: 0.85rem;
+		color: var(--text-secondary);
+	}
+	.field-row {
 		display: flex;
 		gap: 12px;
 	}
-	.key-row input {
-		flex-grow: 1;
+	.field-input {
+		position: relative;
+		flex: 1;
+		min-width: 0;
 	}
-	.mcp-guide {
-		margin: 4px 0 8px;
+	.field-input :global(input),
+	.field-input :global(.inline-select) {
+		width: 100%;
+		box-sizing: border-box;
 	}
-	.mcp-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 4px 0;
+	.required {
+		margin-left: 2px;
+		color: #ef4444;
+		font-weight: 700;
 	}
-	.mcp-name {
-		font-size: 0.9rem;
-	}
-	.usage {
-		margin-top: 8px;
-	}
-	.usage-row {
-		display: flex;
-		justify-content: space-between;
-		max-width: 280px;
+	.row-spacer {
+		width: 40px;
+		flex-shrink: 0;
 	}
 </style>

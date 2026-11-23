@@ -1,15 +1,15 @@
-// authApi — user-scoped（scope:'user'）。src/server/routes/authRoutes.ts に対応。
-// /api/login|register|logout|me|setup* は botId 除外（プレフィックス一致）。
+// authApi — user-scoped（scope:'user'）。ログインは OIDC プロバイダー（/api/auth/oidc/start へのページ遷移）で行う。
+// /api/logout|me は botId 除外（プレフィックス一致）。
 import { api } from "../client";
-import type {
-	MeResponse,
-	SetupStatusResponse,
-	LoginResponse,
-	RegisterResponse,
-	ApiResponse,
-} from "../types";
+import type { ApiResponse, MeResponse } from "../types";
 
 const USER = { scope: "user" } as const;
+
+/** GET /api/auth/oidc/provider。`label` はログイン先の表示名（ログインできないときは null）。 */
+export type AuthProviderResponse = ApiResponse<{
+	enabled: boolean;
+	label: string | null;
+}>;
 
 export const authApi = {
 	/**
@@ -19,48 +19,12 @@ export const authApi = {
 	me: (isBootstrap = false) =>
 		api.get<MeResponse>("/api/me", { ...USER, isBootstrap }),
 
-	/** GET /api/setup/status — 共通エンベロープ外（success を持たない） */
-	setupStatus: () =>
-		api.get<SetupStatusResponse>("/api/setup/status", { ...USER, isBootstrap: true }),
-
-	/** POST /api/setup — 初期セットアップ（最初のユーザー＝管理者登録） */
-	setup: (body: {
-		discordId: string;
-		username: string;
-		password: string;
-		geminiApiKey: string;
-	}) => api.post<ApiResponse>("/api/setup", body, USER),
-
-	/**
-	 * POST /api/admin/default-bot/token — 初期セットアップ Step2:
-	 * system_default Bot のトークン登録（管理者登録直後の bot-setup フォーム）。
-	 */
-	setDefaultBotToken: (body: { token: string }) =>
-		api.post<ApiResponse>("/api/admin/default-bot/token", body, USER),
-
-	/** POST /api/login — 認証は Discord ID + パスワード（authRoutes.ts:367） */
-	login: (body: { discordId: string; password: string }) =>
-		api.post<LoginResponse>("/api/login", body, USER),
-
-	/**
-	 * POST /api/register — DM チャレンジ発行。
-	 * 成功時は { success, pending:true }（authRoutes.ts:282）。pending:true なら
-	 * /api/register/verify で確認コードを確定する。
-	 */
-	register: (body: {
-		discordId: string;
-		username: string;
-		password: string;
-		inviteCode?: string;
-		geminiApiKey?: string;
-	}) => api.post<RegisterResponse>("/api/register", body, USER),
-
-	/**
-	 * POST /api/register/verify — DM チャレンジ確定。
-	 * サーバは { discordId, code } を受ける（authRoutes.ts:297）。
-	 */
-	registerVerify: (body: { discordId: string; code: string }) =>
-		api.post<ApiResponse>("/api/register/verify", body, USER),
+	/** GET /api/auth/oidc/provider — ログイン画面向け（未ログインで呼ぶ）。 */
+	provider: () =>
+		api.get<AuthProviderResponse>("/api/auth/oidc/provider", {
+			...USER,
+			isBootstrap: true,
+		}),
 
 	/** POST /api/logout */
 	logout: () => api.post<ApiResponse>("/api/logout", {}, USER),

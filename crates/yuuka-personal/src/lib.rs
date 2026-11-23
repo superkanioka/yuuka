@@ -16,6 +16,7 @@ pub mod cron;
 pub mod dto;
 pub mod repo;
 pub mod routes;
+pub mod service;
 pub mod tools;
 
 pub use routes::routes;
@@ -53,6 +54,7 @@ mod tests {
     use tower::ServiceExt;
     use yuuka_core::{AuthError, BotId, UserId, UserScope};
     use yuuka_types::{Role, SessionUser};
+    use yuuka_web::test_support::{with_bot_query, TEST_BOT_ID};
     use yuuka_web::{AppState, AuthBackend, Db, WebConfig};
 
     use crate::dto::NewContact;
@@ -61,10 +63,10 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     // Node migrations.ts の contacts DDL + v3 で後付けされる bot_id 列を反映。
-    const CONTACTS_DDL: &str = "CREATE TABLE contacts (
+    const CONTACTS_DDL: &str = "DROP TABLE IF EXISTS contacts; CREATE TABLE contacts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         name TEXT NOT NULL,
         birthday TEXT,
         relationship TEXT,
@@ -76,20 +78,21 @@ mod tests {
         updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
     );";
 
-    // V17__baseline.sql の clipboard_entries を反映（bot_id は後付け列・default system_default）。
-    const CLIPBOARD_DDL: &str = "CREATE TABLE clipboard_entries (
+    // clipboard_entries の単体fixture（V27同様、bot_id は NOT NULL・既定値なし）。
+    const CLIPBOARD_DDL: &str =
+        "DROP TABLE IF EXISTS clipboard_entries; CREATE TABLE clipboard_entries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
         content TEXT NOT NULL,
         expires_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-        bot_id TEXT NOT NULL DEFAULT 'system_default'
+        bot_id TEXT NOT NULL
     );";
 
     // V17__baseline.sql の context_notes を反映（PK(user_id, bot_id)・upsert 対象）。
-    const CONTEXT_NOTES_DDL: &str = "CREATE TABLE context_notes (
+    const CONTEXT_NOTES_DDL: &str = "DROP TABLE IF EXISTS context_notes; CREATE TABLE context_notes (title TEXT NOT NULL DEFAULT 'Shared note',
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         content TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
         PRIMARY KEY (user_id, bot_id)
@@ -102,7 +105,9 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
             conn.execute_batch(CONTACTS_DDL).expect("create contacts");
             conn.execute_batch(CLIPBOARD_DDL).expect("create clipboard");
             conn.execute_batch(CONTEXT_NOTES_DDL)
@@ -223,7 +228,7 @@ mod tests {
         }
     }
 
-    fn app() -> axum::Router {
+    async fn app() -> axum::Router {
         let auth = Arc::new(FakeAuth {
             user: SessionUser {
                 discord_id: "u".to_owned(),
@@ -231,13 +236,15 @@ mod tests {
                 role: Role::User,
             },
         });
-        let state = AppState::new(auth, WebConfig::default(), seed_db());
-        super::routes().with_state(state)
+        let db = seed_db();
+        yuuka_web::test_support::seed_bot(&db, TEST_BOT_ID, "u").await;
+        let state = AppState::new(auth, WebConfig::default(), db);
+        with_bot_query(super::routes().with_state(state), TEST_BOT_ID)
     }
 
     #[tokio::test]
     async fn route_save_then_list() {
-        let app = app();
+        let app = app().await;
         let save = app
             .clone()
             .oneshot(
@@ -286,6 +293,7 @@ mod tests {
     #[tokio::test]
     async fn route_save_rejects_bad_birthday() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -303,6 +311,7 @@ mod tests {
     #[tokio::test]
     async fn route_requires_auth() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/api/contacts")
@@ -331,7 +340,7 @@ mod tests {
     /// camelCase 受理により、同値を送る update で連絡先情報が保持されることを凍結する。
     #[tokio::test]
     async fn route_save_update_preserves_contact_info() {
-        let app = app();
+        let app = app().await;
         // 新規作成（contactInfo つき）。
         let create = app
             .clone()
@@ -480,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_context_note_roundtrip() {
-        let app = app();
+        let app = app().await;
         // 初期は空・max_length 同梱。
         let get0 = app
             .clone()
@@ -544,6 +553,7 @@ mod tests {
         let over = "あ".repeat(10_001);
         let body = serde_json::json!({ "content": over }).to_string();
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -571,6 +581,7 @@ mod tests {
     async fn route_clipboard_delete_missing_is_200_false() {
         // Node parity: 該当無でも 200 + {success:false, message}。
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -594,6 +605,7 @@ mod tests {
     #[tokio::test]
     async fn route_clipboard_requires_auth() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/api/clipboard")

@@ -1,7 +1,7 @@
 # Yuuka Desktop — バックエンド API 増設仕様
 
 対象: バックエンド（Node モノリス）への増設。提案段階（未実装）。
-前提: [architecture.md](architecture.md)。既存規範は [architecture_v2.md](../../architecture/architecture_v2.md) に従う。
+前提: [architecture.md](architecture.md)。（旧 Node 実装時点の規範 [architecture_v2.md](../../architecture/architecture_v2.md) は履歴資料で、現行の規範ではない。本書が想定する Node モノリスは撤去済みで、現行のバックエンドは Rust（`crates/yuuka-supervisor/src/ws.rs`・`crates/yuuka-auth`）。詳細は [index.md](index.md) の注記を参照。本文中の `src/*.ts` へのリンクは切れている。）
 
 この章は **クライアント非依存の汎用チャット API** を定義する。Discord にも Windows にも縛られない（将来の他クライアントも同じ API を使う）。
 
@@ -50,6 +50,20 @@
 
 - 保存先: Redis `device_auth:{sha256(device_code)}` に `{ user_code, status:"pending", device_name, created_at }`、TTL=`expires_in`。Redis 不通時は in-memory フォールバック（セッションと同様）。
 - `user_code` はレート制限つきで衝突回避・総当り耐性のため十分な空間（例 8 文字 Crockford Base32）。
+- 回数制限: 送信元ごとに 60 秒あたり 10 件まで。送信元は IPv4 ならアドレス、IPv6 なら /64 単位で数える。`X-Forwarded-For` は直前の接続元が `TRUSTED_PROXIES` のときだけ使う。
+- 保留中のコードは 10,000 件まで。超えたら、未承認のうち最も古いコードを失効させて新しいコードを発行する（承認済みでトークン交換待ちのコードは失効させない）。
+
+```
+レスポンス 429（回数制限、または承認済みコードだけで保留上限が埋まっている）:
+Retry-After: <秒>                           // 回数制限なら窓が空くまでの秒数、上限なら 30
+{ "error": "too_many_requests", "message": "リクエストが多すぎます。しばらくしてから再度お試しください。" }
+```
+
+### 1.1a `POST /api/auth/device/lookup`（auth: user・Rust 追加）
+
+body `{ user_code }` → `{ success, device_name, age_secs, expires_in }`（不明は 404、承認済みは 409）。承認前に端末名と発行からの経過時間を見せるための照会で、状態は変えない。`expires_in` はレコードの失効時刻までの残り秒。コードを知るだけで端末名を引けないようログイン済み利用者に限定する。承認画面は `?code=` を入力済みにせず、利用者が手入力したコードの照会結果を確認してから承認する（RFC 8628 §5.4 対策・#207）。
+
+- `device_name` は `/device/code` を呼んだ側の自己申告。サーバは発行時に制御文字・書字方向の制御文字・ゼロ幅文字を空白にして保存し、画面では「アプリが申告した端末名」として表示する。
 
 ### 1.2 `POST /api/auth/device/approve`（auth: user）
 
@@ -60,9 +74,10 @@
 処理: user_code から device_auth レコードを引き、status を "approved" にし approved_user = ctx.user.discordId を記録
 レスポンス 200: { success: true, device_name }   // 画面に「(端末名) を許可しました」
 失効/不一致: { success:false, message } （404/410）
+承認済み:   { success:false, message } （409）  // 承認を上書きしない（別ユーザーによる乗っ取り防止）
 ```
 
-- **必ず `auth:"user"`**。承認はログイン済みユーザー本人の操作。CSRF は既存の Origin チェック（[routeRegistry](../../../src/server/routeRegistry.ts)）が効く。
+- **必ず `auth:"user"`**。承認はログイン済みユーザー本人の操作。CSRF は既存の Origin チェック（`routeRegistry`）が効く。
 - 任意強化: 承認前に「この端末を許可しますか？ 端末名: …」の確認 UI を `/device` に出す（フィッシング耐性）。
 
 ### 1.3 `POST /api/auth/device/token`（auth: none, device_code で認可）
@@ -86,12 +101,12 @@
 - 生成: CSPRNG 生トークン。クライアントへは生で返し、サーバは **`sha256(token)` のみ保存**（セッションと同方針）。
 - 保存表 `desktop_tokens`（§5）。検証は `desktopAuthService.verifyToken(token) → SessionUser | null`。
 - TTL: 既定 90 日・アクセス毎スライディング延長（`last_used_at` 更新）。設定 `DESKTOP_TOKEN_TTL_DAYS`（任意）。
-- 失効: ユーザーが Web から端末単位で revoke（§4）。パスワード変更時は当該ユーザーの全 desktop_tokens も失効（`destroyAllForUser` 相当を拡張）。
+- 失効: ユーザーが Web から端末単位で revoke（§4）。アカウント削除時は FK CASCADE で全 desktop_tokens が消える。（旧仕様の「パスワード変更時の全失効」は、sk-account 一本化でパスワード変更が無くなったため廃止。）
 - クライアント保存: Windows 資格情報マネージャ（keyring）。平文ファイル禁止（NFR-4）。
 
 ### 1.5 Bearer 認証の組み込み
 
-- 既存の `RouteAuth = "none"|"user"|"admin"` の `resolveUser()`（[routeRegistry](../../../src/server/routeRegistry.ts)）を拡張し、**`Authorization: Bearer <token>` があれば `desktopAuthService.verifyToken` で SessionUser を解決**する（Cookie が無くても通る）。これにより REST（`GET /api/bots` 等）も Bearer で利用可能。
+- 既存の `RouteAuth = "none"|"user"|"admin"` の `resolveUser()`（`routeRegistry`）を拡張し、**`Authorization: Bearer <token>` があれば `desktopAuthService.verifyToken` で SessionUser を解決**する（Cookie が無くても通る）。これにより REST（`GET /api/bots` 等）も Bearer で利用可能。
 - 優先順位: Cookie セッション → Bearer の順で解決（どちらかが成功すれば認証成立）。
 - WS upgrade（§3）も同じ `verifyToken` を使う。
 - ネイティブ Bearer は CSRF 非該当のため、Bearer 認証済みリクエストは Origin チェックを免除してよい（Cookie 認証時のみ Origin チェック）。
@@ -100,7 +115,7 @@
 
 ## 2. サーバ基盤: WebSocket 受け口の新設
 
-現状 [`src/server.ts`](../../../src/server.ts) は素の `node:http` で `upgrade` を処理していない。WS を同一ポートで受けるため `server.on("upgrade", ...)` を追加する。
+現状 `src/server.ts` は素の `node:http` で `upgrade` を処理していない。WS を同一ポートで受けるため `server.on("upgrade", ...)` を追加する。
 
 ### 2.1 WebSocket ライブラリの方針（要承認の例外）
 
@@ -152,8 +167,10 @@ httpServer.on("upgrade", (req, socket, head) => {
 {
   "type": "msg",
   "text": "明日10時に歯医者リマインド",
+  "messageId": "<発話ごとの安定ID、再送時は同じID>", // R13。最大128バイト、任意
   "image": { "mime": "image/png",  "data": "<base64>" },   // 任意
   "audio": { "mime": "audio/ogg",  "data": "<base64>" },   // 任意
+  "attachments": [{ "mime": "video/mp4", "data": "<base64>" }], // 任意・順序付き複数添付
   "replyToId": "<任意: 返信チェーン>"
 }
 
@@ -163,6 +180,8 @@ httpServer.on("upgrade", (req, socket, head) => {
 // keepalive（任意。WS ping/pong を使うなら不要）
 { "type": "ping" }
 ```
+
+R13の保存候補は現在のフレームの写真/動画だけで、`image → audio → attachments[]` の順にindexを付ける（音声は保存対象外）。合計10件まで、既存フレーム上限と保存対象合計20MiB上限を適用する。再送では同じ `messageId` を使う。省略する旧クライアントには受信ごとのIDを割り当てるため、別受信をまたぐ冪等性が必要なクライアントはIDを送る。デスクトップ実装はフレーム生成時にIDを付け、再送・cloneで保持する。
 
 > Bot を切り替えたい場合はメッセージで切り替えるのではなく、**WS を再接続**（`?botId=` を変えて張り直す）。これにより「1 接続 1 Bot」と「接続束縛 botId の検証」が単純に保たれる。
 
@@ -226,7 +245,7 @@ async function handleMsg(ws, user, botId, m) {
 }
 ```
 
-- **`processMessage` は無改修**。Discord 経路（`bot.ts`）の `asyncDelivery` 組み立てと完全に同型（[`src/bot.ts:594`](../../../src/bot.ts)）で、送り先だけ Discord → WS に替える。
+- **`processMessage` は無改修**。Discord 経路（`bot.ts`）の `asyncDelivery` 組み立てと完全に同型（`src/bot.ts:594`）で、送り先だけ Discord → WS に替える。
 - `notifier.ts` は通さない（重い処理の最終結果も WS `push` で返す）。
 - `serializeRich` は [architecture.md §7](architecture.md)。
 
@@ -259,7 +278,7 @@ POST /api/devices/revoke     (auth: user) { id }  → { success }   // sha256 �
 
 ## 5. DB スキーマ追加（v13）
 
-[`src/db/migrations.ts`](../../../src/db/migrations.ts) に `migrateToDesktopTokens` を追加（現 `SCHEMA_VERSION="12"` → **"13"**）。既存テーブル不変・冪等追加（後方互換）。
+`src/db/migrations.ts` に `migrateToDesktopTokens` を追加（現 `SCHEMA_VERSION="12"` → **"13"**）。既存テーブル不変・冪等追加（後方互換）。
 
 ```sql
 CREATE TABLE IF NOT EXISTS desktop_tokens (

@@ -3,6 +3,13 @@
 # ==============================================================================
 # システム全体設定（全ユーザー共有）
 # ユーザー別の設定（Gemini API Key/Model、Google OAuth等）は管理画面から設定します。
+#
+# これはローカル/開発でバックエンドを直接動かす場合のテンプレートです（docs/guide/setup.md 参照）。
+# 本番・dev は同じスキーマの deploy/prod/config.yaml.example / deploy/dev/config.yaml.example
+# （ポート・OIDC・BASE_URL 等をあらかじめ埋めたもの）を使います。
+# 項目を追加・変更する場合は crates/yuuka-core/src/config.rs の Config 構造体が定義の正であり、
+# 対応するキーはこの 3 ファイル（本ファイル / deploy/dev/config.yaml.example / deploy/prod/config.yaml.example）
+# で揃えてください。
 # ==============================================================================
 
 
@@ -13,27 +20,41 @@ DB_PATH: "./data/yuuka.db"
 # 保存時暗号化シークレット (Encryption at Rest)
 # ==============================================================================
 # 保存時暗号化のマスターシークレット YUUKA_ENCRYPTION_SECRET 【必須】は、このファイルではなく
-# 環境変数で設定します（.env ファイルまたは systemd の Environment 等）。
-# .env.example を .env にコピーして設定してください。
+# 実環境変数で設定します（バックエンドは .env を自動読込しません。docs/guide/setup.md 参照）。
+# .env.example を参考に、値は export するか systemd の Environment= 等で渡してください。
 
 # ==============================================================================
 # 動作チューニング
 # ==============================================================================
-# 返信チェーン解決の最大遡り深度（無限ループ防止）
+# 返信チェーン解決の最大遡り深度（無限ループ防止）。
+# 注意: 現在の Rust バックエンドは返信チェーン解決そのものを未実装のため、この値は読まれません
+# （Node 版の名残。crates/yuuka-core/src/config.rs の Config には対応フィールドがありません）。
 REPLY_CHAIN_MAX_DEPTH: 10
 
 # Web管理画面セッションの有効期限（日数、スライディングウィンドウ延長）
 SESSION_TTL_DAYS: 7
 
 # 初期Adminロールを付与するDiscordユーザーID（カンマ区切り、任意。
-# 未設定の場合は最初に登録したユーザーがAdminになります）
+# 未設定の場合は全員Userになります。管理者の初回ログイン前に指定してください）
 # ADMIN_DISCORD_IDS: ""
 
 # Redis接続用URL (インメモリDBキャッシュ・セッション管理用)
 REDIS_URL: "redis://127.0.0.1:6379"
 
 # リマインダーをチェックする間隔 (cron式、デフォルトは毎分)
+# 不正な式は起動時に警告を出して既定（毎分）を使います。以下のチューニング値も同様です。
 REMINDER_CRON: "* * * * *"
+
+# 会話時に思い出す過去の記憶（シナプス）の件数（1 以上）
+# SYNAPSE_RECALL_K: 5
+# 最近の記憶を上位へ持ち上げる重み（0 で無効）と、その効果が半分になるまでの時間（時間・0 で無効）
+# SYNAPSE_RECENCY_WEIGHT: 0.15
+# SYNAPSE_RECENCY_HALFLIFE_HOURS: 18
+
+# デスクトップアプリのログイン有効期限（日数、最終利用から延長・1〜36500）
+# DESKTOP_TOKEN_TTL_DAYS: 90
+# デスクトップアプリのデバイス認証コードの有効期限（秒・1〜86400）
+# DESKTOP_DEVICE_CODE_TTL_SEC: 600
 
 # ==============================================================================
 # 管理画面サーバー設定 (Dashboard Settings)
@@ -43,19 +64,34 @@ PORT: 7854
 
 # 管理画面サーバーがバインドするホスト名
 # デフォルトはローカルからの接続のみ受け付けます (127.0.0.1)。
-# Cloudflare Tunnels や Docker 等のリバースプロキシを介して公開する場合は
-# すべてのインターフェース ("0.0.0.0") に変更してください。
+# 別のマシンのリバースプロキシから受ける場合は、すべてのインターフェース ("0.0.0.0") に変更してください
+# （同じホストのトンネル / プロキシなら 127.0.0.1 のままでよい）。
 HOST: "127.0.0.1"
 
 # ==============================================================================
-# 招待コード (Invite Codes)
+# ログイン (OIDC)
 # ==============================================================================
-# ユーザー登録に必須の招待コード。起動時にDBに投入されます（既存のものは重複投入されません）。
-# 管理者が自由に追加・削除できます。各コードは1回限り使用可能です。
-# ※ 必ず推測されにくい独自の値に変更してください。
-INVITE_CODES:
-  - change-me-to-random-code-1
-  - change-me-to-random-code-2
+# 本人認証は OIDC プロバイダーだけで行います。Yuuka はパスワードを持ちません。
+# OIDC_ISSUER を省略すると標準の sk-account (https://account.sk-9.net) を使います。
+# 別の OIDC プロバイダーを使う場合は OIDC_ISSUER を指定してください。Yuuka は利用者を
+# Discord ID で識別するため、ID トークンの OIDC_DISCORD_ID_CLAIM に Discord ID が必要です。
+#
+# プロバイダーには次を登録します（BASE_URL が https://example.com の場合）。
+#   redirect_uri:           https://example.com/api/auth/oidc/callback
+#   backchannel_logout_uri: http://<Yuuka のホスト>:<PORT>/api/auth/oidc/backchannel-logout（任意）
+# OIDC_ISSUER: "https://account.sk-9.net"
+# サーバーからプロバイダーへ問い合わせる内部 URL（同じマシンなら。省略時は OIDC_ISSUER）
+# OIDC_INTERNAL_URL: "http://127.0.0.1:3100"
+OIDC_CLIENT_ID: "yuuka"
+# クライアントシークレット（未設定だとログインできません）
+OIDC_CLIENT_SECRET: ""
+# OIDC_SCOPE: "openid profile discord"
+# OIDC_DISCORD_ID_CLAIM: "discord_id"
+# ログインボタンの表示名（省略時は標準なら "sk-9 Account"、それ以外は issuer のホスト名）
+# OIDC_LABEL: "sk-9 Account"
+# 初回ログイン時に Admin として作成する Discord ID（未設定なら全員 User。管理者の初回ログイン前に指定）
+# ADMIN_DISCORD_IDS:
+#   - "123456789012345678"
 
 # ==============================================================================
 # Google OAuth2 システム共通設定 (System-wide Google OAuth)
@@ -95,11 +131,20 @@ TERMS_URL: "/terms"
 GOOGLE_SITE_VERIFICATION: ""
 
 # ==============================================================================
-# Instagram 連携 (Instagram → Discord 自動転送・任意)
+# MCP Apps のサンドボックス用オリジン (MCP_SANDBOX_ORIGIN)
 # ==============================================================================
-# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します（§3.15）。
-# ⚠️ Rust 実装のみの機能です（Node 版では動作しません）。
-# Docker 運用では deploy/<インスタンス>/config.yaml 側に書きます。
+# MCP サーバーが返す画面（MCP Apps）を、本体と別のオリジンで動かすためのオリジンです。
+# 例: https://mcp-sandbox.example.com （BASE_URL と別のホスト名を同じ Yuuka に向けておく）
+# 空欄の場合は不透明オリジン（iframe の sandbox に allow-same-origin を付けない）で動かします。
+# 本体からは隔離されますが、画面の中で localStorage 等は使えません。
+# 詳しくは docs/design/mcp_standard_protocol.md を参照してください。
+MCP_SANDBOX_ORIGIN: ""
+
+# ==============================================================================
+# Instagram 連携 (Instagram → Discord 自動転送・fork 独自・任意)
+# ==============================================================================
+# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します（§3.16）。
+# 本番では deploy/prod/config.yaml 側に書きます。
 
 # 転送先DiscordチャンネルID。空欄なら連携サービスは登録されません。
 INSTAGRAM_CHANNEL_ID: ""

@@ -6,7 +6,7 @@ import type { SessionUser } from "./SessionUser";
  *
  * 既存 Node レスポンス `{success:true, user, privacyPolicyUrl, termsUrl}` に一致させる。
  */
-export type MeData = { user: SessionUser, 
+export type MeData = { user: SessionUser,
 /**
  * Node は `publicLegalUrls()` で既定 `""` を**常に emit**する（常在キー）。
  * wire parity のため `Option` ではなく `String`（未設定は空文字）。

@@ -1,49 +1,62 @@
+import type { BudgetLimit as WireBudgetLimit } from "./generated/BudgetLimit";
+import type { BudgetLimitListData } from "./generated/BudgetLimitListData";
+import type { CategoryTotal as WireCategoryTotal } from "./generated/CategoryTotal";
+import type { ClipboardEntry as WireClipboardEntry } from "./generated/ClipboardEntry";
+import type { ClipboardListData } from "./generated/ClipboardListData";
+import type { Contact as WireContactView } from "./generated/Contact";
+import type { ContactListData } from "./generated/ContactListData";
+import type { ContextNoteData } from "./generated/ContextNoteData";
+import type { Credential as WireCredentialView } from "./generated/Credential";
+import type { CredentialListData } from "./generated/CredentialListData";
+import type { DayPlanBlock as WireDayPlanBlock } from "./generated/DayPlanBlock";
+import type { Envelope } from "./generated/Envelope";
+import type { Expense as WireExpenseRecord } from "./generated/Expense";
+import type { ExpenseListData } from "./generated/ExpenseListData";
+import type { MeData } from "./generated/MeData";
+import type { MonthlyTrendPoint as WireMonthlyTrendPoint } from "./generated/MonthlyTrendPoint";
+import type { Persona as WirePersonaRecord } from "./generated/Persona";
+import type { PersonaListData } from "./generated/PersonaListData";
+import type { PlannedPayment as WirePlannedPayment } from "./generated/PlannedPayment";
+import type { PlannedPaymentListData } from "./generated/PlannedPaymentListData";
+import type { Playbook as WirePlaybookRecord } from "./generated/Playbook";
+import type { PlaybookListData } from "./generated/PlaybookListData";
+import type { PlaybookRun as WirePlaybookRunRecord } from "./generated/PlaybookRun";
+import type { PlaybookSchedule as WirePlaybookScheduleRecord } from "./generated/PlaybookSchedule";
+import type { Reminder as WireReminderRecord } from "./generated/Reminder";
+import type { ReminderListData } from "./generated/ReminderListData";
+import type { RunListData } from "./generated/RunListData";
+import type { Schedule as WireScheduleRecord } from "./generated/Schedule";
+import type { ScheduleListData } from "./generated/ScheduleListData";
+import type { SessionUser as WireSessionUser } from "./generated/SessionUser";
+import type { TaskData } from "./generated/TaskData";
+import type { TaskDetailData } from "./generated/TaskDetailData";
+import type { TaskListData } from "./generated/TaskListData";
+import type { TaskProgressLog as WireTaskProgressLogRecord } from "./generated/TaskProgressLog";
+import type { TimelineDayData } from "./generated/TimelineDayData";
+import type { TimelineNeighborsData } from "./generated/TimelineNeighborsData";
+import type { TimelineRecord as WireTimelineRecord } from "./generated/TimelineRecord";
+import type { Todo as WireTodoRecord } from "./generated/Todo";
+import type { TodoWithSubtasks as WireTodoWithSubtasks } from "./generated/TodoWithSubtasks";
+import type { JsonWire } from "./wire";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 共通 API 型定義（型付き API クライアント層）
 //
 // - サーバの大半のレスポンスは { success: boolean; message?: string } & payload
 //   の「トップレベル直置き」形状（`data` ラッパは無い）。→ ApiResponse<T> で表現。
-// - 機密列（*_encrypted / *_iv / *_tag・password_hash・salt 等）は zod ビュー
-//   スキーマ（src/types/apiViews.ts）で strip 済みのため、ここでも露出フィールド
-//   のみを型化する。全網羅ではなく、フロントが参照する主要フィールドを厚めに定義。
-// - 参照元: src/server/routes/*.ts, src/db/*Repo.ts, src/types/apiViews.ts
+// - Rust wire DTO（ts-rs 生成型・generated/）がある同一契約は生成型を使う。i64 の
+//   bigint → number の変換だけを JsonWire<T>（wire.ts）で行う。Rust DTO が未生成の
+//   管理用契約は手書きで維持する。
+// - PWA の camelCase / string ID 契約は別 wire 契約。clients/pwa/src/api/contracts.ts
+//   で独立管理し、管理画面の生成型を PWA から直接 import しない（wire.ts 参照）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 共通エンベロープ。ペイロードはトップレベル直置き（`data` ラッパ不在）。 */
-export type ApiResponse<T = unknown> = { success: boolean; message?: string } & T;
+/** 共通エンベロープ（Rust `Envelope<T>` の生成型）。ペイロードはトップレベル直置き。 */
+export type ApiResponse<T = unknown> = Envelope<T>;
+export type SessionUser = WireSessionUser;
 
-// ─── auth / session ──────────────────────────────────────────────────────────
-
-export interface SessionUser {
-	discordId: string;
-	username: string;
-	role: "user" | "admin";
-}
-
-/** GET /api/me */
-export type MeResponse = ApiResponse<{
-	user: SessionUser;
-	termsUrl?: string;
-	privacyUrl?: string;
-	usageUrl?: string;
-}>;
-
-/** GET /api/setup/status（共通エンベロープの例外: success を持たない） */
-export interface SetupStatusResponse {
-	needSetup: boolean;
-	termsUrl?: string;
-	privacyUrl?: string;
-	usageUrl?: string;
-}
-
-/** POST /api/login */
-export type LoginResponse = ApiResponse<{ user?: SessionUser }>;
-
-/**
- * POST /api/register（DM チャレンジ発行 → /api/register/verify で確定）。
- * サーバは本人確認のため常に pending:true を返す（authRoutes.ts:282）。
- */
-export type RegisterResponse = ApiResponse<{ pending?: boolean }>;
+/** GET /api/me。法的 URL は未設定でも空文字で常に返る。 */
+export type MeResponse = ApiResponse<MeData>;
 
 // ─── bots ────────────────────────────────────────────────────────────────────
 
@@ -82,8 +95,9 @@ export type PresetsResponse = ApiResponse<{ presets: PresetOption[] }>;
 
 export interface BotShareView {
 	bot_id: string;
-	grantee_id: string;
-	grantee_username?: string;
+	shared_user_id: string;
+	shared_username?: string | null;
+	status: string;
 	created_at?: string;
 }
 export type BotSharesResponse = ApiResponse<{ shares: BotShareView[] }>;
@@ -97,263 +111,105 @@ export type BotUsageResponse = ApiResponse<{
 
 export type TodoPriority = "high" | "medium" | "low";
 
-export interface TodoRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	title: string;
-	description: string | null;
-	due_date: string | null;
-	start_date: string | null;
-	priority: TodoPriority | null;
-	tags: string;
-	status: "open" | "done";
-	progress: number;
-	parent_id: number | null;
-	linked_payment_id: number | null;
-	due_reminded: number;
-	repeat_rule: string | null;
-	repeat_until: string | null;
-	repeat_count: number | null;
-	created_at: string;
-	updated_at: string;
-}
+export type TodoRecord = JsonWire<WireTodoRecord>;
 
-export interface TodoWithSubtasks extends TodoRecord {
-	subtasks: TodoWithSubtasks[];
-	effective_progress: number;
-}
+export type TodoWithSubtasks = JsonWire<WireTodoWithSubtasks>;
 
-export interface TaskProgressLogRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	todo_id: number;
-	progress: number;
-	note: string | null;
-	created_at: string;
-}
+export type TaskProgressLogRecord = JsonWire<WireTaskProgressLogRecord>;
 
-export interface TagCount {
-	tag: string;
-	count: number;
-}
-
-export type TasksResponse = ApiResponse<{ tasks: TodoWithSubtasks[]; tags?: TagCount[] }>;
-export type TaskDetailResponse = ApiResponse<{
-	task: TodoWithSubtasks;
-	progressLogs?: TaskProgressLogRecord[];
-}>;
-export type TaskGanttResponse = ApiResponse<{ tasks: TodoWithSubtasks[] }>;
+/** GET /api/tasks・/api/tasks/someday（親タスクのみ・subtasks ネスト付き）。 */
+export type TasksResponse = ApiResponse<JsonWire<TaskListData>>;
+export type TaskDetailResponse = ApiResponse<JsonWire<TaskDetailData>>;
+export type TaskResponse = ApiResponse<JsonWire<TaskData>>;
+export type TaskGanttResponse = ApiResponse<JsonWire<TaskListData>>;
 
 // ─── expenses（expenseRepo / plannedPaymentRepo） ─────────────────────────────
 
 export type ExpenseType = "income" | "expense";
 
-export interface ExpenseRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	type: ExpenseType;
-	amount: number;
-	category: string;
-	memo: string | null;
-	date: string;
-	time: string | null;
-	source: string;
-	created_at: string;
-}
+export type ExpenseRecord = JsonWire<WireExpenseRecord>;
 
-export interface CategoryTotal {
-	category: string;
-	total: number;
-	count: number;
-}
+export type CategoryTotal = JsonWire<WireCategoryTotal>;
 
-export interface MonthlyTrendPoint {
-	month: string;
-	income: number;
-	expense: number;
-}
+export type MonthlyTrendPoint = JsonWire<WireMonthlyTrendPoint>;
 
-export interface BudgetLimit {
-	id?: number;
-	category: string;
-	/** 月間上限（budget_limits.limit_amount 列） */
-	limit_amount: number;
-}
+export type BudgetLimit = JsonWire<WireBudgetLimit>;
 
 export type PlannedPaymentStatus = "pending" | "settled" | "cancelled";
 
-export interface PlannedPayment {
-	id: number;
-	title: string;
-	amount: number;
-	category: string;
-	memo?: string | null;
-	due_date: string;
-	repeat_rule?: string | null;
-	status: PlannedPaymentStatus;
-}
+export type PlannedPayment = JsonWire<WirePlannedPayment>;
 
-export type ExpensesResponse = ApiResponse<{
-	expenses: ExpenseRecord[];
-	/** 当月支出合計 */
-	total: number;
-	/** 当月収入合計 */
-	incomeTotal: number;
-	breakdown?: CategoryTotal[];
-	trend?: MonthlyTrendPoint[];
-}>;
-export type BudgetLimitsResponse = ApiResponse<{ limits: BudgetLimit[] }>;
-export type PlannedPaymentsResponse = ApiResponse<{ plans: PlannedPayment[] }>;
+/** GET /api/expenses（一覧＋指定月の支出合計 total・収入合計 incomeTotal・内訳・6 ヶ月推移）。 */
+export type ExpensesResponse = ApiResponse<JsonWire<ExpenseListData>>;
+export type BudgetLimitsResponse = ApiResponse<JsonWire<BudgetLimitListData>>;
+export type PlannedPaymentsResponse = ApiResponse<
+	JsonWire<PlannedPaymentListData>
+>;
 
 // ─── schedules（scheduleRepo） ───────────────────────────────────────────────
 
-export interface ScheduleRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	title: string;
-	description: string | null;
-	start_at: string;
-	end_at: string | null;
-	remind_before_minutes: number;
-	reminded: number;
-	google_event_id: string | null;
-	google_calendar_id: string | null;
-	created_at: string;
-}
-export type SchedulesResponse = ApiResponse<{ schedules: ScheduleRecord[] }>;
+export type ScheduleRecord = JsonWire<WireScheduleRecord>;
+export type SchedulesResponse = ApiResponse<JsonWire<ScheduleListData>>;
 
 // ─── reminders（reminderRepo） ───────────────────────────────────────────────
 
 export type ReminderTargetType = "dm" | "channel";
 export type ReminderStatus = "pending" | "sent" | "cancelled";
 
-export interface ReminderRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	message: string;
-	trigger_at: string;
-	repeat_rule: string | null;
-	target_type: ReminderTargetType;
-	target_id: string | null;
-	status: ReminderStatus;
-	source: string;
-	source_id: string | null;
-	created_at: string;
-}
-export type RemindersResponse = ApiResponse<{ reminders: ReminderRecord[] }>;
+export type ReminderRecord = JsonWire<WireReminderRecord>;
+export type RemindersResponse = ApiResponse<JsonWire<ReminderListData>>;
 
 // ─── timeline（timelineRepo） ────────────────────────────────────────────────
 
 export type PlanBlockType = "task" | "transit" | "event" | "free";
-export type RecordType = "memo" | "expense" | "task_done" | "media" | "location";
+export type RecordType =
+	| "memo"
+	| "expense"
+	| "task_done"
+	| "media"
+	| "location";
 
-export interface DayPlanBlock {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	date: string;
-	start_time: string | null;
-	end_time: string | null;
-	type: PlanBlockType;
-	title: string;
-	description: string | null;
-	todo_id: number | null;
-	transit_from: string | null;
-	transit_to: string | null;
-	transit_line: string | null;
-	position: number;
-	created_at: string;
-	updated_at: string;
-}
+export type DayPlanBlock = JsonWire<WireDayPlanBlock>;
 
-export interface TimelineRecord {
-	id: number;
-	user_id: string;
-	bot_id: string;
-	date: string;
-	recorded_at: string;
-	type: RecordType;
-	title: string | null;
-	content: string | null;
-	todo_id: number | null;
-	expense_id: number | null;
-	amount: number | null;
-	expense_category: string | null;
-	media_path: string | null;
-	media_type: string | null;
-	location: string | null;
-	created_at: string;
-}
+export type TimelineRecord = JsonWire<WireTimelineRecord>;
 
-// 注: サーバ（timelineRoutes.ts /api/timeline/day）は `blocks` キーで返す（`plan` ではない）。
-export type TimelineDayResponse = ApiResponse<{
-	blocks: DayPlanBlock[];
-	records: TimelineRecord[];
-}>;
+// 注: サーバ（GET /api/timeline/day）は `blocks` キーで返す（`plan` ではない）。
+export type TimelineDayResponse = ApiResponse<JsonWire<TimelineDayData>>;
+
+/** GET /api/timeline/neighbors（前後で計画か記録のある最寄りの日付。無い方向は null） */
+export type TimelineNeighborsResponse = ApiResponse<
+	JsonWire<TimelineNeighborsData>
+>;
 
 // ─── personal（contextNote / clipboard / contacts） ──────────────────────────
 
-export interface ContactView {
-	id: number;
-	name: string;
-	birthday: string | null;
-	relationship: string | null;
-	contact_info: string | null;
-	notes: string | null;
-	tags: string[];
-	created_at: string;
-	updated_at: string;
-}
-export type ContactsResponse = ApiResponse<{ contacts: ContactView[] }>;
+export type ContactView = JsonWire<WireContactView>;
+export type ContactsResponse = ApiResponse<JsonWire<ContactListData>>;
 
-export interface ClipboardEntry {
-	id: number;
-	content: string;
-	expires_at: string | null;
-	created_at: string;
-}
-export type ClipboardResponse = ApiResponse<{ entries: ClipboardEntry[] }>;
+export type ClipboardEntry = JsonWire<WireClipboardEntry>;
+export type ClipboardResponse = ApiResponse<JsonWire<ClipboardListData>>;
 
-/** GET /api/context-note（content + max_length を返す。updated_at も同梱） */
-export type ContextNoteResponse = ApiResponse<{
-	content: string;
-	max_length: number;
-	updated_at?: string | null;
-}>;
+/** GET /api/context-note（content + max_length を返す。未登録時 updated_at は null） */
+export type ContextNoteResponse = ApiResponse<JsonWire<ContextNoteData>>;
 
 // ─── personas（personaRepo） ─────────────────────────────────────────────────
 
-export interface PersonaRecord {
-	id: number;
-	owner_id: string;
-	name: string;
-	prompt: string;
-	is_public: number;
-	created_at: string;
-	updated_at: string;
-}
+export type PersonaRecord = JsonWire<WirePersonaRecord>;
 
 export interface PublicPersonaView {
 	id: number;
 	name: string;
-	prompt_preview: string;
-	prompt_length: number;
+	/** 全文（一覧側で文字数と冒頭を出す）。 */
+	prompt: string;
 	owner_username: string;
 	updated_at: string;
 }
 
 /** GET /api/personas — personas + 適用中ID + 最大文字数。 */
-export type PersonasResponse = ApiResponse<{
-	personas: PersonaRecord[];
-	active_persona_id: number | null;
-	max_length: number;
+export type PersonasResponse = ApiResponse<JsonWire<PersonaListData>>;
+export type PersonaMarketplaceResponse = ApiResponse<{
+	personas: PublicPersonaView[];
 }>;
-export type PersonaMarketplaceResponse = ApiResponse<{ personas: PublicPersonaView[] }>;
 /** GET /api/personas/marketplace/:id — 公開ペルソナの全文（インポート判断用）。 */
 export type PersonaMarketplaceDetailResponse = ApiResponse<{
 	persona: { id: number; name: string; prompt: string };
@@ -362,39 +218,27 @@ export type PersonaMarketplaceDetailResponse = ApiResponse<{
 // ─── playbooks（playbookRepo） ───────────────────────────────────────────────
 
 /** playbookService.Playbook（name が識別子。id 列は持たない）。 */
-export interface PlaybookRecord {
-	name: string;
-	title: string;
-	keywords: string[];
-	description: string;
-	steps: string;
-}
+export type PlaybookRecord = JsonWire<WirePlaybookRecord>;
 /** playbookScheduleService.PlaybookSchedule。 */
-export interface PlaybookScheduleRecord {
-	id: number;
-	playbook_name: string;
-	cron_expression: string;
-	description?: string;
-	enabled: boolean;
-	last_run_at: string | null;
-}
+export type PlaybookScheduleRecord = JsonWire<WirePlaybookScheduleRecord>;
 /** playbookScheduleService.PlaybookRun。 */
-export interface PlaybookRunRecord {
-	id: number;
-	playbook_name: string;
-	status: "running" | "success" | "failed";
-	output: string;
-	started_at: string;
-	finished_at: string | null;
-}
-export type PlaybooksResponse = ApiResponse<{ playbooks: PlaybookRecord[] }>;
-export type PlaybookSchedulesResponse = ApiResponse<{ schedules: PlaybookScheduleRecord[] }>;
-export type PlaybookRunsResponse = ApiResponse<{ runs: PlaybookRunRecord[] }>;
+export type PlaybookRunRecord = JsonWire<WirePlaybookRunRecord>;
+export type PlaybooksResponse = ApiResponse<JsonWire<PlaybookListData>>;
+/**
+ * GET /api/playbooks/schedules。Rust 側の `ScheduleListData` は予定ドメインと同名で、
+ * 生成時に予定側が先に書き出されるため playbook 版は生成されない。手書きで維持する。
+ */
+export type PlaybookSchedulesResponse = ApiResponse<{
+	schedules: PlaybookScheduleRecord[];
+}>;
+export type PlaybookRunsResponse = ApiResponse<JsonWire<RunListData>>;
 
 // ─── webhooks（webhookRepo） ─────────────────────────────────────────────────
 
 export interface WebhookEndpointView {
 	id: number;
+	/** 帰属 Bot（受信で作る通知・ToDo・リマインドの Bot）。帰属先が無い旧エンドポイントは null。 */
+	bot_id: string | null;
 	name: string;
 	token: string;
 	has_secret: boolean;
@@ -418,9 +262,15 @@ export interface WebhookDeliveryRecord {
 	created_at: string;
 }
 /** GET /api/webhooks — サーバは `endpoints` キーで返す。 */
-export type WebhooksResponse = ApiResponse<{ endpoints: WebhookEndpointView[] }>;
-export type WebhookCreateResponse = ApiResponse<{ endpoint: WebhookEndpointView }>;
-export type WebhookDeliveriesResponse = ApiResponse<{ deliveries: WebhookDeliveryRecord[] }>;
+export type WebhooksResponse = ApiResponse<{
+	endpoints: WebhookEndpointView[];
+}>;
+export type WebhookCreateResponse = ApiResponse<{
+	endpoint: WebhookEndpointView;
+}>;
+export type WebhookDeliveriesResponse = ApiResponse<{
+	deliveries: WebhookDeliveryRecord[];
+}>;
 
 // ─── mcp（mcpRepo） ──────────────────────────────────────────────────────────
 
@@ -429,55 +279,118 @@ export interface McpToolDef {
 	description?: string;
 	inputSchema?: unknown;
 }
-/** GET /api/mcp-servers の toSafeView 出力（mcpRoutes.ts）。 */
+/** MCP サーバーが公開するツール（GET /api/mcp-servers の tools 要素）。 */
+export interface McpToolView {
+	name: string;
+	description: string;
+	/** MCP Apps の画面（`ui://...`）。画面が無いツールは null。 */
+	ui_resource_uri: string | null;
+	/** AI（Function Calling）に見せるか（`_meta.ui.visibility` に "model"）。 */
+	visible_to_model: boolean;
+	/** 画面の中から呼べるか（`_meta.ui.visibility` に "app"）。 */
+	callable_from_app: boolean;
+}
+/** MCP サーバーの認証の状態。 */
+export interface McpAuthView {
+	/** 固定トークン（bearer）・OAuth（oauth）・なし（none）。 */
+	mode: "bearer" | "oauth" | "none";
+	oauth_connected: boolean;
+	/** 直近の接続でサーバーが認可（401/403）を求めた。 */
+	authorization_required: boolean;
+}
+/** GET /api/mcp-servers の 1 件（crates/yuuka-mcp/src/routes.rs）。 */
 export interface McpServerView {
 	id: number;
 	scope: "system" | "user";
 	name: string;
 	endpoint_url: string;
 	has_auth: boolean;
-	tools: { name: string; description: string }[];
+	tools: McpToolView[];
 	tools_cache_updated: string | null;
 	requires_confirmation: boolean;
 	enabled: boolean;
 	created_at: string;
 	/** 許可済み Bot（一覧ハンドラで付与） */
 	granted_bot_ids?: string[];
+	/** 操作できるか（自分の登録、またはシステム登録かつ Admin）。 */
+	can_manage: boolean;
+	auth: McpAuthView;
 }
-export type McpServersResponse = ApiResponse<{ servers: McpServerView[] }>;
+/** MCP Apps の画面を動かすサンドボックスプロキシ。 */
+export interface McpAppsSandbox {
+	/** iframe の src。 */
+	url: string;
+	/** 別オリジン（MCP_SANDBOX_ORIGIN）のときそのオリジン。未設定なら null（不透明オリジン）。 */
+	origin: string | null;
+	isolated: boolean;
+}
+export type McpServersResponse = ApiResponse<{
+	servers: McpServerView[];
+	apps: { sandbox: McpAppsSandbox };
+}>;
+/** POST /api/mcp-servers/:id/apps/resource（tool 指定）の応答。 */
+export type McpAppResourceResponse = ApiResponse<{
+	html: string;
+	/** UI リソースの `_meta.ui`（csp・permissions・prefersBorder など）。 */
+	ui: Record<string, unknown>;
+	tool: {
+		name: string;
+		description: string | null;
+		inputSchema: Record<string, unknown> | null;
+		_meta: { ui: Record<string, unknown> | null };
+	};
+	sandbox: McpAppsSandbox;
+}>;
+/** POST /api/mcp-servers/:id/apps/call・apps/resource（uri 指定）の応答（MCP の結果をそのまま）。 */
+export type McpAppResultResponse = ApiResponse<{
+	result: Record<string, unknown>;
+}>;
 
 // ─── credentials（credentialRepo） ───────────────────────────────────────────
 
-export interface CredentialView {
+export type CredentialView = JsonWire<WireCredentialView>;
+export type CredentialsResponse = ApiResponse<JsonWire<CredentialListData>>;
+
+// ─── 定期報告（/api/periodic-reports） ───────────────────────────────────────
+
+/** 定期報告に載せる内容の区分（periodic_reports.sections の要素） */
+export type ReportSection =
+	| "weather"
+	| "news"
+	| "tasks"
+	| "schedules"
+	| "payments"
+	| "finance"
+	| "topics";
+
+/** 登録済みの定期報告 */
+export interface PeriodicReport {
 	id: number;
 	name: string;
-	type?: string;
-	created_at: string;
+	enabled: boolean;
+	schedule_cron: string;
+	target_type: "dm" | "channel";
+	target_id: string | null;
+	/** 載せる内容（表示順） */
+	sections: ReportSection[];
+	location_name: string | null;
+	weather_lat: number | null;
+	weather_lng: number | null;
+	news_feeds: string[];
+	news_keywords: string[];
+	/** 非公開の内容（タスク・予定・支払い予定・家計）を含む＝DM にだけ送る */
+	private: boolean;
 }
-export type CredentialsResponse = ApiResponse<{ credentials: CredentialView[] }>;
 
-// ─── delivery（briefingConfig / reportConfig） ───────────────────────────────
+/** 登録・更新で送る内容（更新は id と変えるキーだけでよい） */
+export type PeriodicReportInput = Partial<
+	Omit<PeriodicReport, "id" | "private">
+>;
 
-export interface BriefingConfig {
-	enabled?: boolean;
-	schedule_cron?: string;
-	target_type?: "dm" | "channel";
-	target_id?: string;
-	location_name?: string;
-	weather_lat?: number | null;
-	weather_lng?: number | null;
-	news_keywords?: string[];
-	news_feeds?: string[];
-}
-export type BriefingConfigResponse = ApiResponse<{ config: BriefingConfig }>;
-
-export interface ReportConfig {
-	id?: number;
-	type?: "daily" | "weekly";
-	schedule_cron?: string;
-	enabled?: boolean;
-}
-export type ReportConfigsResponse = ApiResponse<{ configs: ReportConfig[] }>;
+export type PeriodicReportsResponse = ApiResponse<{
+	reports: PeriodicReport[];
+}>;
+export type PeriodicReportResponse = ApiResponse<{ report: PeriodicReport }>;
 
 // ─── settings（userRepo / status / discord / google） ────────────────────────
 
@@ -487,11 +400,10 @@ export type GoogleOAuthUrlResponse = ApiResponse<{ url: string }>;
 
 // ─── integrated（integratedRoutes: /api/integrated/overview） ─────────────────
 
-/** 統合オーバービューの Bot 行（overview handler の bots[] を写す） */
+/** 統合オーバービューの Bot 行（overview handler の bots[] を写す・所有 Bot のみ。システム Bot は含まない） */
 export interface IntegratedBotView {
 	id: string;
 	name: string;
-	is_system_default: boolean;
 	preset: string;
 	suspended: boolean;
 	stopped: boolean;
@@ -561,9 +473,8 @@ export interface AdminStats {
 	totalUsers: number;
 	totalBots: number;
 	suspendedBots: number;
-	totalInviteCodes: number;
-	usedInviteCodes: number;
-	availableInviteCodes: number;
+	/** システムデフォルト Bot のトークンが登録済みか */
+	defaultBotTokenSet: boolean;
 }
 /** GET /api/admin/bots が返す Bot 行（BotView とは別形状） */
 export interface AdminBotView {
@@ -578,13 +489,6 @@ export interface AdminBotView {
 	isRunning: boolean;
 	created_at: string;
 	updated_at: string;
-}
-export interface InviteCode {
-	code: string;
-	created_at: string;
-	used_by?: string | null;
-	revoked_at?: string | null;
-	[k: string]: unknown;
 }
 export interface AuditLogEntry {
 	id: number;
@@ -616,7 +520,6 @@ export type AdminBotAttributeSettingsResponse = ApiResponse<{
 export type AdminStatsResponse = ApiResponse<{ stats: AdminStats }>;
 export type AdminUsersResponse = ApiResponse<{ users: AdminUserView[] }>;
 export type AdminBotsResponse = ApiResponse<{ bots: AdminBotView[] }>;
-export type AdminInviteCodesResponse = ApiResponse<{ codes: InviteCode[] }>;
 export type AdminAuditLogsResponse = ApiResponse<{
 	logs: AuditLogEntry[];
 	total: number;

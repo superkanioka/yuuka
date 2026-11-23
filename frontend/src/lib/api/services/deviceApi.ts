@@ -5,7 +5,7 @@
 //   （§10.1。stale な botId を混ぜない）。OAuth トークンポーリング（pollToken）は
 //   エンベロープ外の専用実装（../device.ts）を再輸出する。
 import { api } from "../client";
-import { requestDeviceCode, pollToken } from "../device";
+import { pollToken, requestDeviceCode } from "../device";
 import type { ApiResponse } from "../types";
 
 const USER = { scope: "user" } as const;
@@ -19,7 +19,9 @@ export interface DesktopDevice {
 	last_used_at?: string | null;
 	current?: boolean;
 }
-export type DesktopDevicesResponse = ApiResponse & { devices?: DesktopDevice[] };
+export type DesktopDevicesResponse = ApiResponse & {
+	devices?: DesktopDevice[];
+};
 
 /** GET /api/desktop/info の応答（配布バイナリのメタ情報）。 */
 export type DesktopInfoResponse = ApiResponse & {
@@ -41,6 +43,15 @@ export const deviceApi = {
 	desktopInfo: () => api.get<DesktopInfoResponse>("/api/desktop/info", USER),
 
 	// ── デバイス認可（ブラウザ側の承認操作） ──
+	/** POST /api/auth/device/lookup — 承認前に端末名と発行からの経過秒を確認（ログイン必須） */
+	lookup: (userCode: string) =>
+		api.post<
+			ApiResponse & {
+				device_name?: string | null;
+				age_secs?: number;
+				expires_in?: number;
+			}
+		>("/api/auth/device/lookup", { user_code: userCode }, USER),
 	/** POST /api/auth/device/approve — user_code をログイン済み本人が承認 */
 	approve: (userCode: string) =>
 		api.post<ApiResponse & { device_name?: string }>(

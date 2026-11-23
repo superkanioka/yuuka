@@ -2,7 +2,9 @@
 
 『Yuuka』の対話機能（画像 / 音声 / テキスト入力 → 返答）を、Discord 以外の経路から使えるようにする**新クライアント開発**の第一弾。手始めに **Windows デスクトップ**向けの、常駐オーバーレイ型チャットクライアントを **Rust（最軽量志向）**で実装する。
 
-> ⚠️ **本資料は `docs/design/` 配下の「提案 / 未実装」段階の設計方針書である**（[../../index.md](../../index.md) の権威順序参照）。現行コードへの拘束力はまだ持たない。実装着手時に必要部分を `docs/architecture/` の実装規範へ昇格させる。
+> ⚠️ **本資料は `docs/design/` 配下の設計方針書である**（[../../index.md](../../index.md) の参照優先順位を参照）。現行コードへの拘束力は持たない。実装済みの範囲（バックエンドの Phase 0 認証・Phase 1 WS チャット）と食い違う場合は**現行コードが正**。
+>
+> ⚠️ **旧 Node 実装時点の記述を含みます:** 本資料（と `architecture.md` / `backend_api.md` / `client_design.md`）が参照する `src/gemini.ts`・`src/server.ts`・`src/bot.ts` 等は Node 実装（[#68](https://github.com/kawaii-music-moe/yuuka/pull/68) で撤去済み）のファイルで、現行リポジトリには存在しません（リンク切れを含む）。撤去前のソースは `git show 390df39^:<path>` で参照できます。現行の実装は、バックエンド = `crates/yuuka-supervisor/src/ws.rs`（`/ws/chat`）・`crates/yuuka-auth`（デバイス認証）・`crates/yuuka-orchestrator`（会話エンジン）、クライアント = `clients/desktop/`（Rust / egui）。`architecture_v2.md` への言及は履歴資料（旧 Node 実装の規範）を指す。
 
 ---
 
@@ -37,7 +39,7 @@
 | 会話相手モデル | **1 プロセス = 1 Bot = 1 WS 接続**。**複数起動を許可**（Bot ごとに別プロセス） | WS は選択中の Bot のみに接続。ポップアップ表示中に Bot 切替可（切替＝WS 再接続）。複数 Bot を同時に使うなら複数インスタンス起動 |
 | オーバーレイ意匠 | **オーブ＝Bot アイコン**（`discord_avatar_url`）。**通知時は右上に数字バッジ** | 1 プロセス 1 Bot なのでオーブがどの Bot かを表す。未読/完了プッシュ件数をバッジ表示 |
 | ホットキー | **プライマリ Bot のインスタンスのみがグローバルホットキーを登録（吸う）。サブは登録しない** | 複数起動時の衝突回避。Bot 一覧/切替はプライマリのモーダルに集約。サブはオーブクリック/トレイで開閉 |
-| デスクトップトークン | TTL **既定 90 日**・スライディング延長。**端末単位失効**＋パスワード変更で全失効 | [backend_api.md §1.4](backend_api.md) |
+| デスクトップトークン | TTL **既定 90 日**・スライディング延長。**端末単位失効**（アカウント削除で全消去） | [backend_api.md §1.4](backend_api.md) |
 | 大型添付の上限 | **サーバー管理者が設定**（`DESKTOP_MAX_UPLOAD_MB`、**既定 20MB**） | 超過は `too_large`。REST アップロード移行は将来（同上限を閾値に） |
 | TTS（音声出力） | **v1 非対応**。別途予定の**音声クライアント**が落ち着き次第追従 | バックエンド TTS 増設が前提 |
 | コード配置 | **モノレポ** `clients/desktop/` | プロトコル資料と近接・版管理一元化 |
@@ -49,10 +51,10 @@
 ## 🔑 最重要の前提（調査で判明した事実）
 
 1. **会話用の HTTP API は現状存在しない。** 会話はすべて Discord ゲートウェイ経由（`src/bot.ts` → `src/gemini.ts`）。→ **デスクトップ用に新しいチャット API を増設するのが本プロジェクト最大のバックエンド作業。**
-2. **会話エンジンのコアは既に Discord 非依存。** [`src/gemini.ts:926`](../../../src/gemini.ts) の `processMessage(botId, userId, message: ChatMessage, onStatusChange?, asyncDelivery?)` は `ChatMessage`（`text` + `imageData{base64,mime}` + `audioData{base64,mime}`）を受け取り、`ProcessResult` を返す純粋な関数。**画像・音声は Gemini ネイティブのマルチモーダルで処理**（外部 STT 不要）。
+2. **会話エンジンのコアは既に Discord 非依存。** `src/gemini.ts:926` の `processMessage(botId, userId, message: ChatMessage, onStatusChange?, asyncDelivery?)` は `ChatMessage`（`text` + `imageData{base64,mime}` + `audioData{base64,mime}`）を受け取り、`ProcessResult` を返す純粋な関数。**画像・音声は Gemini ネイティブのマルチモーダルで処理**（外部 STT 不要）。
 3. **障壁は「入口」と「出口」だけ。** Discord 密結合は ① メッセージ受信（`bot.ts` の `setupMessageListener`）と ② 返答送信（`notifier.ts` の `sendToUser`）に集中している。コアの会話ロジック（`gemini.ts` / `turnPlanner.ts` / `llmClient.ts` / Function 群）は**無改修で再利用できる**。
 4. **TTS（音声出力）は現状バックエンドに無い。** v1 では「音声入力 → テキスト返答」。音声で読み上げる返答は将来フェーズ（[roadmap.md](roadmap.md) 参照）。
-5. **WebSocket はサーバに未実装。** [`src/server.ts`](../../../src/server.ts) は素の `node:http` で `upgrade` を処理していない。WS 受け口の新設が必要。
+5. **WebSocket はサーバに未実装。** `src/server.ts` は素の `node:http` で `upgrade` を処理していない。WS 受け口の新設が必要。
 
 ---
 

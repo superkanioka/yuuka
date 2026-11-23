@@ -18,11 +18,15 @@ serde.workspace = true
 serde_json.workspace = true
 ts-rs.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+yuuka-google.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 tower = { workspace = true, features = ["util"] }
 tempfile = "3"
+yuuka-web = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

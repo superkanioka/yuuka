@@ -41,12 +41,30 @@ pub struct IncomingChat {
     pub image: Option<InlineMedia>,
     /// 添付音声（あれば）。
     pub audio: Option<InlineMedia>,
+    /// その他の添付（PWA チャットの画像・音声・動画・PDF 等・複数可）。`image`/`audio` と同じく
+    /// 直近のユーザー発言へ inline data として渡す。
+    pub attachments: Vec<InlineMedia>,
+    /// Current speaker-owned attachments eligible for an explicit timeline save.
+    pub timeline_attachments: Vec<yuuka_core::tool::ConversationAttachment>,
     /// 受信 Discord メッセージ ID（会話ログ永続化用）。
     pub discord_msg_id: Option<String>,
     /// 返信元 Discord メッセージ ID（返信チェーン解決用）。
     pub reply_to_msg_id: Option<String>,
+    /// Discord から取得した返信元チェーン（R08・古い順・受信チャンネル内・上限 8 件）。engine は会話ログ
+    /// から復元したチェーンとメッセージ ID で重複を除いて合わせ、systemInstruction と想起クエリへ使う。
+    pub reply_chain: Vec<ReplyAncestor>,
     /// 受信チャンネル ID（ギルドコンテキストのチャンネル分離用・V19）。
     pub channel_id: Option<String>,
+}
+
+/// 返信元チェーンの 1 件（R08）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyAncestor {
+    /// 元メッセージの ID。Discord のメッセージ ID（時刻順の snowflake）か、Discord の ID を持たない
+    /// 会話ログの行は `log:<id>`。取得元をまたいだ重複除去と時系列の並べ替えに使う。
+    pub message_id: String,
+    /// `[発言者] 本文`（1200 文字まで）。
+    pub text: String,
 }
 
 /// 発話者（現行 `speaker { userId, displayName }`）。
@@ -73,6 +91,8 @@ pub type StatusSink = Arc<dyn Fn(BotStatus) + Send + Sync>;
 /// ターン処理の結果（現行 `ProcessResult`）。provider 中立。
 #[derive(Debug, Clone, Default)]
 pub struct TurnReply {
+    /// Persisted reply ID, usable as a later reply target (e.g. `log:123`).
+    pub message_id: Option<String>,
     /// 最終テキスト（空かつ embeds/files 無しなら「応答なし＝黙殺」）。
     pub text: String,
     /// リッチ埋め込み（現行 `embeds`）。
@@ -110,7 +130,13 @@ pub struct FileAttachment {
 }
 
 /// リッチ埋め込みの provider 中立記述（reply 層で twilight `Embed` へ写像）。
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize`/`Deserialize`（camelCase）は issue #41 PR #75 レビューで追加: PWA チャット送信
+/// （`yuuka-client-api`）が `secretary_turn_pwa` の埋め込みを `message_logs.rich_content` へ JSON で
+/// 永続化し、履歴取得時に読み戻すために使う（Discord 経路は twilight へ直接写像するだけで
+/// シリアライズを使わない・PWA 専用の利用）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RichEmbed {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -120,8 +146,8 @@ pub struct RichEmbed {
     pub footer: Option<String>,
 }
 
-/// 埋め込みフィールド。
-#[derive(Debug, Clone)]
+/// 埋め込みフィールド（`RichEmbed` 参照）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmbedField {
     pub name: String,
     pub value: String,
@@ -176,6 +202,17 @@ pub trait TurnDelivery: Send + Sync {
 
     /// 事前予測で非同期化したターンの最終結果を、完了後に配信する。
     async fn deliver_final(&self, reply: TurnReply);
+
+    /// 生成中の本文を逐次表示する配信先か。`true` のときだけ processor は本文を
+    /// [`on_partial_text`](Self::on_partial_text) へ流し、流し始めたら途中応答へ切り替えない
+    /// （流れている本文が進み具合の表示を兼ねる）。既定は `false`（従来どおり途中応答を返す）。
+    fn shows_partial_text(&self) -> bool {
+        false
+    }
+
+    /// 生成中の本文（ここまでに届いた全体）を逐次表示する。生成のコールバックから同期で呼ぶため、送信・
+    /// 編集は実装が裏で行う。[`shows_partial_text`](Self::shows_partial_text) が `false` なら呼ばれない。
+    fn on_partial_text(&self, _text: &str) {}
 }
 
 /// ユーザーへの通知配信（現行 `services/notifier.sendToUser`）。本クレートの Messenger が実装し、
@@ -200,6 +237,9 @@ pub trait Notifier: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TurnError {
+    /// quota 超過（LLM を呼ばず、チャネル固有の応答へ変換する）。
+    #[error("{0:?}")]
+    RateLimited(RateExceeded),
     /// 上流（Gemini/synapse 等）障害。
     #[error("turn processing failed: {0}")]
     Failed(String),
@@ -222,13 +262,15 @@ pub trait TurnProcessor: Send + Sync {
         delivery: Arc<dyn TurnDelivery>,
     ) -> Result<TurnReply, TurnError>;
 
-    /// 秘書のレシート画像経路（現行 `parseReceipt`）。
+    /// 秘書のレシート画像経路（現行 `parseReceipt`）。`image` はレシート候補の画像、`msg` は同じ
+    /// メッセージのキャプション（`text`・空なら指示なし）・本人添付の保存候補（`timeline_attachments`）・
+    /// 会話ログの紐づけ（`discord_msg_id`/`reply_to_msg_id`/`channel_id`/`reply_chain`）。`msg.image` は使わない。
     async fn parse_receipt(
         &self,
         bot_id: &BotId,
         user_id: &UserId,
         image: InlineMedia,
-        caption: Option<String>,
+        msg: IncomingChat,
         status: StatusSink,
         delivery: Arc<dyn TurnDelivery>,
     ) -> Result<TurnReply, TurnError>;
@@ -319,12 +361,7 @@ pub trait BotDirectory: Send + Sync {
     ) -> bool;
 
     /// 発言禁止チャンネルか（メンション/返信があっても応答しない・Rust 新機能）。DM/未登録は false。
-    async fn is_channel_muted(
-        &self,
-        bot_id: &BotId,
-        guild_id: &GuildId,
-        channel_id: &str,
-    ) -> bool;
+    async fn is_channel_muted(&self, bot_id: &BotId, guild_id: &GuildId, channel_id: &str) -> bool;
 
     /// 保有ロールのいずれかが許可ロールか（現行 `isAnyRoleAllowed`）。
     async fn is_any_role_allowed(
@@ -358,15 +395,78 @@ pub struct SubmitOutcome {
     pub request_id: Option<i64>,
 }
 
-/// 申請可否操作の結果（現行 `decideMemberRequestById` の `{ ok, message?, status?, botName? }`）。
+/// 申請可否操作の結果（現行 `decideMemberRequestById` の `{ ok, message? }` + 決定した申請）。
 #[derive(Debug, Clone, Default)]
 pub struct DecisionOutcome {
     pub ok: bool,
     pub message: String,
-    pub status: Option<MemberDecision>,
-    pub bot_name: Option<String>,
-    /// 申請者（結果 DM の宛先・Node `sendMemberDecisionDM` の applicantId）。ok 時のみ。
-    pub applicant_id: Option<String>,
+    /// 決定した申請（受付 DM を決定済みの embed へ編集する材料）。ok 時のみ。
+    pub request: Option<DecidedRequest>,
+}
+
+/// 決定した利用申請（オーナー宛の受付 DM を決定済みの embed へ編集する材料）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecidedRequest {
+    pub decision: MemberDecision,
+    pub bot_name: String,
+    /// 申請者の Discord ユーザー ID。
+    pub applicant_id: String,
+    /// 申請時に Discord から解決した申請者名（Web 経由の申請・記録前の申請は `None`）。
+    pub applicant_label: Option<String>,
+    pub guild_id: String,
+    /// 申請時に Discord から解決したギルド名（同上）。
+    pub guild_label: Option<String>,
+    /// 申請メッセージ（Web 経由の申請のみ）。
+    pub note: Option<String>,
+}
+
+impl DecidedRequest {
+    /// 受付 DM を置き換える決定済みの embed（Discord ボタン・Web のどちらで決定しても同じ表示にする）。
+    #[must_use]
+    pub fn embed(&self) -> RichEmbed {
+        let (title, color) = match self.decision {
+            MemberDecision::Approved => ("✅ 利用申請が承認されました", 0x57_F2_87),
+            MemberDecision::Rejected => ("🚫 利用申請が却下されました", 0xED_42_45),
+        };
+        let field = |name: &str, value: String, inline: bool| EmbedField {
+            name: name.to_owned(),
+            value,
+            inline,
+        };
+        let mut fields = vec![
+            field("Bot", self.bot_name.clone(), true),
+            field(
+                "申請者",
+                self.applicant_label
+                    .clone()
+                    .unwrap_or_else(|| format!("<@{}>", self.applicant_id)),
+                true,
+            ),
+            field(
+                "ギルド",
+                self.guild_label
+                    .clone()
+                    .unwrap_or_else(|| self.guild_id.clone()),
+                true,
+            ),
+        ];
+        if let Some(note) = &self.note {
+            fields.push(field("申請メッセージ", note.clone(), false));
+        }
+        RichEmbed {
+            title: Some(title.to_owned()),
+            color: Some(color),
+            fields,
+            ..RichEmbed::default()
+        }
+    }
+}
+
+/// 利用申請のオーナー宛 DM の所在（決定後にその DM を編集してボタンを外すために控える）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmMessageRef {
+    pub channel_id: String,
+    pub message_id: String,
 }
 
 /// 共有招待レコード（現行 `getShareById`）。
@@ -406,6 +506,9 @@ pub trait MembershipService: Send + Sync {
         actor: &UserId,
     ) -> DecisionOutcome;
 
+    /// 申請に、送ったオーナー宛 DM の所在を控える（Web から決定したときの DM 編集用・best-effort）。
+    async fn record_request_dm(&self, request_id: i64, dm: &DmMessageRef);
+
     /// 共有招待を引く（現行 `getShareById`）。
     async fn get_share(&self, share_id: i64) -> Option<ShareRecord>;
 
@@ -422,11 +525,13 @@ pub trait MembershipService: Send + Sync {
     async fn get_public_persona(&self, persona_id: i64) -> Option<PersonaRecord>;
 }
 
-/// 利用申請ボタンフローの結果 DM 送信（Node `sendMemberRequestDM`/`sendMemberDecisionDM`）。
+/// 利用申請の受付 DM 送信と、決定後のその DM の編集（Node `sendMemberRequestDM`）。
 ///
-/// interaction ハンドラが DB 確定後に呼ぶ。常に共有デフォルト Bot から送る（実装側で担保）。fire-and-forget
-/// （戻り値の false は握り潰す・DB 上の申請は Web 管理から拾えるため）。fake でユニットテスト可能にするため
-/// 注入ポートにする（[`DiscordMessenger`] が本実装）。
+/// interaction ハンドラ（Discord ボタン経路）と Web の利用申請ルート（`yuuka-orchestrator::member_routes`）
+/// が DB 確定後に呼ぶ。常に共有デフォルト Bot から送る（実装側で担保）。fire-and-forget
+/// （失敗は握り潰す・DB 上の申請は Web 管理から拾えるため）。決定の結果は受付 DM の編集だけで示し、
+/// 申請者へ別の DM は送らない。fake でユニットテスト可能にするため注入ポートにする
+/// （[`DiscordMessenger`] が本実装）。
 #[async_trait]
 pub trait MemberDmSender: Send + Sync {
     /// 申請受付を Bot オーナーへ通知（承認/却下ボタン付き）。
@@ -438,10 +543,28 @@ pub trait MemberDmSender: Send + Sync {
         guild_label: &str,
         note: Option<&str>,
         request_id: i64,
-    ) -> bool;
+    ) -> Option<DmMessageRef>;
 
-    /// 承認/却下の結果を申請者へ通知（ボタンなし）。
-    async fn send_decision_dm(&self, applicant_id: &str, bot_name: &str, approved: bool) -> bool;
+    /// 受付 DM を決定済みの embed へ編集してボタンを外す（Web から決定した場合）。
+    async fn close_request_dm(&self, dm: &DmMessageRef, request: &DecidedRequest) -> bool;
+}
+
+/// Bot 共有招待 DM の送信ポート（Node `sendShareInviteDM`）。
+///
+/// Web の共有招待ルート（`yuuka-orchestrator::share_routes`）が招待行の作成後に呼ぶ。常に共有デフォルト
+/// Bot から `share_accept:{share_id}` / `share_decline:{share_id}` ボタン付きで送り、押下は
+/// [`crate::interaction::decide`] が処理する（[`crate::DiscordMessenger`] が本実装）。送信失敗でも招待行は残る。
+#[async_trait]
+pub trait ShareInviteDm: Send + Sync {
+    /// 招待先へ承認/辞退ボタン付き DM を送る（成功なら `true`）。
+    async fn send_invite(
+        &self,
+        share_id: i64,
+        target_user_id: &str,
+        bot_name: &str,
+        owner_name: &str,
+        persona_name: Option<&str>,
+    ) -> bool;
 }
 
 // ─── RateLimiter ─────────────────────────────────────────────────────────────

@@ -3,11 +3,11 @@
 /**
  * クライアントへ返すペルソナ（クリーンビュー・snake_case・`owner_id` を含めない）。
  */
-export type Persona = { id: bigint, name: string, 
+export type Persona = { id: bigint, name: string,
 /**
  * システムプロンプト本文（自分のペルソナは全文を返す）。
  */
-prompt: string, 
+prompt: string,
 /**
  * マーケットプレイス公開フラグ（DB は 0/1、wire は bool）。
  */

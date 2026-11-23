@@ -12,10 +12,14 @@
 
 pub mod pool;
 pub mod schema;
+pub mod snapshot;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod writer;
 
 pub use pool::{open_conn, ReadPool};
 pub use schema::run_migrations;
+pub use snapshot::snapshot;
 pub use writer::WriterHandle;
 
 use yuuka_core::DbError;
@@ -115,28 +119,16 @@ mod tests {
         // 履歴なし）へ refinery が全マイグレーションを流す。baseline の CREATE 群が IF NOT EXISTS で
         // 冪等でないと「object already exists」で失敗し Rust writer が起動不能になる（#2 のガード）。
         //
-        // 注: post-baseline のマイグレーション（V19 の ALTER TABLE ADD COLUMN 等）は SQLite に
-        // IF NOT EXISTS が無く再走冪等にできないため、「全オブジェクト既存 + 履歴なし」ではなく
-        // 「Node 実スキーマ（baseline のみ既存）+ 履歴なし」を正確に再現する: 履歴を消した上で
-        // post-baseline の産物（bot_channels / message_logs.channel_id）も除去してから再走する。
         let dir = tempdir().unwrap();
         let path = dir.path().join("populated.sqlite");
         seed_db(&path, "");
         let mut conn = open_conn(&path, false).unwrap();
 
-        // 1) 全オブジェクトを作成（+ refinery 履歴を刻む）。
-        run_migrations(&mut conn).unwrap();
-
-        // 2) refinery 履歴を消し、post-baseline 産物を落として「Node 作成 DB」状態を作る。
-        conn.execute_batch(
-            "DROP TABLE refinery_schema_history; \
-             DROP TABLE bot_channels; \
-             DROP INDEX idx_message_logs_guild_channel; \
-             ALTER TABLE message_logs DROP COLUMN channel_id;",
-        )
-        .unwrap();
-
-        // 3) 全体を再走 — baseline は冪等 CREATE、post-baseline は対象不在なので成功する。
+        // Reproduce the Node-created V17 schema directly. Starting from the latest
+        // schema and undoing selected ALTERs is no longer a faithful V17 fixture:
+        // V27 also removes mcp_servers.bot_id and all implicit Bot defaults.
+        conn.execute_batch(include_str!("../migrations/V17__baseline.sql"))
+            .unwrap();
         run_migrations(&mut conn).unwrap();
 
         // #1: schema_version が '17' で刻まれている（Node がこの DB を開いても再 DROP しない）。
@@ -167,28 +159,85 @@ mod tests {
             .unwrap();
         assert_eq!(channel_col, 1, "V19: message_logs.channel_id 再追加");
 
-        // V21: Instagram 連携（§3.15）。CREATE TABLE IF NOT EXISTS のため再走しても衝突しない。
-        let instagram: i64 = conn
+        // post-baseline の産物が再作成されている（V21・issue #33 PWA API port）。
+        let source_col: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='instagram_account'",
+                "SELECT COUNT(*) FROM pragma_table_info('message_logs') WHERE name='source'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(instagram, 1, "V21: instagram_account 作成");
-        // 単一アカウント運用の番人（CHECK(id = 1)）が効いている。
-        conn.execute(
-            "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
-             VALUES (1, 'e', 'i', 't')",
-            [],
-        )
-        .unwrap();
-        let second = conn.execute(
-            "INSERT INTO instagram_account (id, access_token_encrypted, access_token_iv, access_token_tag) \
-             VALUES (2, 'e', 'i', 't')",
-            [],
-        );
-        assert!(second.is_err(), "V21: id = 1 以外の行は CHECK 制約で拒否される");
+        assert_eq!(source_col, 1, "V21: message_logs.source 再追加");
+        let list_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('todos') WHERE name='list'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(list_col, 1, "V21: todos.list 再追加");
+        let title_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('context_notes') WHERE name='title'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title_col, 1, "V21: context_notes.title 再追加");
+
+        // V22（issue #41 PR #75・PWA リッチ返信の永続化）の産物。
+        let rich_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('message_logs') WHERE name='rich_content'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rich_col, 1, "V22: message_logs.rich_content 再追加");
+        let attachments_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_attachments'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attachments_table, 1, "V22: message_attachments 再作成");
+        let notice_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('message_logs') WHERE name='is_notice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notice_col, 1, "V22: message_logs.is_notice 再追加");
+
+        // V25（sk-account 一本化）: パスワード列と招待コード表が無い。
+        let password_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='password_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(password_col, 0, "V25: users.password_hash 削除");
+        let invite_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='invite_codes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(invite_table, 0, "V25: invite_codes 削除");
+
+        // V26: Webhook エンドポイントが帰属 Bot を持つ。
+        let webhook_bot_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('webhook_endpoints') WHERE name='bot_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(webhook_bot_col, 1, "V26: webhook_endpoints.bot_id 追加");
     }
 
     #[tokio::test]
@@ -222,6 +271,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "hello");
+    }
+
+    #[tokio::test]
+    async fn spawn_bootstrapping_creates_new_db_and_applies_migrations() {
+        // issue #55: YUUKA_INIT_DB オプトイン経路（WriterHandle::spawn_bootstrapping）は、
+        // 存在しない DB ファイルでも新規作成し、baseline からの migrations を適用して
+        // 実際にスキーマが使える状態にする（通常の spawn は CREATE を付けず即エラー）。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("fresh.sqlite");
+        assert!(!path.exists(), "precondition: db file must not exist yet");
+        assert!(
+            WriterHandle::spawn(path.clone()).is_err(),
+            "normal spawn must still fail fast on a missing db (C-2 unchanged)"
+        );
+
+        let writer = WriterHandle::spawn_bootstrapping(path.clone())
+            .expect("bootstrapping spawn should create the db file and run migrations");
+        assert!(path.exists(), "db file must be created by bootstrapping");
+
+        // schema_version が刻印されている（baseline が正しく適用された証跡）。
+        let pool = ReadPool::open(&path).unwrap();
+        let version: String = pool
+            .read(|c| {
+                c.query_row(
+                    "SELECT value FROM system_settings WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, "17");
+
+        // 実 baseline テーブル（users）に書き込み・読み出しできる＝スキーマが使える状態。
+        writer
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO users(discord_id, username, salt) \
+                     VALUES ('u1', 'alice', 'salt')",
+                    [],
+                )
+                .map_err(map_sqlite)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let username: String = pool
+            .read(|c| {
+                c.query_row(
+                    "SELECT username FROM users WHERE discord_id='u1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite)
+            })
+            .await
+            .unwrap();
+        assert_eq!(username, "alice");
     }
 
     #[tokio::test]

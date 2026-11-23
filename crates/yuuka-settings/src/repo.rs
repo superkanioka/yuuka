@@ -1,8 +1,6 @@
 //! settings データアクセス（Node `userRepo` の設定系セッターのパリティ）。
 //!
-//! ユーザー本人の行のみを更新する（`WHERE discord_id = ?`）。bcrypt ハッシュ化は yuuka-auth の
-//! [`hash_password`](yuuka_auth::users::hash_password)（cost 12）を再利用し、パスワード変更でも
-//! `salt` 列は**絶対に変更しない**（ユーザー鍵導出＝保存済み資格情報の復号に使うため）。
+//! ユーザー本人の行のみを更新する（`WHERE discord_id = ?`）。`salt` 列は**絶対に変更しない**（ユーザー鍵導出＝保存済み資格情報の復号に使うため）。
 
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, ErrorCode, OptionalExtension};
@@ -339,6 +337,79 @@ pub(crate) struct UserSettingsPatch {
     pub timezone: Option<String>,
 }
 
+/// ユーザー単位の通知・バックアップ設定（`GET /api/settings/user`・`GET /api/settings/backup`）。
+///
+/// `/api/status` は Bot スコープ（botId 必須）のため、Bot を選ばずに開く「あなたの設定」は
+/// こちらで現在値を読む。users 行が無いときは列の既定値を返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPreferences {
+    pub rich_reply_enabled: bool,
+    pub remind_default_minutes: i64,
+    pub notify_target_type: String,
+    pub notify_target_id: Option<String>,
+    pub timezone: String,
+    pub backup_enabled: bool,
+    pub backup_folder_id: Option<String>,
+    pub backup_interval_hours: i64,
+    pub backup_generations: i64,
+    pub backup_last_run_at: Option<String>,
+}
+
+impl Default for UserPreferences {
+    /// users テーブルの列既定値と同じ。
+    fn default() -> Self {
+        Self {
+            rich_reply_enabled: true,
+            remind_default_minutes: 10,
+            notify_target_type: "dm".to_owned(),
+            notify_target_id: None,
+            timezone: "Asia/Tokyo".to_owned(),
+            backup_enabled: false,
+            backup_folder_id: None,
+            backup_interval_hours: 24,
+            backup_generations: 7,
+            backup_last_run_at: None,
+        }
+    }
+}
+
+/// ユーザー本人の通知・バックアップ設定を読む。行が無ければ既定値。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn user_preferences(db: &Db, discord_id: &str) -> Result<UserPreferences, DbError> {
+    let discord_id = discord_id.to_owned();
+    db.read
+        .read(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT rich_reply_enabled, remind_default_minutes, notify_target_type, \
+                     notify_target_id, timezone, backup_enabled, backup_folder_id, \
+                     backup_interval_hours, backup_generations, backup_last_run_at \
+                     FROM users WHERE discord_id = ?1",
+                    params![discord_id],
+                    |r| {
+                        Ok(UserPreferences {
+                            rich_reply_enabled: r.get::<_, i64>(0)? != 0,
+                            remind_default_minutes: r.get(1)?,
+                            notify_target_type: r.get(2)?,
+                            notify_target_id: r.get(3)?,
+                            timezone: r.get(4)?,
+                            backup_enabled: r.get::<_, i64>(5)? != 0,
+                            backup_folder_id: r.get(6)?,
+                            backup_interval_hours: r.get(7)?,
+                            backup_generations: r.get(8)?,
+                            backup_last_run_at: r.get(9)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(map_sqlite)?;
+            Ok(row.unwrap_or_default())
+        })
+        .await
+}
+
 /// ユーザー名を更新する（Node `updateUsername`）。変更行があれば `true`。
 ///
 /// username は UNIQUE。衝突時は `Ok(false)`（ハンドラの「既に使われている」400 に写像する。Node は
@@ -364,33 +435,6 @@ pub async fn update_username(db: &Db, discord_id: &str, username: &str) -> Resul
                 }
                 Err(e) => Err(map_sqlite(e)),
             }
-        })
-        .await
-}
-
-/// パスワードを bcrypt で再ハッシュして更新する（Node `updatePassword`）。**`salt` は変更しない**。
-/// 全セッション/デスクトップトークンの失効は呼び出し側で行う。
-///
-/// # Errors
-/// bcrypt 失敗・書き込み失敗時 [`DbError`]。
-pub async fn update_password(
-    db: &Db,
-    discord_id: &str,
-    new_password: &str,
-) -> Result<bool, DbError> {
-    // async な bcrypt はクロージャ外で先に済ませる（yuuka-auth の cost 12 実装を再利用）。
-    let hash = yuuka_auth::users::hash_password(new_password.to_owned()).await?;
-    let discord_id = discord_id.to_owned();
-    db.writer
-        .transaction(move |tx| {
-            let n = tx
-                .execute(
-                    "UPDATE users SET password_hash = ?1, updated_at = datetime('now', 'localtime') \
-                     WHERE discord_id = ?2",
-                    params![hash, discord_id],
-                )
-                .map_err(map_sqlite)?;
-            Ok(n > 0)
         })
         .await
 }
@@ -634,8 +678,8 @@ mod tests {
     fn seed_user(path: &PathBuf, discord_id: &str, role: &str) {
         raw(path)
             .execute(
-                "INSERT INTO users (discord_id, username, password_hash, salt, role) \
-                 VALUES (?1, ?1, 'orig-hash', 'deadbeef', ?2)",
+                "INSERT INTO users (discord_id, username, salt, role) \
+                 VALUES (?1, ?1, 'deadbeef', ?2)",
                 params![discord_id, role],
             )
             .expect("seed user");
@@ -666,20 +710,6 @@ mod tests {
         assert!(!update_username(&db, "alice", "bob").await.unwrap());
         // 不在ユーザーは false。
         assert!(!update_username(&db, "ghost", "x").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn password_rehash_keeps_salt() {
-        let (db, path) = fresh_db();
-        seed_user(&path, "alice", "user");
-        let salt_before = col(&path, "alice", "salt");
-        assert!(update_password(&db, "alice", "NewPassw0rd!").await.unwrap());
-        let hash_after = col(&path, "alice", "password_hash").unwrap();
-        // bcrypt ハッシュに置き換わる（$2b$ 始まり・元の 'orig-hash' でない）。
-        assert!(hash_after.starts_with("$2b$"), "bcrypt でリハッシュ");
-        assert_ne!(hash_after, "orig-hash");
-        // salt は絶対に変更しない（資格情報復号のため）。
-        assert_eq!(col(&path, "alice", "salt"), salt_before);
     }
 
     #[tokio::test]
@@ -835,6 +865,46 @@ mod tests {
         update_user_settings(&db, "u", UserSettingsPatch::default())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_preferences_reads_saved_values_and_defaults() {
+        let (db, path) = fresh_db();
+        // 行が無いユーザーは列の既定値。
+        assert_eq!(
+            user_preferences(&db, "ghost").await.unwrap(),
+            UserPreferences::default()
+        );
+
+        seed_user(&path, "u", "user");
+        update_user_settings(
+            &db,
+            "u",
+            UserSettingsPatch {
+                rich_reply: Some(false),
+                remind_minutes: Some(5),
+                notify_type: Some("channel"),
+                notify_id: Some(Some("123".to_owned())),
+                timezone: Some("UTC".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        update_backup(&db, "u", true, 48.0, 3.0, Some("FOLDER_1".to_owned()))
+            .await
+            .unwrap();
+
+        let prefs = user_preferences(&db, "u").await.unwrap();
+        assert!(!prefs.rich_reply_enabled);
+        assert_eq!(prefs.remind_default_minutes, 5);
+        assert_eq!(prefs.notify_target_type, "channel");
+        assert_eq!(prefs.notify_target_id.as_deref(), Some("123"));
+        assert_eq!(prefs.timezone, "UTC");
+        assert!(prefs.backup_enabled);
+        assert_eq!(prefs.backup_folder_id.as_deref(), Some("FOLDER_1"));
+        assert_eq!(prefs.backup_interval_hours, 48);
+        assert_eq!(prefs.backup_generations, 3);
+        assert_eq!(prefs.backup_last_run_at, None);
     }
 
     #[tokio::test]

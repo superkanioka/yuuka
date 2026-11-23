@@ -1,34 +1,43 @@
-import { spawn } from "node:child_process";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+// モック API（clients/pwa/mock/server.ts・8787）で PWA と管理画面を起動する（`pnpm dev:client:mock`）。
+//
+// 管理画面（frontend の Svelte dev server・/admin/ 配下）は 5174 に固定する。Client の
+// /admin/... はここへプロキシされ、/login は /admin/login へリダイレクトされる
+// （clients/pwa/vite.config.ts 参照）。ログイン後の returnTo が Client のパスなら
+// 逆に Client へ戻される（frontend/vite.config.ts の VITE_PWA_DEV_SERVER）。
+// /api は両方ともこのモック API へ向ける（#44）。
+import {
+	clientDir,
+	installHint,
+	processGroup,
+	root,
+} from "./lib/processes.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const clientDir = path.join(root, "client", "pwa");
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const children = [];
+const mockApi = "http://localhost:8787";
+const group = processGroup();
 
-function start(label, args, env = {}) {
-	const child = spawn(npm, args, {
-		cwd: clientDir,
-		stdio: "inherit",
-		env: { ...process.env, ...env },
-		shell: process.platform === "win32",
+try {
+	group.start(
+		process.platform === "win32" ? "npm.cmd" : "npm",
+		["run", "mock"],
+		{
+			cwd: clientDir,
+			shell: process.platform === "win32",
+		},
+	);
+	group.vite(clientDir, [], {
+		VITE_API_PROXY_TARGET: mockApi,
+		VITE_ADMIN_DEV_SERVER: "http://localhost:5174",
 	});
-	child.on("exit", (code) => {
-		if (code && code !== 0) process.exitCode = code;
-	});
-	children.push(child);
-	console.log(`[dev] ${label} started`);
+	group.vite(
+		root,
+		["--config", "frontend/vite.config.ts", "--port", "5174", "--strictPort"],
+		{
+			VITE_API_TARGET: mockApi,
+			VITE_PWA_DEV_SERVER: "http://localhost:5173",
+		},
+	);
+	console.log("Dev (mock API): http://localhost:5173/ (admin: /admin/)");
+} catch (error) {
+	console.error(`${error.message}\n${installHint}`);
+	group.shutdown(1);
 }
-
-function shutdown() {
-	for (const child of children) child.kill();
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-start("mock API", ["run", "mock"]);
-start("Client", ["run", "dev:client"], {
-	VITE_API_PROXY_TARGET: "http://localhost:8787",
-});

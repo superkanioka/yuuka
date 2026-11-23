@@ -1,8 +1,8 @@
 // リマインダー タブの純関数群（DOM 非依存）。旧 app.js fetchRemindersList の表示ロジックを移植。
-import type { ReminderRecord, ReminderStatus } from "$lib/api/types";
+import type { ReminderRecord } from "$lib/api/types";
 
 /** ステータス → 日本語ラベル（旧: pending=待機中 / sent=送信済み / cancelled=キャンセル）。 */
-export function reminderStatusLabel(status: ReminderStatus): string {
+export function reminderStatusLabel(status: string): string {
 	switch (status) {
 		case "pending":
 			return "待機中";
@@ -15,12 +15,12 @@ export function reminderStatusLabel(status: ReminderStatus): string {
 	}
 }
 
-/** 送信先の表示テキスト（📢 チャンネル / 📩 DM）。 */
+/** 送信先の表示テキスト（チャンネル: ID / DM）。アイコンはカード側で付ける。 */
 export function reminderTargetText(rem: ReminderRecord): string {
 	if (rem.target_type === "channel") {
-		return rem.target_id ? `📢 チャンネル: ${rem.target_id}` : "📢 チャンネル";
+		return rem.target_id ? `チャンネル: ${rem.target_id}` : "チャンネル";
 	}
-	return "📩 DM";
+	return "DM";
 }
 
 /**

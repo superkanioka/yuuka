@@ -9,10 +9,12 @@
 //! Phase 4 で [`cron`] に追加済み。recurrence の登録 UI・finance 連携・gantt/someday・progress log・
 //! 優先度2段・15 tool function・subtree 削除は todo 完成パスで追加。
 
+pub mod auto_tags;
 pub mod cron;
 pub mod dto;
 pub mod repo;
 pub mod routes;
+pub mod service;
 pub mod tools;
 
 pub use routes::routes;
@@ -51,6 +53,7 @@ mod tests {
     use tower::ServiceExt;
     use yuuka_core::{AuthError, BotId, UserId, UserScope};
     use yuuka_types::{Role, SessionUser};
+    use yuuka_web::test_support::{with_bot_query, TEST_BOT_ID};
     use yuuka_web::{AppState, AuthBackend, Db, WebConfig};
 
     use crate::dto::{NewTodo, PriorityUpdate, TodoUpdate};
@@ -58,10 +61,11 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    const TODOS_DDL: &str = "CREATE TABLE todos (
+    const TODOS_DDL: &str =
+        "DROP TABLE IF EXISTS todos; CREATE TABLE todos (list TEXT NOT NULL DEFAULT '個人',
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         title TEXT NOT NULL,
         description TEXT,
         due_date TEXT,
@@ -81,10 +85,11 @@ mod tests {
     );";
 
     /// task_progress_logs（進捗ログ）。V17__baseline.sql と同列（progress/note の追記対象）。
-    const PROGRESS_LOGS_DDL: &str = "CREATE TABLE task_progress_logs (
+    const PROGRESS_LOGS_DDL: &str =
+        "DROP TABLE IF EXISTS task_progress_logs; CREATE TABLE task_progress_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
-        bot_id TEXT NOT NULL DEFAULT 'system_default',
+        bot_id TEXT NOT NULL,
         todo_id INTEGER NOT NULL,
         progress INTEGER NOT NULL,
         note TEXT,
@@ -98,8 +103,10 @@ mod tests {
             std::process::id()
         ));
         {
-            let conn = rusqlite::Connection::open(&path).expect("seed db");
-            conn.execute_batch(TODOS_DDL).expect("create todos");
+            let mut conn = rusqlite::Connection::open(&path).expect("seed db");
+            // Install the isolated unit schema after migrating the real schema (SD07).
+            yuuka_db::run_migrations(&mut conn).expect("migrate before unit fixture");
+            yuuka_db::test_support::execute_unit_ddl(&conn, TODOS_DDL).expect("create todos");
             conn.execute_batch(PROGRESS_LOGS_DDL)
                 .expect("create task_progress_logs");
         }
@@ -138,6 +145,46 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_field_defaults_and_round_trips_and_list_all_flat_includes_done() {
+        let db = seed_db();
+        let repo = TodoRepo::new(&db);
+        let sc = scope("u");
+
+        // 未指定は既定「個人」（issue #47: Node は list を保存せず常に "Personal" 固定だった）。
+        let default_item = repo.add(&sc, new_todo("no-list", vec![])).await.unwrap();
+        assert_eq!(default_item.list, "個人");
+
+        // 明示指定はそのまま保存・往復する（PWA が送る値をそのまま使う）。
+        let work_item = repo
+            .add(
+                &sc,
+                NewTodo {
+                    title: "work-task".to_owned(),
+                    list: Some("仕事".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(work_item.list, "仕事");
+        assert_eq!(
+            repo.get(&sc, work_item.id).await.unwrap().unwrap().list,
+            "仕事"
+        );
+
+        // list_all_flat は open/done を問わず全件返す（list_open_flat は open のみ）。
+        repo.complete(&sc, work_item.id).await.unwrap();
+        let all = repo.list_all_flat(&sc).await.unwrap();
+        assert_eq!(all.len(), 2, "done も含め全件");
+        assert!(repo
+            .list_open_flat(&sc)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.status == "open"));
     }
 
     #[tokio::test]
@@ -310,7 +357,7 @@ mod tests {
         }
     }
 
-    fn app() -> axum::Router {
+    async fn app_with_db() -> (axum::Router, Db) {
         let auth = Arc::new(FakeAuth {
             user: SessionUser {
                 discord_id: "u".to_owned(),
@@ -318,13 +365,104 @@ mod tests {
                 role: Role::User,
             },
         });
-        let state = AppState::new(auth, WebConfig::default(), seed_db());
-        super::routes().with_state(state)
+        let db = seed_db();
+        yuuka_web::test_support::seed_bot(&db, TEST_BOT_ID, "u").await;
+        let state = AppState::new(auth, WebConfig::default(), db.clone());
+        (
+            with_bot_query(super::routes().with_state(state), TEST_BOT_ID),
+            db,
+        )
+    }
+
+    async fn app() -> axum::Router {
+        app_with_db().await.0
+    }
+
+    #[tokio::test]
+    async fn api_add_and_description_edit_enqueue_scoped_tag_jobs() {
+        let (app, db) = app_with_db().await;
+        let post = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("cookie", "__Host-yuuka-session=good")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/tasks/add",
+                r#"{"title":"API","tags":["explicit"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let repo = TodoRepo::new(&db);
+        let cron = yuuka_core::CrossUserAccess::for_scheduled_task();
+        let job = repo.claim_tag_jobs(cron).await.unwrap().pop().unwrap();
+        assert_eq!(job.scope.user_id().as_str(), "u");
+        assert_eq!(job.scope.bot_id().as_str(), TEST_BOT_ID);
+        let id = job.id;
+        repo.finish_tag_job(job, vec!["auto".into()]).await.unwrap();
+        let response = app
+            .oneshot(post(
+                "/api/tasks/update",
+                &format!(r#"{{"id":{id},"description":"new description"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let job = repo.claim_tag_jobs(cron).await.unwrap().pop().unwrap();
+        assert_eq!(job.description.as_deref(), Some("new description"));
+        repo.finish_tag_job(job, vec!["new auto".into()])
+            .await
+            .unwrap();
+        let task = repo
+            .get(
+                &UserScope::new(UserId::new("u"), BotId::new(TEST_BOT_ID)),
+                id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.tags, vec!["explicit", "new auto"]);
+    }
+    #[tokio::test]
+    async fn route_add_validates_repeat_rule_with_runtime_parser() {
+        // R19: 5 フィールドでも実行時 parser が解釈できない式は保存しない（ツールと同じ判定）。
+        let app = app().await;
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks/add")
+                .header("cookie", "__Host-yuuka-session=good")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let bad = app
+            .clone()
+            .oneshot(post(
+                r#"{"title":"x","repeatRule":"0 9 * * 8","dueDate":"2026-07-13"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let ok = app
+            .oneshot(post(
+                r#"{"title":"x","repeatRule":"0 9 * * 1","dueDate":"2026-07-13"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn route_add_then_list() {
-        let app = app();
+        let app = app().await;
         let add = app
             .clone()
             .oneshot(
@@ -366,6 +504,7 @@ mod tests {
     #[tokio::test]
     async fn route_requires_auth() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/api/tasks")
@@ -377,11 +516,62 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// issue #139: Bot 未指定・システム Bot は 403、アクセスできない Bot は 404。
+    /// どれもシステム Bot へ黙って落とさない。
+    #[tokio::test]
+    async fn route_rejects_missing_system_and_foreign_bot() {
+        let auth = Arc::new(FakeAuth {
+            user: SessionUser {
+                discord_id: "u".to_owned(),
+                username: "u".to_owned(),
+                role: Role::User,
+            },
+        });
+        let db = seed_db();
+        yuuka_web::test_support::seed_bot(&db, "foreign", "someone").await;
+        // botId を補うレイヤを掛けない素のルータ。
+        let app = super::routes().with_state(AppState::new(auth, WebConfig::default(), db));
+        for (uri, want) in [
+            ("/api/tasks", StatusCode::FORBIDDEN),
+            ("/api/tasks?botId=", StatusCode::FORBIDDEN),
+            ("/api/tasks?botId=system_default", StatusCode::FORBIDDEN),
+            ("/api/tasks?botId=foreign", StatusCode::NOT_FOUND),
+            ("/api/tasks?botId=ghost", StatusCode::NOT_FOUND),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("cookie", "__Host-yuuka-session=good")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{uri}");
+        }
+        // 書き込みも同じ（body に botId が無ければ 403）。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/add")
+                    .header("cookie", "__Host-yuuka-session=good")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     /// H-1 回帰: フロント／Node は **camelCase**（`dueDate`/`startDate`）を送り、旧 UI は
     /// **数値優先度**（`2`）を送る。どちらも無音で落とさず永続化することを凍結する。
     #[tokio::test]
     async fn route_add_accepts_camelcase_and_numeric_priority() {
-        let app = app();
+        let app = app().await;
         let add = app
             .oneshot(
                 Request::builder()
@@ -571,7 +761,7 @@ mod tests {
     /// H-3 E2E: `GET /api/tasks` がネストしたツリーを返し、内部列を露出しない。
     #[tokio::test]
     async fn route_tasks_returns_nested_tree_without_internal_columns() {
-        let app = app();
+        let app = app().await;
         // 親を追加し id を取得。
         let add_parent = app
             .clone()
@@ -642,7 +832,7 @@ mod tests {
     /// いずれも `deletedId`/`deleted_id` を返さない（`*DeletedData` 幽霊型の除去）。
     #[tokio::test]
     async fn route_delete_returns_bare_success_without_deleted_id() {
-        let app = app();
+        let app = app().await;
         let add = app
             .clone()
             .oneshot(
@@ -711,6 +901,7 @@ mod tests {
     #[tokio::test]
     async fn route_complete_missing_returns_success_false() {
         let resp = app()
+            .await
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1118,7 +1309,7 @@ mod tests {
     /// `GET /api/tasks/detail`: id 未指定/非数値/0 は 400、不在は 404、成功は camelCase 兄弟キー付き。
     #[tokio::test]
     async fn route_detail_validates_and_returns_siblings() {
-        let app = app();
+        let app = app().await;
         // id 未指定 → 400。
         assert_eq!(
             get_json(&app, "/api/tasks/detail").await.0,
@@ -1187,7 +1378,7 @@ mod tests {
     /// `GET /api/tasks/gantt` / `someday`: 日付有無で振り分け、{success, tasks} を返す。
     #[tokio::test]
     async fn route_gantt_and_someday_partition_by_date() {
-        let app = app();
+        let app = app().await;
         add_parent(&app, r#"{"title":"dated","dueDate":"2026-07-10"}"#).await;
         add_parent(&app, r#"{"title":"undated"}"#).await;
 
@@ -1207,7 +1398,7 @@ mod tests {
     /// `POST /api/tasks/update`: id 未指定/0 は 400、不在は 404、成功は {success, task}。
     #[tokio::test]
     async fn route_update_validates_and_updates() {
-        let app = app();
+        let app = app().await;
         // id なし → 400（missing field id で DTO パース失敗）。
         assert_eq!(
             post_json(&app, "/api/tasks/update", r#"{"title":"x"}"#.to_owned())
@@ -1254,7 +1445,7 @@ mod tests {
     /// `POST /api/tasks/progress`: 葉タスクは 200、サブタスクを持つ親は 409、不在は 404、id なしは 400。
     #[tokio::test]
     async fn route_progress_leaf_ok_parent_conflict() {
-        let app = app();
+        let app = app().await;
         // id なし → 400。
         assert_eq!(
             post_json(&app, "/api/tasks/progress", r#"{"progress":50}"#.to_owned())

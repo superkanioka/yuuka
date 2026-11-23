@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use scraper::{Html, Selector};
 use serde::Serialize;
+use yuuka_outbound::BlockedByResolver;
 
 /// 検索結果 1 件（tool 応答の `results[]` 要素）。
 #[derive(Debug, Clone, Serialize)]
@@ -265,15 +266,78 @@ fn parse_ddg(html: &str) -> Vec<SearchResult> {
     results
 }
 
+const MAX_REDIRECTS: usize = 5;
+
+/// [`get_following`] の失敗。再試行してよいのは `Transport` だけ。
+#[derive(Debug)]
+enum FetchError {
+    /// SSRF 検査（URL の事前検査・接続時のリゾルバ）で拒否した。再試行しても変わらない。
+    Blocked(String),
+    /// リダイレクト先が不正・多すぎる。再試行しても変わらない。
+    Redirect(String),
+    /// 通信エラー（タイムアウト・切断など）。再試行してよい。
+    Transport(String),
+}
+
+/// 送信エラーの原因をたどり、リゾルバの拒否なら `Blocked`、それ以外は `Transport` にする。
+fn classify_send_error(e: &reqwest::Error) -> FetchError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = source {
+        if let Some(blocked) = err.downcast_ref::<BlockedByResolver>() {
+            return FetchError::Blocked(blocked.to_string());
+        }
+        source = err.source();
+    }
+    FetchError::Transport(format!("リクエストエラー: {e}"))
+}
+
+/// 追いかけるリダイレクトか（304 Not Modified や Location の無い 300 は追わずにそのまま返す）。
+fn is_followed_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// 1 回分の GET。リダイレクトは自動で追わず、各ホップを SSRF 検査してから追う。
+async fn get_following(
+    client: &reqwest::Client,
+    start: &str,
+    build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, FetchError> {
+    let mut url = start.to_owned();
+    for _ in 0..=MAX_REDIRECTS {
+        yuuka_outbound::assert_safe_outbound_url(&url)
+            .await
+            .map_err(FetchError::Blocked)?;
+        let resp = build(client.get(&url))
+            .send()
+            .await
+            .map_err(|e| classify_send_error(&e))?;
+        if !is_followed_redirect(resp.status()) {
+            return Ok(resp);
+        }
+        let invalid = || FetchError::Redirect("リダイレクト先が不正です。".to_owned());
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(invalid)?;
+        url = resp.url().join(location).map_err(|_| invalid())?.into();
+    }
+    Err(FetchError::Redirect(
+        "リダイレクトが多すぎます。".to_owned(),
+    ))
+}
+
 /// ブラウザ相当ヘッダ + 指数バックオフで HTML を取得する（Node `fetchHtmlWithRetry`）。
 /// `fetchDynamicPage` の静的取得経路でも共有する。
 ///
 /// # Errors
 /// 全リトライ失敗時に最後のエラー文言を返す。
 pub async fn fetch_html(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, reqwest::Error>> =
+        std::sync::OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| yuuka_outbound::guarded_client(Duration::from_secs(15)))
+        .as_ref()
         .map_err(|e| e.to_string())?;
 
     let mut delay = Duration::from_secs(1);
@@ -281,8 +345,8 @@ pub async fn fetch_html(url: &str) -> Result<String, String> {
     let mut last_err = "ページ取得に失敗しました。".to_owned();
 
     for i in 0..max_retries {
-        let req = client
-            .get(url)
+        let sent = get_following(client, url, |req| {
+            req
             .header("User-Agent", UA)
             .header(
                 "Accept",
@@ -294,9 +358,11 @@ pub async fn fetch_html(url: &str) -> Result<String, String> {
             .header("Sec-Fetch-Mode", "navigate")
             .header("Sec-Fetch-Site", "none")
             .header("Upgrade-Insecure-Requests", "1")
-            .timeout(Duration::from_secs(15));
+                .timeout(Duration::from_secs(15))
+        })
+        .await;
 
-        match req.send().await {
+        match sent {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
@@ -309,7 +375,9 @@ pub async fn fetch_html(url: &str) -> Result<String, String> {
                     return Err(last_err);
                 }
             }
-            Err(e) => last_err = format!("リクエストエラー: {e}"),
+            Err(FetchError::Transport(e)) => last_err = e,
+            // SSRF 検査で弾いた・リダイレクト不正は再試行しても結果が変わらない。
+            Err(FetchError::Blocked(e) | FetchError::Redirect(e)) => return Err(e),
         }
 
         if i < max_retries - 1 {
@@ -323,6 +391,61 @@ pub async fn fetch_html(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yuuka_outbound::PublicOnlyResolver;
+
+    #[tokio::test]
+    async fn fetch_html_refuses_internal_targets_without_connecting() {
+        // 内部アドレスのリテラルは接続前に拒否される（待受は無いので接続していれば別のエラーになる）。
+        for url in [
+            "http://127.0.0.1:9/",
+            "http://169.254.169.254/latest/meta-data",
+            "http://localhost/",
+        ] {
+            let err = fetch_html(url).await.unwrap_err();
+            assert!(err.contains("許可されていません"), "{url}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_only_resolver_rejects_loopback_names() {
+        use reqwest::dns::Resolve;
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        assert!(PublicOnlyResolver.resolve(name).await.is_err());
+    }
+
+    /// リゾルバの拒否は送信エラーの原因から `Blocked` と分かる（再試行しない）。
+    #[tokio::test]
+    async fn resolver_rejection_is_classified_as_blocked() {
+        let client = yuuka_outbound::guarded_client(Duration::from_secs(1)).unwrap();
+        // URL の事前検査を通さず、リゾルバだけで拒否される名前（*.localhost）で送る。
+        let err = client
+            .get("http://yuuka-test.localhost/")
+            .send()
+            .await
+            .unwrap_err();
+        let classified = classify_send_error(&err);
+        assert!(
+            matches!(&classified, FetchError::Blocked(msg) if msg.contains("ローカルホスト")),
+            "{classified:?}"
+        );
+    }
+
+    #[test]
+    fn only_real_redirects_are_followed() {
+        use reqwest::StatusCode;
+        for s in [301, 302, 303, 307, 308] {
+            assert!(
+                is_followed_redirect(StatusCode::from_u16(s).unwrap()),
+                "{s}"
+            );
+        }
+        for s in [300, 304, 305, 200, 404] {
+            assert!(
+                !is_followed_redirect(StatusCode::from_u16(s).unwrap()),
+                "{s}"
+            );
+        }
+    }
 
     #[test]
     fn encode_query_percent_encodes_spaces_and_kanji() {

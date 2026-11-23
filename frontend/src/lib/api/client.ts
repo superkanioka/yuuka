@@ -14,7 +14,7 @@
 //   - scope:'user' … botId を絶対に注入しない（auth/me/bots系/device/setup/admin/
 //                     settings）。stale な botId を混ぜると別 Bot のデータに化ける。
 //   - 除外は「プレフィックス一致」なので、サービス層で正しい scope を付ける責務。
-//     （/api/bots 配下・/api/login|register|logout|me・/api/auth/device/*・
+//     （/api/bots 配下・/api/logout|me・/api/auth/device/*・
 //       device-management 3本・/api/setup* は scope:'user'）
 //
 //   - credentials:'same-origin' を明示。dev は Vite proxy(changeOrigin:false)で
@@ -28,9 +28,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { get } from "svelte/store";
+import {
+	currentRoute,
+	goto,
+	isPublicPath,
+	page,
+	withBasePath,
+} from "$lib/router";
 import { activeBot } from "$lib/stores/activeBot";
 import { currentUser } from "$lib/stores/session";
-import { goto, isPublicPath, currentRoute } from "$lib/router";
+import { ApiError, DEFAULT_ERROR_MESSAGE } from "./errors";
+
+export { ApiError, errorMessage } from "./errors";
 
 /** scope:'bot' は botId 注入必須、'user' は絶対に注入しない。 */
 export type Scope = "bot" | "user";
@@ -48,16 +57,6 @@ export interface RequestOpts {
 
 /** body を取らないメソッド（GET/DELETE）用の Opts。 */
 export type NoBodyOpts = Omit<RequestOpts, "body">;
-
-export class ApiError extends Error {
-	constructor(
-		public status: number,
-		message: string,
-	) {
-		super(message);
-		this.name = "ApiError";
-	}
-}
 
 function applyQuery(url: URL, query?: RequestOpts["query"]): void {
 	if (!query) return;
@@ -91,7 +90,9 @@ async function request<T>(
 		if (botId) url.searchParams.set("botId", botId);
 		finalBody = undefined;
 	} else {
-		const base = (opts.body as Record<string, unknown> | undefined) ?? (botId ? {} : undefined);
+		const base =
+			(opts.body as Record<string, unknown> | undefined) ??
+			(botId ? {} : undefined);
 		const merged = base && botId ? { ...base, botId } : base;
 		if (merged !== undefined) {
 			finalBody = JSON.stringify(merged);
@@ -109,8 +110,17 @@ async function request<T>(
 	// 集中型 401: bootstrap プローブ・公開ルート上では遷移しない（匿名として扱う）
 	if (res.status === 401) {
 		currentUser.set(null);
-		if (!opts.isBootstrap && !isPublicPath(get(currentRoute))) {
-			goto("/login");
+		const here = get(currentRoute);
+		if (!opts.isBootstrap && !isPublicPath(here)) {
+			// #34 症状4: returnTo を付けてログイン後に元の画面へ戻れるようにする
+			// （currentRoute はアプリ相対パス・query/hash は page ストアの URL から補う）。
+			// returnTo は物理パス（`/admin/...`）で渡す。PWA 等の別アプリから来る returnTo（`/todo`）と
+			// 同じ規約にそろえ、ログイン側（resolveReturnTarget）が SPA 内/外を一意に判別できるようにする。
+			const dest =
+				here === "/login"
+					? "/login"
+					: `/login?returnTo=${encodeURIComponent(withBasePath(here) + get(page).search + get(page).hash)}`;
+			goto(dest);
 		}
 		throw new ApiError(401, "認証が必要です");
 	}
@@ -122,14 +132,38 @@ async function request<T>(
 
 	// HTTP エラー、または 200 でも success:false は失敗扱い
 	if (!res.ok || data.success === false) {
-		throw new ApiError(res.status, data.message ?? "エラーが発生しました");
+		throw new ApiError(res.status, data.message ?? DEFAULT_ERROR_MESSAGE);
 	}
 	return data;
 }
 
 export const api = {
-	get: <T>(path: string, opts: NoBodyOpts) => request<T>("GET", path, opts as RequestOpts),
+	get: <T>(path: string, opts: NoBodyOpts) =>
+		request<T>("GET", path, opts as RequestOpts),
 	post: <T>(path: string, body?: unknown, opts?: NoBodyOpts) =>
 		request<T>("POST", path, { ...(opts as RequestOpts), body }),
-	del: <T>(path: string, opts: NoBodyOpts) => request<T>("DELETE", path, opts as RequestOpts),
+	del: <T>(path: string, opts: NoBodyOpts) =>
+		request<T>("DELETE", path, opts as RequestOpts),
+	/** JSON POST の結果をファイルとして受け取る（暗号化パッケージ等）。 */
+	downloadPost: async (
+		path: string,
+		body: Record<string, unknown>,
+	): Promise<{ blob: Blob; filename: string | null }> => {
+		const res = await fetch(new URL(path, location.origin), {
+			method: "POST",
+			credentials: "same-origin",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) {
+			const data = (await res.json().catch(() => ({}))) as { message?: string };
+			throw new ApiError(
+				res.status,
+				data.message ?? "ダウンロードに失敗しました",
+			);
+		}
+		const disposition = res.headers.get("Content-Disposition");
+		const filename = disposition?.match(/filename="([^"]+)"/)?.[1] ?? null;
+		return { blob: await res.blob(), filename };
+	},
 };

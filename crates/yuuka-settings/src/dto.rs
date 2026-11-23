@@ -13,25 +13,11 @@ pub(crate) struct ProfileInput {
     pub username: Option<String>,
 }
 
-/// `POST /api/settings/password`。
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct PasswordInput {
-    #[serde(default, rename = "currentPassword")]
-    pub current_password: Option<String>,
-    #[serde(default, rename = "newPassword")]
-    pub new_password: Option<String>,
-}
-
-/// `POST /api/settings/delete-account`。
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct DeleteAccountInput {
-    #[serde(default)]
-    pub password: Option<String>,
-}
-
 /// `POST /api/settings/gemini`。
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct GeminiInput {
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default, rename = "apiKey")]
     pub api_key: Option<String>,
     #[serde(default)]

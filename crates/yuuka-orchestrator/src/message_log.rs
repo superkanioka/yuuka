@@ -7,6 +7,7 @@
 use rusqlite::{params, OptionalExtension};
 use yuuka_core::DbError;
 use yuuka_db::map_sqlite;
+use yuuka_discord::ReplyAncestor;
 use yuuka_web::Db;
 
 /// 直近コンテキストの既定件数（Node `CONTEXT_LIMIT = 15`）。
@@ -14,6 +15,12 @@ pub const CONTEXT_LIMIT: i64 = 15;
 
 /// 汎用モード・ギルドコンテキストの既定件数（Node `GUILD_CONTEXT_LIMIT = 30`）。
 pub const GUILD_CONTEXT_LIMIT: i64 = 30;
+
+/// 返信元チェーンの上限件数（Node `REPLY_CHAIN_MAX_DEPTH` の既定 10 より絞る）。
+pub const REPLY_CHAIN_MAX: usize = 8;
+
+/// 返信元チェーン 1 件の最大文字数（systemInstruction の肥大を防ぐ）。
+pub const REPLY_CHAIN_ITEM_CHARS: usize = 1200;
 
 /// 会話 1 発言（LLM へ渡す履歴要素・Node `ContextEntry`）。`role` は `"user"`/`"assistant"`。
 #[derive(Debug, Clone)]
@@ -101,7 +108,8 @@ pub async fn get_bot_usage_series(
         .await
 }
 
-/// 秘書コンテキストのリセット境界キー（Node `contextFloorKey`）。
+/// 秘書コンテキストのリセット境界キー（Node `contextFloorKey`）。**Discord 専用**（後方互換のため
+/// 無変更で維持・`source` 導入前からの既存境界をそのまま引き継ぐ）。
 fn context_floor_key(user_id: &str, bot_id: &str) -> String {
     format!("context_floor:{bot_id}:{user_id}")
 }
@@ -112,7 +120,19 @@ fn bot_dm_context_floor_key(user_id: &str, bot_id: &str) -> String {
     format!("context_floor:{bot_id}:dm:{user_id}")
 }
 
-/// 送受信メッセージを `message_logs` へ記録する（Node `addMessageLog`・`guild_id = NULL` = 秘書/DM）。
+/// PWA コンテキストのリセット境界キー（issue #33/#38: Discord とは別軸で管理する）。
+///
+/// Node の `source` 導入（8/14 merge bb97bae）は `contextKey`/`contextFloorKey` を
+/// `` `${botId}:${source}` `` で束ねたのに対し `clearContext` だけ据え置きのままで、書き込み/読み出しと
+/// リセットのキーが食い違って「リセットしても消えない」バグ（issue #38）を生んだ。Rust では
+/// **読み出し（[`recent_pwa_context`]）とリセット（[`clear_pwa_context`]）が必ずこの同じ関数を経由する**
+/// ようにして、同種のキー不一致を構造的に起こせなくする。
+fn pwa_context_floor_key(user_id: &str, bot_id: &str) -> String {
+    format!("context_floor:{bot_id}:pwa:{user_id}")
+}
+
+/// 送受信メッセージを `message_logs` へ記録する（Node `addMessageLog`・`guild_id = NULL` = 秘書/DM・
+/// `source` は既定 `"discord"`）。
 ///
 /// # Errors
 /// 書き込み失敗時 [`DbError`]。
@@ -125,20 +145,75 @@ pub async fn add_message_log(
     discord_msg_id: Option<&str>,
     reply_to_msg_id: Option<&str>,
 ) -> Result<(), DbError> {
-    let (user_id, bot_id, role, content) = (
+    add_message_log_for(
+        db,
+        user_id,
+        bot_id,
+        role,
+        content,
+        discord_msg_id,
+        reply_to_msg_id,
+        "discord",
+    )
+    .await
+}
+
+/// PWA 発の送受信メッセージを `message_logs` へ記録する（`source = "pwa"`・discord_msg_id/reply_to_msg_id
+/// は常に `NULL`）。issue #33 の PWA チャット送信用。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn add_pwa_message_log(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<(), DbError> {
+    add_message_log_for(db, user_id, bot_id, role, content, None, None, "pwa").await
+}
+
+/// [`add_message_log`]/[`add_pwa_message_log`] の共通実装。`source` を明示的に列へ書く
+/// （マイグレーション V21 の `DEFAULT 'discord'` に頼らず、Discord 経路も含めて全 INSERT が
+/// 自分の由来を明示する）。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+#[allow(clippy::too_many_arguments)]
+async fn add_message_log_for(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    role: &str,
+    content: &str,
+    discord_msg_id: Option<&str>,
+    reply_to_msg_id: Option<&str>,
+    source: &str,
+) -> Result<(), DbError> {
+    let (user_id, bot_id, role, content, source) = (
         user_id.to_owned(),
         bot_id.to_owned(),
         role.to_owned(),
         content.to_owned(),
+        source.to_owned(),
     );
     let discord_msg_id = discord_msg_id.map(str::to_owned);
     let reply_to_msg_id = reply_to_msg_id.map(str::to_owned);
     db.writer
         .transaction(move |tx| {
             tx.execute(
-                "INSERT INTO message_logs (user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id],
+                "INSERT INTO message_logs \
+                   (user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id, source) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    user_id,
+                    bot_id,
+                    discord_msg_id,
+                    role,
+                    content,
+                    reply_to_msg_id,
+                    source
+                ],
             )
             .map_err(map_sqlite)?;
             Ok(())
@@ -146,7 +221,8 @@ pub async fn add_message_log(
         .await
 }
 
-/// 秘書コンテキスト（`guild_id IS NULL`・秘書 floor）を古い順に取得する（Node `getRecentContext`）。
+/// 秘書コンテキスト（`guild_id IS NULL`・`source='discord'`・秘書 floor）を古い順に取得する
+/// （Node `getRecentContext`）。
 ///
 /// # Errors
 /// 読み取り失敗時 [`DbError`]。
@@ -161,13 +237,39 @@ pub async fn recent_context(
         user_id,
         bot_id,
         context_floor_key(user_id, bot_id),
+        "discord",
+        limit,
+    )
+    .await
+}
+
+/// PWA コンテキスト（`guild_id IS NULL`・`source='pwa'`・PWA floor）を古い順に取得する（issue #33）。
+///
+/// [`pwa_context_floor_key`] を [`clear_pwa_context`] と共有するため、書き込み/読み出しとリセットの
+/// キーが食い違う心配がない（issue #38 の Node バグの再発防止）。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn recent_pwa_context(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    limit: i64,
+) -> Result<Vec<ContextEntry>, DbError> {
+    recent_context_with_floor(
+        db,
+        user_id,
+        bot_id,
+        pwa_context_floor_key(user_id, bot_id),
+        "pwa",
         limit,
     )
     .await
 }
 
 /// owner DM（汎用モード）コンテキストを古い順に取得する（Node `getBotDmContext`）。SQLite の行は秘書と
-/// 同じ（`bot_id × user_id × guild_id IS NULL`）だが、リセット境界だけ DM 専用 floor で分離する。
+/// 同じ（`bot_id × user_id × guild_id IS NULL`・`source='discord'`）だが、リセット境界だけ DM 専用
+/// floor で分離する。
 ///
 /// # Errors
 /// 読み取り失敗時 [`DbError`]。
@@ -182,21 +284,24 @@ pub async fn recent_bot_dm_context(
         user_id,
         bot_id,
         bot_dm_context_floor_key(user_id, bot_id),
+        "discord",
         limit,
     )
     .await
 }
 
 /// LLM へ渡す直近コンテキストを**古い順**で取得する（Node `getRecentContext`/`getBotDmContext` の SQLite
-/// 再構築部）。指定 `floor_key` より後・`guild_id IS NULL`（秘書/DM）の直近 `limit` 件を古い順に返す。
+/// 再構築部）。指定 `floor_key` より後・`guild_id IS NULL`（秘書/DM）・指定 `source` の直近 `limit` 件を
+/// 古い順に返す。
 async fn recent_context_with_floor(
     db: &Db,
     user_id: &str,
     bot_id: &str,
     floor_key: String,
+    source: &str,
     limit: i64,
 ) -> Result<Vec<ContextEntry>, DbError> {
-    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    let (user_id, bot_id, source) = (user_id.to_owned(), bot_id.to_owned(), source.to_owned());
     db.read
         .read(move |conn| {
             // floor（無ければ 0・非数値も 0）。
@@ -216,12 +321,13 @@ async fn recent_context_with_floor(
                     "SELECT role, content FROM ( \
                        SELECT id, role, content FROM message_logs \
                        WHERE user_id = ?1 AND bot_id = ?2 AND id > ?3 AND guild_id IS NULL \
+                         AND source = ?5 AND is_notice = 0 \
                        ORDER BY id DESC LIMIT ?4 \
                      ) ORDER BY id ASC",
                 )
                 .map_err(map_sqlite)?;
             let rows = stmt
-                .query_map(params![user_id, bot_id, floor, limit], |r| {
+                .query_map(params![user_id, bot_id, floor, limit, source], |r| {
                     Ok(ContextEntry {
                         role: r.get::<_, String>(0)?,
                         content: r.get::<_, String>(1)?,
@@ -231,6 +337,430 @@ async fn recent_context_with_floor(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_sqlite)?;
             Ok(rows)
+        })
+        .await
+}
+
+/// PWA チャット画面の履歴一覧 1 件（Node `MessageLogRecord` の PWA 表示に使う部分集合）。
+#[derive(Debug, Clone)]
+pub struct PwaMessageRow {
+    pub id: i64,
+    /// `"user" | "assistant"`。
+    pub role: String,
+    pub content: String,
+    /// `'YYYY-MM-DD HH:MM:SS'`（SQLite localtime）。
+    pub created_at: String,
+    /// `RichEmbed` 配列の JSON（issue #41 PR #75 レビュー・P2）。埋め込みが無ければ `None`。
+    pub rich_content: Option<String>,
+    /// このアシスタント応答に付随するファイル添付（メタデータのみ・バイト列は
+    /// [`get_pwa_attachment_for_user`] で個別に取得する）。
+    pub attachments: Vec<PwaAttachmentRow>,
+}
+
+/// [`PwaMessageRow::attachments`] の 1 件（バイト列は含まない・一覧表示用）。
+#[derive(Debug, Clone)]
+pub struct PwaAttachmentRow {
+    pub id: i64,
+    pub name: String,
+    pub mime_type: String,
+}
+
+/// PWA チャット履歴を古い順に返す（Node `listPwaMessages`・`source='pwa'` のみ・floor 非依存＝
+/// リセット後も永続ログ自体は表示する、Node と同じ「履歴一覧は全件、LLM コンテキストだけ floor で
+/// 絞る」設計）。issue #41 PR #75 レビュー（P2）で `rich_content`/添付メタデータも合わせて返すよう拡張。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn list_pwa_messages(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    limit: i64,
+) -> Result<Vec<PwaMessageRow>, DbError> {
+    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    let limit = limit.clamp(1, 200);
+    db.read
+        .read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, role, content, created_at, rich_content FROM ( \
+                       SELECT id, role, content, created_at, rich_content FROM message_logs \
+                       WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa' \
+                       ORDER BY id DESC LIMIT ?3 \
+                     ) ORDER BY id ASC",
+                )
+                .map_err(map_sqlite)?;
+            let mut rows = stmt
+                .query_map(params![user_id, bot_id, limit], |r| {
+                    Ok(PwaMessageRow {
+                        id: r.get::<_, i64>(0)?,
+                        role: r.get::<_, String>(1)?,
+                        content: r.get::<_, String>(2)?,
+                        created_at: r.get::<_, String>(3)?,
+                        rich_content: r.get::<_, Option<String>>(4)?,
+                        attachments: Vec::new(),
+                    })
+                })
+                .map_err(map_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite)?;
+
+            // 添付は行ごとの小さな別クエリで補完する（PWA 履歴は高々 200 件・N+1 でも実害の無い
+            // 規模。read プールの同一コネクション内で完結させ、追加の往復コストを増やさない）。
+            let mut att_stmt = conn
+                .prepare(
+                    "SELECT id, name, mime_type FROM message_attachments \
+                     WHERE message_log_id = ?1 ORDER BY id ASC",
+                )
+                .map_err(map_sqlite)?;
+            // アシスタントの添付（グラフ等）とユーザーが送った添付（画像・音声等）の両方を返す。
+            for row in &mut rows {
+                row.attachments = att_stmt
+                    .query_map(params![row.id], |r| {
+                        Ok(PwaAttachmentRow {
+                            id: r.get::<_, i64>(0)?,
+                            name: r.get::<_, String>(1)?,
+                            mime_type: r.get::<_, String>(2)?,
+                        })
+                    })
+                    .map_err(map_sqlite)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_sqlite)?;
+            }
+            Ok(rows)
+        })
+        .await
+}
+
+/// [`add_pwa_assistant_reply`] の添付入力 1 件（呼び出し側が `TurnReply::files` から変換する）。
+#[derive(Debug, Clone)]
+pub struct PwaAttachmentInput {
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// PWA アシスタント応答をリッチコンテンツ（embeds JSON・添付ファイル）付きで保存する（issue #41
+/// PR #75 レビュー・P2: `secretary_turn_pwa` の戻り値が持つ `embeds`/`files` が [`add_pwa_message_log`]
+/// では握り潰され `reply.text` しか保存されていなかった問題の解消）。
+///
+/// `embeds_json`（[`yuuka_discord::RichEmbed`] 配列の JSON・埋め込みが無ければ `None`）と `files`
+/// （バイナリ添付・`message_attachments` へ別テーブル保存）を message_logs 行 1 件とアトミックに
+/// 書き込み、挿入した `message_logs.id` を返す（添付の外部キー・GET 応答の attachment URL 組み立てに使う）。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn add_pwa_assistant_reply(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+    embeds_json: Option<&str>,
+    files: &[PwaAttachmentInput],
+) -> Result<i64, DbError> {
+    let (user_id, bot_id, content) = (user_id.to_owned(), bot_id.to_owned(), content.to_owned());
+    let embeds_json = embeds_json.map(str::to_owned);
+    let files = files.to_vec();
+    db.writer
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO message_logs \
+                   (user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id, source, rich_content) \
+                 VALUES (?1, ?2, NULL, 'assistant', ?3, NULL, 'pwa', ?4)",
+                params![user_id, bot_id, content, embeds_json],
+            )
+            .map_err(map_sqlite)?;
+            let message_log_id = tx.last_insert_rowid();
+            for file in &files {
+                tx.execute(
+                    "INSERT INTO message_attachments (message_log_id, name, mime_type, bytes) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![message_log_id, file.name, file.mime_type, file.bytes],
+                )
+                .map_err(map_sqlite)?;
+            }
+            Ok(message_log_id)
+        })
+        .await
+}
+
+/// PWA のシステム通知（⚠️ の定型応答・失敗/タイムアウトのフォールバック）をアシスタント行として保存する
+/// （issue #41 PR #75 レビュー・P1）。非同期配信ではターン確定の印として履歴にアシスタント行が
+/// 現れる必要があるため保存するが、`is_notice=1` で LLM コンテキスト（[`recent_pwa_context`] 等）からは
+/// 除外する（「⚠️ 定型応答で以後の文脈を汚染しない」不変条件の維持）。履歴一覧（[`list_pwa_messages`]）
+/// には通常のアシスタント応答として現れる。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn add_pwa_notice(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+) -> Result<i64, DbError> {
+    let (user_id, bot_id, content) = (user_id.to_owned(), bot_id.to_owned(), content.to_owned());
+    db.writer
+        .transaction(move |tx| insert_pwa_notice(tx, &user_id, &bot_id, &content))
+        .await
+}
+
+/// [`add_pwa_notice`] と [`fail_orphaned_pwa_turns`] が共有する通知行の INSERT（`is_notice=1` の
+/// アシスタント行・`source='pwa'`）。通知行の形を 1 か所に固定する。
+fn insert_pwa_notice(
+    tx: &rusqlite::Transaction,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+) -> Result<i64, DbError> {
+    tx.execute(
+        "INSERT INTO message_logs \
+           (user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id, source, is_notice) \
+         VALUES (?1, ?2, NULL, 'assistant', ?3, NULL, 'pwa', 1)",
+        params![user_id, bot_id, content],
+    )
+    .map_err(map_sqlite)?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// [`accept_pwa_user_message`] の結果（永続化済みの PWA ユーザー発言）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedPwaMessage {
+    /// 保存したユーザー発言の `message_logs.id`。
+    pub message_id: i64,
+    /// このユーザー発言を保存する**直前**の、`source='pwa'` 会話の最大 `message_logs.id`（無ければ 0）。
+    /// `202` 応答の `sinceId`（クライアントのポーリング起点）として使う。
+    pub since_id: i64,
+}
+
+/// PWA のユーザー発言を `202 Accepted` を返す**前に**永続化する（issue #77）。
+///
+/// 従来はユーザー発言の保存がバックグラウンドターン（`ChatEngine::secretary_turn_pwa`）の先頭にあった
+/// ため、`202` の後・保存前にプロセスが落ちると受理済みの送信そのものが履歴から消えた。ここで先に
+/// 保存しておくことで、「受理した発言は必ず履歴に残る」ことを `202` の前提にする。以後にターンが
+/// 失われても、履歴は「未回答のユーザー発言」で終わる状態になり、起動時の回復スイープ
+/// （[`fail_orphaned_pwa_turns`]）が終端の通知行を書ける。
+///
+/// `sinceId` の読み出しと保存を 1 トランザクションで行う（間に別の行が挟まらない）。エンジン側の
+/// PWA ターンはユーザー発言を**保存しない**（呼び出し側がこの関数で保存済みである前提・
+/// `ChatEngine::secretary_turn_pwa` 参照）。`content` は呼び出し側が trim 済みの非空文字列を渡す。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn accept_pwa_user_message(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+) -> Result<AcceptedPwaMessage, DbError> {
+    accept_pwa_user_message_with_files(db, user_id, bot_id, content, &[]).await
+}
+
+/// [`accept_pwa_user_message`] の添付付き版。ユーザーが送った添付（画像・音声等）を発言の行と同じ
+/// トランザクションで `message_attachments` へ保存する（履歴表示・`GET /api/client/chat/attachments/:id`）。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn accept_pwa_user_message_with_files(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+    files: &[PwaAttachmentInput],
+) -> Result<AcceptedPwaMessage, DbError> {
+    let (user_id, bot_id, content) = (user_id.to_owned(), bot_id.to_owned(), content.to_owned());
+    let files = files.to_vec();
+    db.writer
+        .transaction(move |tx| {
+            let since_id = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM message_logs \
+                     WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa'",
+                    params![user_id, bot_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(map_sqlite)?;
+            tx.execute(
+                "INSERT INTO message_logs \
+                   (user_id, bot_id, discord_msg_id, role, content, reply_to_msg_id, source) \
+                 VALUES (?1, ?2, NULL, 'user', ?3, NULL, 'pwa')",
+                params![user_id, bot_id, content],
+            )
+            .map_err(map_sqlite)?;
+            let message_id = tx.last_insert_rowid();
+            for file in &files {
+                tx.execute(
+                    "INSERT INTO message_attachments (message_log_id, name, mime_type, bytes) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![message_id, file.name, file.mime_type, file.bytes],
+                )
+                .map_err(map_sqlite)?;
+            }
+            Ok(AcceptedPwaMessage {
+                message_id,
+                since_id,
+            })
+        })
+        .await
+}
+
+/// [`fail_orphaned_pwa_turns`] が 1 トランザクションで処理する会話数の上限（書き込みの占有時間を
+/// 抑えるための分割単位。全件処理されるまで呼び出し側でループする）。
+const ORPHAN_SWEEP_BATCH: i64 = 500;
+
+/// 起動時の回復スイープ: 応答待ちのまま取り残された PWA 会話に終端の通知行を書く（issue #77）。
+///
+/// `202` で受理したターンはプロセス内の `tokio::spawn` で動くため、再起動・異常終了で消える
+/// （in-flight 集合も同時に消え、通知行を書く後始末も走らない）。ターンの再開は行わず（Gemini の
+/// ツール呼び出しは副作用を持ちうるため二重実行の恐れがある・fail-closed）、**「`source='pwa'` の
+/// 最新行が `role='user'` のままの会話」= 取り残された会話**として、`content` を持つ通知行
+/// （[`add_pwa_notice`] と同じ `is_notice=1` のアシスタント行）を 1 件ずつ追加する。クライアントの
+/// ポーリングは `sinceId` より後のアシスタント行で終了するため、これで有限時間で終端し文言が表示される。
+/// 通知行は LLM コンテキストからは除外される（[`recent_pwa_context`] は `is_notice = 0` のみ）。
+///
+/// **呼び出し条件**: プロセス起動直後、HTTP を受け付ける**前**に 1 度だけ呼ぶこと（新しいプロセスは
+/// in-flight ターンを 1 件も持たないので、該当会話は全て取り残しと断定できる）。稼働中に呼ぶと、
+/// 進行中のターンの会話（最新行がユーザー発言）まで失敗扱いにしてしまう。
+///
+/// **冪等・低コスト**: 通知行を書いた会話は最新行がアシスタントになり再度は対象にならない（2 回目以降
+/// は 0 件）。走査は `idx_message_logs_user_bot_source (user_id, bot_id, source, id)` のカバリング
+/// インデックスのみで会話ごとの最新 `id` を求め、最新行の `role` を主キー検索で判定する（本文は
+/// 読まない・100 万行で ~0.1 秒）。書き込みは [`ORPHAN_SWEEP_BATCH`] 会話ごとに別トランザクション。
+///
+/// 戻り値は通知行を書いた会話の数。
+///
+/// # Errors
+/// 読み書き失敗時 [`DbError`]（それまでに commit 済みのバッチは残る）。
+pub async fn fail_orphaned_pwa_turns(db: &Db, content: &str) -> Result<usize, DbError> {
+    let mut total = 0_usize;
+    loop {
+        let content = content.to_owned();
+        let written = db
+            .writer
+            .transaction(move |tx| {
+                let orphans = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT t.user_id, t.bot_id \
+                             FROM ( \
+                               SELECT user_id, bot_id, MAX(id) AS last_id FROM message_logs \
+                               WHERE source = 'pwa' GROUP BY user_id, bot_id \
+                             ) t \
+                             JOIN message_logs m ON m.id = t.last_id \
+                             WHERE m.role = 'user' \
+                             LIMIT ?1",
+                        )
+                        .map_err(map_sqlite)?;
+                    let rows = stmt
+                        .query_map(params![ORPHAN_SWEEP_BATCH], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(map_sqlite)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(map_sqlite)?;
+                    rows
+                };
+                for (user_id, bot_id) in &orphans {
+                    insert_pwa_notice(tx, user_id, bot_id, &content)?;
+                }
+                Ok(orphans.len())
+            })
+            .await?;
+        total += written;
+        // バッチが満杯でなければ全件処理済み（満杯なら残りがあるかもしれないので再走査する。処理済みの
+        // 会話は最新行がアシスタントになっているため、各パスで対象は必ず減り、ループは有限回で終わる）。
+        if i64::try_from(written).unwrap_or(i64::MAX) < ORPHAN_SWEEP_BATCH {
+            return Ok(total);
+        }
+    }
+}
+
+/// 添付ファイル本体（バイト列を含む・issue #41 PR #75 レビュー・P2）。
+#[derive(Debug, Clone)]
+pub struct PwaAttachmentBlob {
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 添付ファイル本体を所有者スコープで取得する（`GET /api/client/chat/attachments/:id` 用）。
+/// `message_logs.user_id` が `user_id` と一致し、かつ `source='pwa'` の行に紐づく添付のみ返す
+/// （他ユーザーの添付・Discord 由来の行に紐づく添付は `None`＝呼び出し側で 404 に写像する）。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn get_pwa_attachment_for_user(
+    db: &Db,
+    attachment_id: i64,
+    user_id: &str,
+) -> Result<Option<PwaAttachmentBlob>, DbError> {
+    let user_id = user_id.to_owned();
+    db.read
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT a.name, a.mime_type, a.bytes \
+                 FROM message_attachments a \
+                 JOIN message_logs m ON m.id = a.message_log_id \
+                 WHERE a.id = ?1 AND m.user_id = ?2 AND m.source = 'pwa'",
+                params![attachment_id, user_id],
+                |r| {
+                    Ok(PwaAttachmentBlob {
+                        name: r.get::<_, String>(0)?,
+                        mime_type: r.get::<_, String>(1)?,
+                        bytes: r.get::<_, Vec<u8>>(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite)
+        })
+        .await
+}
+
+/// `source='pwa'` 会話の直近 `message_logs.id`（無ければ 0）。チャット送信（issue #41 PR #75・
+/// 非同期配信レビュー）が `202` 応答へ含める `sinceId`（クライアントのポーリング起点）に使う。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn max_pwa_message_id(db: &Db, user_id: &str, bot_id: &str) -> Result<i64, DbError> {
+    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    db.read
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM message_logs \
+                 WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa'",
+                params![user_id, bot_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(map_sqlite)
+        })
+        .await
+}
+
+/// `since_id` より後に `source='pwa'` のアシスタント応答が既に 1 件でも存在するか。バックグラウンド
+/// のチャット送信ターン（issue #41 PR #75 レビュー・非同期配信）が失敗/タイムアウトした際、
+/// フォールバック（終端状態）応答を二重に保存しないための確認に使う。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn has_pwa_assistant_reply_after(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    since_id: i64,
+) -> Result<bool, DbError> {
+    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    db.read
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM message_logs \
+                   WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa' \
+                     AND role = 'assistant' AND id > ?3 \
+                 )",
+                params![user_id, bot_id, since_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(map_sqlite)
         })
         .await
 }
@@ -355,6 +885,44 @@ pub async fn clear_context(db: &Db, user_id: &str, bot_id: &str) -> Result<(), D
         .await
 }
 
+/// PWA コンテキストをリセットする（issue #33/#38）。[`clear_context`] の PWA 版で、境界キーは
+/// 必ず [`pwa_context_floor_key`]（[`recent_pwa_context`] と共有）を使う。
+///
+/// Node の bug（issue #38）は、コンテキストを `source` 別キーへ分けた際に `clearContext` だけ
+/// 旧キーのまま据え置かれ、リセットが何も消さなくなった。Rust では読み出し・リセットが同じ
+/// `pwa_context_floor_key` 関数を経由するため、この種のキー不一致は構造的に起こらない。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn clear_pwa_context(db: &Db, user_id: &str, bot_id: &str) -> Result<(), DbError> {
+    let floor_key = pwa_context_floor_key(user_id, bot_id);
+    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    db.writer
+        .transaction(move |tx| {
+            // PWA (`source='pwa'`) の最大 id のみを境界にする（Discord 側の id が pwa より新しくても
+            // 巻き込まない・[`recent_pwa_context`] が `source='pwa'` で絞るのと対称）。
+            let max_id: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM message_logs \
+                     WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa'",
+                    params![user_id, bot_id],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .map_err(map_sqlite)?;
+            if let Some(max_id) = max_id {
+                tx.execute(
+                    "INSERT INTO system_settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                     updated_at = datetime('now', 'localtime')",
+                    params![floor_key, max_id.to_string()],
+                )
+                .map_err(map_sqlite)?;
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Bot 単位の日次利用件数（Node `countBotDailyUsage`・`role='user'` を日付集計・降順）。
 ///
 /// `days` は `[1,90]` に floor + clamp する。`created_at >= date('now','localtime','-N days')` で範囲を
@@ -390,6 +958,144 @@ pub async fn count_bot_daily_usage(
                 out.push(row.map_err(map_sqlite)?);
             }
             Ok(out)
+        })
+        .await
+}
+
+/// アシスタント応答を入力メッセージへ紐づけて保存し、挿入した行 ID を返す（`source='discord'`）。
+///
+/// `reply_to` は応答した入力の Discord メッセージ ID（返信元チェーンで応答から入力へ遡るため）。
+/// 戻り値は `log:<id>` 形式で後の返信先に使える（WS など Discord のメッセージ ID を持たない経路用）。
+/// 秘書・owner DM は `guild_id = None`、ギルドは `guild_id`/`channel_id` 付きで保存する。
+///
+/// # Errors
+/// 書き込み失敗時 [`DbError`]。
+pub async fn add_linked_assistant_reply(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    content: &str,
+    reply_to: Option<&str>,
+    guild_id: Option<&str>,
+    channel_id: Option<&str>,
+) -> Result<i64, DbError> {
+    let (user_id, bot_id, content) = (user_id.to_owned(), bot_id.to_owned(), content.to_owned());
+    let (reply_to, guild_id, channel_id) = (
+        reply_to.map(str::to_owned),
+        guild_id.map(str::to_owned),
+        channel_id.map(str::to_owned),
+    );
+    db.writer
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO message_logs \
+                   (user_id, bot_id, role, content, reply_to_msg_id, guild_id, channel_id, source) \
+                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6, 'discord')",
+                params![user_id, bot_id, content, reply_to, guild_id, channel_id],
+            )
+            .map_err(map_sqlite)?;
+            Ok(tx.last_insert_rowid())
+        })
+        .await
+}
+
+/// 返信元チェーンを会話ログから復元する（Node `resolveReplyChain`/`resolveGuildReplyChain`）。
+///
+/// `reply_to` から `reply_to_msg_id` を辿り、最大 [`REPLY_CHAIN_MAX`] 件を古い順で返す（直近履歴に
+/// 入らない古い発言も対象）。各段で同じ Bot・`source='discord'`・通知行以外・同じスコープに限る:
+/// 秘書/owner DM（`guild_id = None`）は同じ利用者の `guild_id IS NULL` 行でリセット境界（floor）より後、
+/// ギルドは同じギルド（`channel_id` があれば同じチャンネル）の行。`bot_dm` は owner DM の floor を使う。
+/// 見つからない ID・循環で打ち切る。`log:<id>` は会話ログの行 ID、それ以外は Discord のメッセージ ID
+/// として引く。各件は `[role] 本文` を [`REPLY_CHAIN_ITEM_CHARS`] 文字までに切り、行の Discord メッセージ ID
+/// （無ければ `log:<id>`）を付ける（Discord から取得したチェーンとの重複除去・並べ替え用）。
+///
+/// # Errors
+/// 読み取り失敗時 [`DbError`]。
+pub async fn reply_chain(
+    db: &Db,
+    user_id: &str,
+    bot_id: &str,
+    guild_id: Option<&str>,
+    channel_id: Option<&str>,
+    bot_dm: bool,
+    reply_to: Option<&str>,
+) -> Result<Vec<ReplyAncestor>, DbError> {
+    let Some(reply_to) = reply_to else {
+        return Ok(Vec::new());
+    };
+    let floor_key = if bot_dm {
+        bot_dm_context_floor_key(user_id, bot_id)
+    } else {
+        context_floor_key(user_id, bot_id)
+    };
+    let (user_id, bot_id) = (user_id.to_owned(), bot_id.to_owned());
+    let (guild_id, channel_id) = (guild_id.map(str::to_owned), channel_id.map(str::to_owned));
+    let mut next = Some(reply_to.to_owned());
+    db.read
+        .read(move |conn| {
+            // ギルドはリセット境界を持たない（[`recent_guild_context`] と同じ）。
+            let floor: i64 = if guild_id.is_some() {
+                0
+            } else {
+                conn.query_row(
+                    "SELECT value FROM system_settings WHERE key = ?1",
+                    params![floor_key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite)?
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+            };
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, discord_msg_id, role, content, reply_to_msg_id FROM message_logs \
+                     WHERE bot_id = ?1 AND source = 'discord' AND is_notice = 0 AND id > ?2 \
+                       AND ((?3 IS NULL AND guild_id IS NULL AND user_id = ?4) \
+                         OR (guild_id = ?3 AND (?5 IS NULL OR channel_id = ?5))) \
+                       AND (discord_msg_id = ?6 OR id = ?7) \
+                     ORDER BY id DESC LIMIT 1",
+                )
+                .map_err(map_sqlite)?;
+            let mut chain = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            while chain.len() < REPLY_CHAIN_MAX {
+                let Some(target) = next.take() else {
+                    break;
+                };
+                if !seen.insert(target.clone()) {
+                    break;
+                }
+                let row_id = target
+                    .strip_prefix("log:")
+                    .and_then(|s| s.parse::<i64>().ok());
+                let row = stmt
+                    .query_row(
+                        params![bot_id, floor, guild_id, user_id, channel_id, target, row_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, Option<String>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(map_sqlite)?;
+                let Some((id, discord_msg_id, role, content, parent)) = row else {
+                    break;
+                };
+                let content: String = content.chars().take(REPLY_CHAIN_ITEM_CHARS).collect();
+                chain.push(ReplyAncestor {
+                    message_id: discord_msg_id.unwrap_or_else(|| format!("log:{id}")),
+                    text: format!("[{role}] {content}"),
+                });
+                next = parent;
+            }
+            chain.reverse();
+            Ok(chain)
         })
         .await
 }
@@ -479,5 +1185,663 @@ mod tests {
                 .len(),
             90
         );
+    }
+
+    // ─── issue #33/#38: source 分離コンテキスト（discord/pwa）のテスト ───
+
+    use super::{
+        add_message_log, add_pwa_message_log, clear_context, clear_pwa_context, list_pwa_messages,
+        recent_context, recent_pwa_context, CONTEXT_LIMIT,
+    };
+
+    /// `users` 行を用意する（`message_logs`/`context_notes` の FK 対象）。
+    fn seed_user(path: &std::path::Path, user_id: &str) {
+        let conn = rusqlite::Connection::open(path).expect("open");
+        conn.execute(
+            "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+             VALUES (?1, ?1, 'x')",
+            rusqlite::params![user_id],
+        )
+        .expect("seed user");
+    }
+
+    #[tokio::test]
+    async fn pwa_and_discord_contexts_are_isolated() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_message_log(&db, "u", "b1", "user", "discord-1", None, None)
+            .await
+            .unwrap();
+        add_pwa_message_log(&db, "u", "b1", "user", "pwa-1")
+            .await
+            .unwrap();
+
+        // Discord 側の再構築には PWA の発話が混ざらない。
+        let discord_ctx = recent_context(&db, "u", "b1", CONTEXT_LIMIT).await.unwrap();
+        assert_eq!(discord_ctx.len(), 1);
+        assert_eq!(discord_ctx[0].content, "discord-1");
+
+        // PWA 側の再構築には Discord の発話が混ざらない。
+        let pwa_ctx = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(pwa_ctx.len(), 1);
+        assert_eq!(pwa_ctx[0].content, "pwa-1");
+    }
+
+    #[tokio::test]
+    async fn clear_pwa_context_resets_pwa_only_and_uses_same_key_as_read() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_pwa_message_log(&db, "u", "b1", "user", "pwa-before")
+            .await
+            .unwrap();
+        add_message_log(&db, "u", "b1", "user", "discord-before", None, None)
+            .await
+            .unwrap();
+
+        clear_pwa_context(&db, "u", "b1").await.unwrap();
+
+        // PWA コンテキストはリセット後、境界以前の発話を含まない（issue #38 の再発防止）。
+        let pwa_ctx = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert!(
+            pwa_ctx.is_empty(),
+            "pwa clear は pwa floor を境界まで進める"
+        );
+
+        // Discord コンテキストは pwa のリセットに巻き込まれない（境界キーが別）。
+        let discord_ctx = recent_context(&db, "u", "b1", CONTEXT_LIMIT).await.unwrap();
+        assert_eq!(discord_ctx.len(), 1);
+        assert_eq!(discord_ctx[0].content, "discord-before");
+
+        // 新しい PWA 発話は境界より後なので見える。
+        add_pwa_message_log(&db, "u", "b1", "user", "pwa-after")
+            .await
+            .unwrap();
+        let pwa_ctx_after = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(pwa_ctx_after.len(), 1);
+        assert_eq!(pwa_ctx_after[0].content, "pwa-after");
+    }
+
+    #[tokio::test]
+    async fn clear_context_discord_does_not_affect_pwa_context() {
+        // 対称性の確認: 既存の (discord 用) clear_context も pwa 側を巻き込まない。
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_message_log(&db, "u", "b1", "user", "discord-before", None, None)
+            .await
+            .unwrap();
+        add_pwa_message_log(&db, "u", "b1", "user", "pwa-before")
+            .await
+            .unwrap();
+
+        clear_context(&db, "u", "b1").await.unwrap();
+
+        assert!(recent_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap()
+            .is_empty());
+        let pwa_ctx = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(pwa_ctx.len(), 1, "discord の clear は pwa floor を進めない");
+    }
+
+    #[tokio::test]
+    async fn list_pwa_messages_returns_pwa_only_oldest_first_and_ignores_floor() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_pwa_message_log(&db, "u", "b1", "user", "pwa-1")
+            .await
+            .unwrap();
+        add_message_log(&db, "u", "b1", "user", "discord-1", None, None)
+            .await
+            .unwrap();
+        add_pwa_message_log(&db, "u", "b1", "assistant", "pwa-2")
+            .await
+            .unwrap();
+
+        // 履歴一覧は floor 非依存（リセット後も全件表示）: 先に clear しても件数は変わらない。
+        clear_pwa_context(&db, "u", "b1").await.unwrap();
+
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 2, "discord のログは含まず pwa のみ");
+        assert_eq!(history[0].content, "pwa-1", "古い順");
+        assert_eq!(history[1].content, "pwa-2");
+    }
+
+    // ─── issue #41 PR #75 レビュー: リッチ返信永続化（P2）・非同期配信の補助クエリ（P1） ───
+
+    use super::{
+        add_pwa_assistant_reply, add_pwa_notice, get_pwa_attachment_for_user,
+        has_pwa_assistant_reply_after, max_pwa_message_id, PwaAttachmentInput,
+    };
+
+    #[tokio::test]
+    async fn add_pwa_assistant_reply_persists_embeds_json_and_is_readable_via_history() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        let embeds_json =
+            r#"[{"title":"天気","description":null,"color":46068,"fields":[],"footer":null}]"#;
+        let id = add_pwa_assistant_reply(&db, "u", "b1", "今日は晴れです", Some(embeds_json), &[])
+            .await
+            .unwrap();
+        assert!(id > 0);
+
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[0].content, "今日は晴れです");
+        assert_eq!(history[0].rich_content.as_deref(), Some(embeds_json));
+        assert!(history[0].attachments.is_empty(), "embeds のみ・添付は無し");
+    }
+
+    #[tokio::test]
+    async fn add_pwa_assistant_reply_without_embeds_leaves_rich_content_null() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_pwa_assistant_reply(&db, "u", "b1", "プレーンな返信", None, &[])
+            .await
+            .unwrap();
+
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0].rich_content.is_none(),
+            "embeds が無ければ rich_content は NULL のまま（後方互換）"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_pwa_assistant_reply_persists_attachments_and_lists_metadata_in_history() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        let files = vec![PwaAttachmentInput {
+            name: "attachment.png".to_owned(),
+            mime_type: "image/png".to_owned(),
+            bytes: vec![1, 2, 3, 4],
+        }];
+        let message_log_id = add_pwa_assistant_reply(&db, "u", "b1", "グラフです", None, &files)
+            .await
+            .unwrap();
+
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].attachments.len(),
+            1,
+            "添付メタデータが一覧に載る"
+        );
+        let att = &history[0].attachments[0];
+        assert_eq!(att.name, "attachment.png");
+        assert_eq!(att.mime_type, "image/png");
+
+        // 添付本体（バイト列）は所有者スコープの専用クエリで別途取得する。
+        let blob = get_pwa_attachment_for_user(&db, att.id, "u")
+            .await
+            .unwrap()
+            .expect("owner can fetch the blob");
+        assert_eq!(blob.name, "attachment.png");
+        assert_eq!(blob.mime_type, "image/png");
+        assert_eq!(blob.bytes, vec![1, 2, 3, 4]);
+
+        // 他ユーザーからは取得できない（issue #41 PR #75 レビュー: 所有者スコープの認可）。
+        seed_user(&path, "attacker");
+        let forbidden = get_pwa_attachment_for_user(&db, att.id, "attacker")
+            .await
+            .unwrap();
+        assert!(
+            forbidden.is_none(),
+            "他ユーザーの添付は取得できない（404 相当）"
+        );
+
+        // 未知の attachment id も None（存在しない message_log_id の外部キーを潜り抜けない）。
+        let unknown = get_pwa_attachment_for_user(&db, message_log_id + 999, "u")
+            .await
+            .unwrap();
+        assert!(unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn max_pwa_message_id_and_has_reply_after_track_the_polling_watermark() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        // メッセージが無ければ 0（ポーリングの起点として安全に使える）。
+        assert_eq!(max_pwa_message_id(&db, "u", "b1").await.unwrap(), 0);
+        assert!(
+            !has_pwa_assistant_reply_after(&db, "u", "b1", 0)
+                .await
+                .unwrap(),
+            "まだ何も無い"
+        );
+
+        add_pwa_message_log(&db, "u", "b1", "user", "こんにちは")
+            .await
+            .unwrap();
+        let since_id = max_pwa_message_id(&db, "u", "b1").await.unwrap();
+        assert!(since_id > 0, "ユーザー発言の直後は since_id がその id 以上");
+        assert!(
+            !has_pwa_assistant_reply_after(&db, "u", "b1", since_id)
+                .await
+                .unwrap(),
+            "ユーザー発言だけではまだアシスタント応答は無い（バックグラウンドターン未完了）"
+        );
+
+        // バックグラウンドターンが完了してアシスタント応答を保存すると、以後は since_id 以降に
+        // 応答があると判定できる（クライアントはこれでポーリングを止める）。
+        add_pwa_assistant_reply(&db, "u", "b1", "こんにちは！", None, &[])
+            .await
+            .unwrap();
+        assert!(
+            has_pwa_assistant_reply_after(&db, "u", "b1", since_id)
+                .await
+                .unwrap(),
+            "アシスタント応答が since_id より後に存在する"
+        );
+
+        // 別 bot_id/別ユーザーの応答は since_id 判定に混ざらない。
+        assert!(
+            !has_pwa_assistant_reply_after(&db, "u", "other-bot", since_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pwa_notice_is_in_history_but_excluded_from_llm_context() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        add_pwa_message_log(&db, "u", "b1", "user", "こんにちは")
+            .await
+            .unwrap();
+        let since_id = max_pwa_message_id(&db, "u", "b1").await.unwrap();
+        add_pwa_notice(&db, "u", "b1", "⚠️ 利用制限に達しています")
+            .await
+            .unwrap();
+
+        // ポーリングの終端条件（since_id より後のアシスタント行）を満たす。
+        assert!(has_pwa_assistant_reply_after(&db, "u", "b1", since_id)
+            .await
+            .unwrap());
+        // 履歴一覧には通常のアシスタント応答として現れる。
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, "⚠️ 利用制限に達しています");
+        // LLM コンテキストには入らない（⚠️ 定型応答で以後の文脈を汚染しない）。
+        let ctx = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(ctx.len(), 1);
+        assert_eq!(ctx[0].content, "こんにちは");
+    }
+
+    // ─── issue #77: 受理の永続化と再起動後の回復スイープ ───
+
+    use super::{accept_pwa_user_message, fail_orphaned_pwa_turns, ORPHAN_SWEEP_BATCH};
+
+    /// 回復スイープの通知文言（テスト用の任意値）。
+    const SWEEP_NOTICE: &str = "⚠️ サーバー再起動のため応答を生成できませんでした。";
+
+    fn count_pwa_rows(path: &std::path::Path, user_id: &str, bot_id: &str, filter: &str) -> i64 {
+        let conn = rusqlite::Connection::open(path).expect("open");
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM message_logs \
+                 WHERE user_id = ?1 AND bot_id = ?2 AND source = 'pwa' AND {filter}"
+            ),
+            rusqlite::params![user_id, bot_id],
+            |r| r.get(0),
+        )
+        .expect("count")
+    }
+
+    #[tokio::test]
+    async fn accept_pwa_user_message_persists_as_pwa_user_row_and_returns_the_watermark() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+
+        // 何も無ければ since_id は 0。
+        let first = accept_pwa_user_message(&db, "u", "b1", "こんにちは")
+            .await
+            .unwrap();
+        assert_eq!(first.since_id, 0);
+        assert!(first.message_id > 0);
+
+        // 保存済みの発言は source='pwa'・role='user'・履歴/PWA コンテキストに 1 件だけ現れる。
+        let history = list_pwa_messages(&db, "u", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, first.message_id);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "こんにちは");
+        let ctx = recent_pwa_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(ctx.len(), 1);
+        // Discord 側の文脈には漏れない。
+        assert!(recent_context(&db, "u", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // 2 回目の since_id は 1 回目の保存直後の最大 id（＝1 回目の message_id）。
+        let second = accept_pwa_user_message(&db, "u", "b1", "もう一度")
+            .await
+            .unwrap();
+        assert_eq!(second.since_id, first.message_id);
+        assert!(second.message_id > second.since_id);
+    }
+
+    #[tokio::test]
+    async fn fail_orphaned_pwa_turns_writes_exactly_one_notice_per_orphaned_thread() {
+        let (db, path) = seed_db();
+        // 取り残し: 最新行がユーザー発言。
+        accept_pwa_user_message(&db, "orphan", "b1", "返事はまだ？")
+            .await
+            .unwrap();
+        // 完了済み: 最新行がアシスタント応答。
+        add_pwa_message_log(&db, "done", "b1", "user", "こんにちは")
+            .await
+            .unwrap();
+        add_pwa_assistant_reply(&db, "done", "b1", "こんにちは！", None, &[])
+            .await
+            .unwrap();
+        // 終端済み: 最新行が通知行（失敗/タイムアウトのフォールバック等）。
+        add_pwa_message_log(&db, "noticed", "b1", "user", "エラーになる質問")
+            .await
+            .unwrap();
+        add_pwa_notice(
+            &db,
+            "noticed",
+            "b1",
+            "⚠️ 応答の生成中にエラーが発生しました",
+        )
+        .await
+        .unwrap();
+        // Discord 由来の未回答ユーザー発言は PWA の対象外（source が違う）。
+        add_message_log(&db, "discord-only", "b1", "user", "discord発言", None, None)
+            .await
+            .unwrap();
+        // PWA の最新行がユーザー発言でも、後から Discord のアシスタント行があっても PWA 会話は別軸で
+        // 取り残しのまま（PWA 会話の最新行だけを見る）。
+        accept_pwa_user_message(&db, "mixed", "b1", "PWAの発言")
+            .await
+            .unwrap();
+        add_message_log(&db, "mixed", "b1", "assistant", "Discordの返信", None, None)
+            .await
+            .unwrap();
+        // 同じユーザーでも bot_id が違えば別会話（b2 側だけが取り残し）。
+        accept_pwa_user_message(&db, "orphan", "b2", "別Botへの発言")
+            .await
+            .unwrap();
+        add_pwa_message_log(&db, "orphan", "b3", "user", "b3の発言")
+            .await
+            .unwrap();
+        add_pwa_assistant_reply(&db, "orphan", "b3", "b3の返信", None, &[])
+            .await
+            .unwrap();
+
+        let swept = fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap();
+        assert_eq!(swept, 3, "orphan/b1・mixed/b1・orphan/b2 のみ");
+
+        // 取り残し会話には通知行がちょうど 1 件（`is_notice=1` のアシスタント行）。
+        for (uid, bid) in [("orphan", "b1"), ("mixed", "b1"), ("orphan", "b2")] {
+            assert_eq!(
+                count_pwa_rows(&path, uid, bid, "role = 'assistant' AND is_notice = 1"),
+                1,
+                "{uid}/{bid}"
+            );
+        }
+        // 完了済み・終端済み・Discord のみの会話には何も足されない。
+        assert_eq!(
+            count_pwa_rows(&path, "done", "b1", "is_notice = 1"),
+            0,
+            "完了済みの会話には通知行を足さない"
+        );
+        assert_eq!(
+            count_pwa_rows(&path, "noticed", "b1", "is_notice = 1"),
+            1,
+            "既に通知行で終端済みの会話に二重に足さない（元の 1 件のまま）"
+        );
+        assert_eq!(count_pwa_rows(&path, "discord-only", "b1", "1 = 1"), 0);
+        assert_eq!(count_pwa_rows(&path, "orphan", "b3", "is_notice = 1"), 0);
+
+        // ポーリングの終端条件を満たす: since_id より後にアシスタント行が現れ、履歴の最後は通知行。
+        let history = list_pwa_messages(&db, "orphan", "b1", 50).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, SWEEP_NOTICE);
+        assert!(
+            has_pwa_assistant_reply_after(&db, "orphan", "b1", history[0].id - 1)
+                .await
+                .unwrap()
+        );
+
+        // 通知行は LLM コンテキストから除外される（次ターンの文脈を汚染しない）。
+        let ctx = recent_pwa_context(&db, "orphan", "b1", CONTEXT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(ctx.len(), 1, "ctx={ctx:?}");
+        assert_eq!(ctx[0].role, "user");
+        assert_eq!(ctx[0].content, "返事はまだ？");
+    }
+
+    #[tokio::test]
+    async fn fail_orphaned_pwa_turns_is_idempotent() {
+        let (db, path) = seed_db();
+        accept_pwa_user_message(&db, "u1", "b1", "a").await.unwrap();
+        accept_pwa_user_message(&db, "u2", "b1", "b").await.unwrap();
+
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 2);
+        let rows_after_first: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows_after_first, 4, "ユーザー 2 + 通知 2");
+
+        // 2 回目・3 回目は何も書かない。
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 0);
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 0);
+        let rows_after_more: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows_after_more, rows_after_first);
+
+        // 通知後に新しく送られたメッセージが未回答なら、それは（次回起動時に）再び対象になる。
+        accept_pwa_user_message(&db, "u1", "b1", "c").await.unwrap();
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 1);
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fail_orphaned_pwa_turns_covers_more_threads_than_one_batch() {
+        let (db, path) = seed_db();
+        // バッチ上限（`ORPHAN_SWEEP_BATCH`）を超える数の取り残し会話でも全件処理される。
+        let total = usize::try_from(ORPHAN_SWEEP_BATCH).unwrap() + 37;
+        {
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..total {
+                tx.execute(
+                    "INSERT INTO message_logs (user_id, bot_id, role, content, source) \
+                     VALUES (?1, 'b1', 'user', 'q', 'pwa')",
+                    rusqlite::params![format!("user-{i}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(
+            fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(),
+            total
+        );
+        let notices: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_logs WHERE is_notice = 1 AND source = 'pwa'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notices, i64::try_from(total).unwrap());
+        assert_eq!(fail_orphaned_pwa_turns(&db, SWEEP_NOTICE).await.unwrap(), 0);
+    }
+
+    // ─── R08: 返信元チェーン ───
+
+    use super::{
+        add_guild_message_log, add_linked_assistant_reply, reply_chain, REPLY_CHAIN_ITEM_CHARS,
+        REPLY_CHAIN_MAX,
+    };
+
+    fn texts(chain: &[yuuka_discord::ReplyAncestor]) -> Vec<&str> {
+        chain.iter().map(|e| e.text.as_str()).collect()
+    }
+
+    /// 応答から入力へ、入力から `log:<id>` の応答へと遡り、古い順で返す。別の利用者・循環は辿らない。
+    #[tokio::test]
+    async fn reply_chain_follows_linked_replies_oldest_first_within_the_user_scope() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+        seed_user(&path, "other");
+        add_message_log(&db, "u", "b1", "user", "質問1", Some("d1"), None)
+            .await
+            .unwrap();
+        let answer = add_linked_assistant_reply(&db, "u", "b1", "回答1", Some("d1"), None, None)
+            .await
+            .unwrap();
+        let log_ref = format!("log:{answer}");
+        add_message_log(&db, "u", "b1", "user", "質問2", Some("d2"), Some(&log_ref))
+            .await
+            .unwrap();
+        // 同じ Discord ID でも別の利用者の行は辿らない。
+        add_message_log(&db, "other", "b1", "user", "他人", Some("d9"), None)
+            .await
+            .unwrap();
+
+        let chain = reply_chain(&db, "u", "b1", None, None, false, Some("d2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            texts(&chain),
+            ["[user] 質問1", "[assistant] 回答1", "[user] 質問2"]
+        );
+        let ids: Vec<&str> = chain.iter().map(|e| e.message_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["d1", log_ref.as_str(), "d2"],
+            "Discord の ID が無い行は log:<id>"
+        );
+        let none = reply_chain(&db, "u", "b1", None, None, false, Some("d9"))
+            .await
+            .unwrap();
+        assert!(none.is_empty(), "別の利用者の発言は返信元にしない");
+
+        // 循環は 1 周で打ち切る。
+        add_message_log(&db, "u", "b1", "user", "A", Some("c1"), Some("c2"))
+            .await
+            .unwrap();
+        add_message_log(&db, "u", "b1", "user", "B", Some("c2"), Some("c1"))
+            .await
+            .unwrap();
+        let cyclic = reply_chain(&db, "u", "b1", None, None, false, Some("c1"))
+            .await
+            .unwrap();
+        assert_eq!(texts(&cyclic), ["[user] B", "[user] A"]);
+
+        // リセット境界より前の発言は復元しない（直近コンテキストと同じ floor）。
+        clear_context(&db, "u", "b1").await.unwrap();
+        let after_reset = reply_chain(&db, "u", "b1", None, None, false, Some("d2"))
+            .await
+            .unwrap();
+        assert!(after_reset.is_empty());
+    }
+
+    /// ギルドは同じチャンネルの行だけを辿り、件数と 1 件の文字数に上限がある。
+    #[tokio::test]
+    async fn reply_chain_stays_in_the_guild_channel_and_is_bounded() {
+        let (db, path) = seed_db();
+        seed_user(&path, "u");
+        add_guild_message_log(
+            &db,
+            "b1",
+            "g1",
+            "u",
+            "user",
+            "別チャンネル",
+            Some("x1"),
+            None,
+            Some("c2"),
+        )
+        .await
+        .unwrap();
+        add_guild_message_log(
+            &db,
+            "b1",
+            "g1",
+            "u",
+            "user",
+            "同じチャンネル",
+            Some("x2"),
+            Some("x1"),
+            Some("c1"),
+        )
+        .await
+        .unwrap();
+        let chain = reply_chain(&db, "u", "b1", Some("g1"), Some("c1"), false, Some("x2"))
+            .await
+            .unwrap();
+        assert_eq!(texts(&chain), ["[user] 同じチャンネル"]);
+
+        let long = "あ".repeat(REPLY_CHAIN_ITEM_CHARS + 10);
+        let mut parent: Option<String> = None;
+        for i in 0..REPLY_CHAIN_MAX + 3 {
+            let id = format!("m{i}");
+            add_guild_message_log(
+                &db,
+                "b1",
+                "g1",
+                "u",
+                "user",
+                &long,
+                Some(&id),
+                parent.as_deref(),
+                Some("c1"),
+            )
+            .await
+            .unwrap();
+            parent = Some(id);
+        }
+        let chain = reply_chain(
+            &db,
+            "u",
+            "b1",
+            Some("g1"),
+            Some("c1"),
+            false,
+            parent.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chain.len(), REPLY_CHAIN_MAX, "新しい側から上限件数まで");
+        assert!(chain
+            .iter()
+            .all(|t| t.text.chars().count() == "[user] ".chars().count() + REPLY_CHAIN_ITEM_CHARS));
     }
 }

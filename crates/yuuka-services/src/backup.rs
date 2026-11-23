@@ -5,8 +5,8 @@
 //! （`Date.now() - lastRun >= intervalMs`）していれば `runBackup(userId)`（一時 SQLite エクスポート →
 //! ZIP → Drive アップロード → 世代管理 → `touchBackupLastRun`）を実行する。Rust も同モデルを踏襲する。
 //!
-//! ## スケジュールモデル（briefing/report との違い）
-//! briefing/report は per-user cron（`schedule_cron` を毎分 `cron_matches_now` 判定）だが、**backup は
+//! ## スケジュールモデル（定期報告との違い）
+//! 定期報告は per-report cron（`schedule_cron` を毎分 `cron_matches_now` 判定）だが、**backup は
 //! per-user cron ではなく固定間隔（`interval_hours`）+ `last_run_at` マーカー**で due 判定する（Node の
 //! `backupTick` はこの間隔差分を見る）。よってスケジュールは固定 [`Schedule::Cron`]`("15 * * * *")`
 //! （毎時 15 分に間隔判定）で、`last_run_at` の更新で冪等性（同一間隔内の二重実行防止）を担保する。
@@ -66,7 +66,7 @@ impl CronService for BackupService {
 
     fn schedule(&self) -> Schedule {
         // Node `cron.schedule("15 * * * *")`（毎時 15 分に間隔判定）。
-        Schedule::Cron("15 * * * *")
+        Schedule::Cron("15 * * * *".to_owned())
     }
 
     fn run_on_start(&self) -> bool {
@@ -151,7 +151,7 @@ fn parse_local_datetime(raw: &str) -> Option<DateTime<Local>> {
 
 /// 全ユーザーのバックアップ設定を横断で読む（Node `listAllUserIds` + `getUserBackupConfig` を 1 クエリに）。
 ///
-/// 横断アクセスは cron/バッチ起点でしか作れない（[`CrossUserAccess`] 証憑必須・§7.3）。briefing/report の
+/// 横断アクセスは cron/バッチ起点でしか作れない（[`CrossUserAccess`] 証憑必須・§7.3）。定期報告の
 /// `list_enabled_*` と同規律で `UserScope` 経路から隔離する。無効ユーザーも含めて読み、due 判定は
 /// [`is_due`] が担う（enabled=0 は false）。
 ///
@@ -299,7 +299,7 @@ mod tests {
     ///
     /// `users` は core テーブルで migrations（V17 baseline）が backup 列込みで作る。テスト用の
     /// 縮小 DDL を先置きすると `idx_users_username` 作成でスキーマ衝突するため、空ファイルから
-    /// migrations に作らせてから INSERT する（NOT NULL の username/password_hash/salt はダミー値）。
+    /// migrations に作らせてから INSERT する（NOT NULL の username/salt はダミー値）。
     async fn seed(rows: &[(&str, i64, i64, Option<&str>)]) -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -314,9 +314,9 @@ mod tests {
                 .execute(move |conn| {
                     conn.execute(
                         "INSERT INTO users \
-                         (discord_id, username, password_hash, salt, backup_enabled, \
+                         (discord_id, username, salt, backup_enabled, \
                           backup_interval_hours, backup_last_run_at) \
-                         VALUES (?1, ?1, 'x', 'x', ?2, ?3, ?4)",
+                         VALUES (?1, ?1, 'x', ?2, ?3, ?4)",
                         rusqlite::params![uid, enabled, interval, last_run],
                     )
                     .map_err(yuuka_db::map_sqlite)?;
@@ -379,7 +379,7 @@ mod tests {
     fn schedule_is_hourly_at_15() {
         assert!(matches!(
             BackupService.schedule(),
-            Schedule::Cron("15 * * * *")
+            Schedule::Cron(expr) if expr == "15 * * * *"
         ));
     }
 }

@@ -22,6 +22,7 @@ pub enum RestError {
 
 /// `GET /api/devices` の 1 要素（backend_api.md §4）。
 #[derive(Debug, Clone, Deserialize)]
+#[expect(dead_code, reason = "Reserved for the device-management UI")]
 pub struct DeviceInfo {
     pub id: String,
     #[serde(default)]
@@ -83,6 +84,7 @@ pub async fn fetch_avatar(client: &reqwest::Client, url: &str) -> Result<Vec<u8>
 }
 
 /// `GET /api/devices` — 端末一覧（端末管理・自端末判定）。
+#[expect(dead_code, reason = "Reserved for the device-management UI")]
 pub async fn get_devices(
     client: &reqwest::Client,
     token: &str,
@@ -94,6 +96,7 @@ pub async fn get_devices(
 }
 
 /// `POST /api/devices/revoke` — 自端末トークンの失効（ログアウト時。client_design.md §8）。
+#[expect(dead_code, reason = "Reserved for the device-management UI")]
 pub async fn revoke_device(
     client: &reqwest::Client,
     token: &str,
@@ -124,7 +127,8 @@ mod tests {
     fn parses_wrapped_bots_response() {
         // 実際の dev 応答（system_default。primary 無し・追加フィールド多数）。
         let json = r#"{"success":true,"bots":[{"id":"system_default","user_id":"493051731555516417","name":"システムデフォルト","recommended_persona_id":null,"persona_id":null,"capabilities":"[\"persona\"]","discord_username":"鬼方カヨコ","discord_avatar_url":"https://cdn.example/a.webp","discord_application_id":null,"suspended":0,"created_at":"2026-01-01","updated_at":"2026-01-01","preset":"secretary","preset_display_name":"秘書","has_gemini_key":false,"has_token":false,"running":false,"connected":false,"shared":false}]}"#;
-        let parsed: BotsResponse = serde_json::from_str(json).expect("wrapped bots response must parse");
+        let parsed: BotsResponse =
+            serde_json::from_str(json).expect("wrapped bots response must parse");
         assert_eq!(parsed.bots.len(), 1);
         assert_eq!(parsed.bots[0].id, "system_default");
         assert_eq!(parsed.bots[0].name, "システムデフォルト");

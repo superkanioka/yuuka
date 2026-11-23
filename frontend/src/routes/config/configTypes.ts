@@ -52,10 +52,13 @@ export interface DiscordTokenResponse {
 	success: boolean;
 	message?: string;
 	tokenMasked?: string;
+	/** トークンが登録済みか（本体は返さない） */
+	hasToken?: boolean;
 }
 
 // ── /api/bots（属性カードが現在の Bot を探す） ───────────────────────────────
 export interface BotAttrView {
+	name_linked_to_discord?: boolean;
 	id: string;
 	user_id: string;
 	name: string;
@@ -64,7 +67,6 @@ export interface BotAttrView {
 	discord_username?: string | null;
 	discord_application_id?: string | null;
 	recommended_persona_id?: number | null;
-	[k: string]: unknown;
 }
 export interface BotListResp {
 	success: boolean;
@@ -144,6 +146,9 @@ export interface AssistantRateLimits {
 	guildPerDay: number;
 }
 export interface AssistantConfigResp {
+	llm?: { provider: string; model: string };
+	llm_defaults?: { provider: string; model: string };
+	llm_models?: string[];
 	success: boolean;
 	message?: string;
 	has_gemini_key?: boolean;
@@ -171,6 +176,7 @@ export interface GuildOptionsResp {
 	message?: string;
 	available?: boolean;
 	members?: GuildOptionItem[];
+	channels?: GuildOptionItem[];
 	roles?: GuildOptionItem[];
 }
 
@@ -224,12 +230,19 @@ export interface CredentialsResp {
 }
 
 /** ギルドの表示ラベル（名前が解決できていれば名前・できなければ「ギルド <ID>」）。 */
-export function guildLabel(
-	guilds: AssistantGuild[],
-	guildId: string,
-): string {
+export function guildLabel(guilds: AssistantGuild[], guildId: string): string {
 	const g = guilds.find((x) => x.guild_id === guildId);
 	return g?.guild_name ? g.guild_name : `ギルド ${guildId}`;
+}
+
+/** ギルドを選ぶプルダウン（Select）の選択肢 */
+export function guildOptions(
+	guilds: AssistantGuild[],
+): { value: string; label: string }[] {
+	return guilds.map((g) => ({
+		value: g.guild_id,
+		label: g.guild_name ?? `ギルド ${g.guild_id}`,
+	}));
 }
 
 /** owner/Admin 判定用のヘルパ。activeBot には user_id が無いため /api/bots の結果と突き合わせる。 */

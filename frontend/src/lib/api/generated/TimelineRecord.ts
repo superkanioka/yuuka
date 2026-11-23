@@ -5,31 +5,31 @@
  *
  * `timeline_records` 表の全公開列を写す。内部スコープ列（user_id/bot_id）は持たない。
  */
-export type TimelineRecord = { id: bigint, 
+export type TimelineRecord = { id: bigint,
 /**
  * `'YYYY-MM-DD'`。
  */
-date: string, 
+date: string,
 /**
  * datetime 文字列（`recorded_at`）。
  */
-recorded_at: string, 
+recorded_at: string,
 /**
  * `"memo" | "expense" | "task_done" | "media" | "location"`。
  */
-type: string, title: string | null, content: string | null, 
+type: string, title: string | null, content: string | null,
 /**
  * `todos.id` への参照（cross-domain・passthrough）。
  */
-todo_id: bigint | null, 
+todo_id: bigint | null,
 /**
  * `expenses.id` への参照（cross-domain・passthrough）。
  */
-expense_id: bigint | null, amount: number | null, expense_category: string | null, 
+expense_id: bigint | null, amount: number | null, expense_category: string | null,
 /**
  * メディアファイル名のみ（`data/media/` 以下）。
  */
-media_path: string | null, 
+media_path: string | null,
 /**
  * `"photo" | "video"`。
  */

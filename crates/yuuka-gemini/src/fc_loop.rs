@@ -4,15 +4,23 @@
 //! 往復・並行呼び出し（`id` 相関）・`maxIterations`・完了ハルシネーション是正（mode=ANY）を保持。
 //! バックエンドは [`GenerateBackend`] trait 越しなのでテストは canned レスポンスで駆動できる。
 //! provider は `yuuka-core` の凍結 [`ToolProvider`] トレイト（Native/MCP/WASM 透過）。
+//! ツール実行実績（`tool_outcomes`）は [`ToolOutcomeSink`] ポート越しに上位層が永続化する。
 
 use std::sync::Arc;
+use std::time::Instant;
 
+use async_trait::async_trait;
 use serde_json::json;
 use yuuka_core::tool::FunctionDeclaration as CoreFnDecl;
-use yuuka_core::{ActionRecorder, GeminiError, ResponsePart, ToolContext, ToolName, ToolProvider};
+use yuuka_core::{
+    ActionRecorder, DbError, GeminiError, MetricsSink, ResponsePart, ToolContext, ToolName,
+    ToolProvider,
+};
 
 use crate::client::GenerateBackend;
-use crate::wire::{Content, FunctionDeclaration, FunctionResponse, Part, Role, ToolConfig};
+use crate::wire::{
+    Content, FunctionDeclaration, FunctionResponse, GenerateContentResponse, Part, Role, ToolConfig,
+};
 
 /// 未実行の完了報告を検知した際に注入する是正プロンプト（[`src/gemini.ts:491-495`] 直移植）。
 pub const COMPLETION_CORRECTION_PROMPT: &str = "【システム検証】あなたは今回のやり取りで一度もツール（関数）を呼び出していません。\
@@ -30,6 +38,69 @@ pub enum Status {
 /// ステータス通知コールバック（省略可）。
 pub type StatusCb = Arc<dyn Fn(Status) + Send + Sync>;
 
+/// 生成中の本文を受け取るコールバック（省略可）。1 回の生成でここまでに届いた本文全体を渡し、次の生成
+/// （ツール結果の返送後・完了是正後）では、その生成の本文で最初から渡し直す。
+pub type TextCb = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// ツール実行の成否（`tool_outcomes.status`・Node `"success" | "error"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcomeStatus {
+    Success,
+    Error,
+}
+
+impl ToolOutcomeStatus {
+    /// `functionResponse.response` から成否を判定する（Node `reportedFailure`: JSON の
+    /// `success === false` のときだけ失敗。`success` を持たない結果は成功扱い）。
+    #[must_use]
+    pub fn from_response(response: &serde_json::Value) -> Self {
+        if response.get("success") == Some(&serde_json::Value::Bool(false)) {
+            Self::Error
+        } else {
+            Self::Success
+        }
+    }
+
+    /// DB に保存する文字列表現（`"success"` / `"error"`）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// ツール 1 回分の実行実績（Node `recordToolOutcome` の入力のうち FC ループが知る部分）。
+///
+/// `args` は**生の引数**。永続化する側は必ずダイジェスト化（秘匿マスク）してから保存し、
+/// 引数そのものを残さないこと。user/bot/guild は同時に渡す [`ToolContext`] から取る。
+#[derive(Debug, Clone, Copy)]
+pub struct ToolOutcomeRecord<'a> {
+    /// ツール名（Gemini の functionCall 名）。
+    pub tool_name: &'a str,
+    /// 生の引数（ダイジェスト化前）。
+    pub args: &'a serde_json::Value,
+    /// 成否。
+    pub status: ToolOutcomeStatus,
+    /// dispatch に要した時間（ミリ秒）。
+    pub latency_ms: u64,
+}
+
+/// ツール実行実績の記録先ポート（Node `recordToolOutcome` → `tool_outcomes`）。
+///
+/// FC ループは dispatch 毎に 1 回呼ぶ。失敗はループ側で `warn` ログに落とし、ターンは続行する
+/// （記録の失敗で応答を妨げない）。本番実装は orchestrator の `DbToolOutcomeSink`。
+#[async_trait]
+pub trait ToolOutcomeSink: Send + Sync {
+    /// 実行実績を 1 件記録する。
+    ///
+    /// # Errors
+    /// 永続化に失敗したとき [`DbError`]。
+    async fn record(&self, ctx: &ToolContext, record: ToolOutcomeRecord<'_>)
+        -> Result<(), DbError>;
+}
+
 /// ループ実行オプション。
 pub struct LoopOptions {
     /// 最大反復回数（現行 `maxIterations=10`）。
@@ -43,6 +114,14 @@ pub struct LoopOptions {
     /// 操作履歴レコーダー（Node `recordFunctionCall`）。dispatch 毎に記録し
     /// `getRecentActionHistory` へ供給する。None なら記録しない。
     pub action_recorder: Option<Arc<ActionRecorder>>,
+    /// ツール実行実績の記録先（Node `recordToolOutcome`）。dispatch 毎に 1 件記録する。
+    /// None なら記録しない。
+    pub outcome_sink: Option<Arc<dyn ToolOutcomeSink>>,
+    /// 実利用メトリクスの記録先（Node `incrMetric("tool_calls")`）。dispatch 毎に `tool_calls` を 1 増やす。
+    /// None なら記録しない。
+    pub metrics: Option<Arc<dyn MetricsSink>>,
+    /// 生成中の本文の逐次通知（Discord の逐次表示）。None なら本文を逐次受け取らない。
+    pub on_text: Option<TextCb>,
 }
 
 impl Default for LoopOptions {
@@ -53,6 +132,9 @@ impl Default for LoopOptions {
             allowed_tool_names: None,
             on_status: None,
             action_recorder: None,
+            outcome_sink: None,
+            metrics: None,
+            on_text: None,
         }
     }
 }
@@ -163,6 +245,40 @@ fn notify(opts: &LoopOptions, status: Status) {
     }
 }
 
+/// ループの 1 回分の生成。`opts.on_text` があれば本文を逐次受け取って渡す。
+///
+/// `may_correct`（まだ一度もツールを呼ばず、完了是正がまだ効く）の間は、「登録しました」等の完了報告に
+/// なった本文を渡さない。是正で取り消す本文を、実行していない操作の報告として利用者へ見せないため。
+async fn generate_step(
+    backend: &dyn GenerateBackend,
+    system_instruction: &str,
+    decls: &[FunctionDeclaration],
+    contents: &[Content],
+    tool_config: Option<ToolConfig>,
+    opts: &LoopOptions,
+    may_correct: bool,
+) -> Result<GenerateContentResponse, GeminiError> {
+    let Some(on_text) = &opts.on_text else {
+        return backend
+            .generate(Some(system_instruction), decls, contents, tool_config)
+            .await;
+    };
+    let forward = |text: &str| {
+        if !(may_correct && claims_action_completed(text)) {
+            on_text(text);
+        }
+    };
+    backend
+        .generate_streaming(
+            Some(system_instruction),
+            decls,
+            contents,
+            tool_config,
+            &forward,
+        )
+        .await
+}
+
 /// Function Calling ループ本体。`contents` は往復のたびに追記される（呼び出し側の履歴）。
 ///
 /// # Errors
@@ -182,9 +298,17 @@ pub async fn run_function_calling_loop(
         provider.list(ctx).iter().map(to_wire_declaration).collect();
 
     notify(opts, Status::Thinking);
-    let mut resp = backend
-        .generate(Some(system_instruction), &decls, contents, None)
-        .await?;
+    let may_correct = opts.max_corrections > 0 && !decls.is_empty();
+    let mut resp = generate_step(
+        backend,
+        system_instruction,
+        &decls,
+        contents,
+        None,
+        opts,
+        may_correct,
+    )
+    .await?;
 
     let mut result = LoopResult::default();
     let mut iterations = 0usize;
@@ -218,9 +342,17 @@ pub async fn run_function_calling_loop(
                     notify(opts, Status::Thinking);
                     // mode=ANY で構造的に関数呼び出しを強制（AUTO のままだと是正後も繰り返し得る）。
                     let tc = ToolConfig::force_any(opts.allowed_tool_names.clone());
-                    resp = backend
-                        .generate(Some(system_instruction), &decls, contents, Some(tc))
-                        .await?;
+                    let may_correct = corrections < opts.max_corrections;
+                    resp = generate_step(
+                        backend,
+                        system_instruction,
+                        &decls,
+                        contents,
+                        Some(tc),
+                        opts,
+                        may_correct,
+                    )
+                    .await?;
                     iterations += 1;
                     continue;
                 }
@@ -238,8 +370,26 @@ pub async fn run_function_calling_loop(
             if let Some(recorder) = &opts.action_recorder {
                 recorder.record(ctx.user_id.as_str(), &fc.name, &fc.args);
             }
+            let started = Instant::now();
             let response =
                 dispatch_one(provider, ctx, &fc.name, fc.args.clone(), &mut result).await;
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // 実利用メトリクス（Node は recordToolOutcome の直前で `incrMetric("tool_calls")`）。
+            if let Some(metrics) = &opts.metrics {
+                metrics.incr("tool_calls", 1);
+            }
+            // 実行実績を永続化（Node `recordToolOutcome`・失敗は warn のみで応答を妨げない）。
+            if let Some(sink) = &opts.outcome_sink {
+                let record = ToolOutcomeRecord {
+                    tool_name: &fc.name,
+                    args: &fc.args,
+                    status: ToolOutcomeStatus::from_response(&response),
+                    latency_ms,
+                };
+                if let Err(e) = sink.record(ctx, record).await {
+                    tracing::warn!(error = %e, tool = %fc.name, "[ToolOutcome] 記録に失敗しました（無視）");
+                }
+            }
             response_parts.push(Part::function_response(FunctionResponse {
                 name: fc.name.clone(),
                 response,
@@ -256,9 +406,16 @@ pub async fn run_function_calling_loop(
             parts: response_parts,
         });
         notify(opts, Status::Writing);
-        resp = backend
-            .generate(Some(system_instruction), &decls, contents, None)
-            .await?;
+        resp = generate_step(
+            backend,
+            system_instruction,
+            &decls,
+            contents,
+            None,
+            opts,
+            false,
+        )
+        .await?;
         iterations += 1;
     }
 

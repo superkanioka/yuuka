@@ -1,49 +1,51 @@
 <script lang="ts">
-	// 支払い予定の追加モーダル（旧 index.html #modal-expense-plan + app.js expensePlanForm submit）。
-	// 保存は onsave で親へ委譲。開くたびに初期化（日付は今日）。
-	import { Modal, Button } from "$lib/components/ui";
-	import { EXPENSE_CATEGORIES, todayIso } from "./expenseUtils";
+// 支払い予定の追加モーダル（旧 index.html #modal-expense-plan + app.js expensePlanForm submit）。
+// 保存は onsave で親へ委譲。開くたびに初期化（日付は今日）。
+import { Button, Modal, Select } from "$lib/components/ui";
+import { todayIso } from "$lib/date";
+import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_OPTIONS } from "./expenseUtils";
 
-	interface Props {
-		open?: boolean;
-		onsave: (payload: {
-			title: string;
-			amount: number;
-			category: string;
-			plannedDate: string;
-			description: string;
-		}) => void;
-	}
+interface Props {
+	open?: boolean;
+	onsave: (payload: {
+		title: string;
+		amount: number;
+		category: string;
+		plannedDate: string;
+		description: string;
+	}) => void;
+}
 
-	let { open = $bindable(false), onsave }: Props = $props();
+let { open = $bindable(false), onsave }: Props = $props();
 
-	let title = $state("");
-	let amount = $state<number | null>(null);
-	let category = $state<string>(EXPENSE_CATEGORIES[0]);
-	let plannedDate = $state("");
-	let description = $state("");
+let title = $state("");
+let amount = $state<number | null>(null);
+let category = $state<string>(EXPENSE_CATEGORIES[0]);
+let plannedDate = $state("");
+let description = $state("");
 
-	$effect(() => {
-		if (!open) return;
-		title = "";
-		amount = null;
-		category = EXPENSE_CATEGORIES[0];
-		plannedDate = todayIso();
-		description = "";
+$effect(() => {
+	if (!open) return;
+	title = "";
+	amount = null;
+	category = EXPENSE_CATEGORIES[0];
+	plannedDate = todayIso();
+	description = "";
+});
+
+function submit(e: SubmitEvent) {
+	e.preventDefault();
+	const trimmed = title.trim();
+	if (!trimmed || amount == null || Number.isNaN(amount) || !plannedDate)
+		return;
+	onsave({
+		title: trimmed,
+		amount: Number(amount),
+		category,
+		plannedDate,
+		description: description.trim(),
 	});
-
-	function submit(e: SubmitEvent) {
-		e.preventDefault();
-		const trimmed = title.trim();
-		if (!trimmed || amount == null || Number.isNaN(amount) || !plannedDate) return;
-		onsave({
-			title: trimmed,
-			amount: Number(amount),
-			category,
-			plannedDate,
-			description: description.trim(),
-		});
-	}
+}
 </script>
 
 <Modal bind:open title="支払い予定の追加">
@@ -64,23 +66,28 @@
 				<input
 					type="number"
 					id="plan-amount"
-					required
+										required
 					placeholder="5000"
 					bind:value={amount}
 				/>
 			</div>
 			<div class="form-group">
 				<label for="plan-category">カテゴリー *</label>
-				<select id="plan-category" required bind:value={category}>
-					{#each EXPENSE_CATEGORIES as cat (cat)}
-						<option value={cat}>{cat}</option>
-					{/each}
-				</select>
+				<Select
+					id="plan-category"
+					options={EXPENSE_CATEGORY_OPTIONS}
+					bind:value={category}
+				/>
 			</div>
 		</div>
 		<div class="form-group">
 			<label for="plan-date">支払予定日 *</label>
-			<input type="date" id="plan-date" required bind:value={plannedDate} />
+			<input
+				type="date"
+				id="plan-date"
+				required
+				bind:value={plannedDate}
+			/>
 		</div>
 		<div class="form-group">
 			<label for="plan-description">メモ</label>

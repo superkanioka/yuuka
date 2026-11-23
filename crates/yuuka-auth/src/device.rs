@@ -6,6 +6,8 @@
 //! ときだけ可能（`Authorization: Bearer` を sha256 して `token_hash` と突き合わせる）。
 //! レスポンス形は Node `sendJson` にバイト単位で合わせる。
 
+use yuuka_web::error::{server_error, status_json};
+
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -118,21 +120,6 @@ fn parse_leading_int(s: &str) -> Option<i64> {
     buf.parse::<i64>().ok()
 }
 
-fn status_json(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-fn server_error() -> Response {
-    status_json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "内部エラーが発生しました。",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -187,8 +174,8 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).expect("seed conn");
             for uid in ["u", "other"] {
                 conn.execute(
-                    "INSERT OR IGNORE INTO users (discord_id, username, password_hash, salt) \
-                     VALUES (?1, ?1, 'x', 'x')",
+                    "INSERT OR IGNORE INTO users (discord_id, username, salt) \
+                     VALUES (?1, ?1, 'x')",
                     rusqlite::params![uid],
                 )
                 .expect("seed user");

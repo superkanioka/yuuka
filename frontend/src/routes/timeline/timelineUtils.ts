@@ -3,22 +3,10 @@ import type { PlanBlockType, RecordType } from "$lib/api/types";
 
 const DAY_NAMES = ["日", "月", "火", "水", "木", "金", "土"];
 
-/** ローカル日付 'YYYY-MM-DD' を取得。 */
-export function todayIso(): string {
-	return new Date().toISOString().slice(0, 10);
-}
-
 /** 'YYYY-MM-DD' → 'YYYY-MM-DD (曜)'（旧 tlFmtDate）。 */
 export function fmtTimelineDate(iso: string): string {
 	const d = new Date(iso + "T00:00:00");
 	return `${iso} (${DAY_NAMES[d.getDay()]})`;
-}
-
-/** 日付を delta 日ずらして 'YYYY-MM-DD' を返す（旧 tlShiftDay のロジック部分）。 */
-export function shiftDay(iso: string, delta: number): string {
-	const d = new Date(iso + "T00:00:00");
-	d.setDate(d.getDate() + delta);
-	return d.toISOString().slice(0, 10);
 }
 
 // タイプ → アイコン/ラベル（旧 PLAN_TYPE_ICON/LABEL, RECORD_TYPE_ICON/LABEL）
@@ -49,14 +37,14 @@ export const RECORD_TYPE_LABEL: Record<RecordType, string> = {
 	location: "場所",
 };
 
-export function planTypeIcon(type: PlanBlockType): string {
-	return PLAN_TYPE_ICON[type] ?? "event";
+export function planTypeIcon(type: string): string {
+	return PLAN_TYPE_ICON[type as PlanBlockType] ?? "event";
 }
-export function recordTypeIcon(type: RecordType): string {
-	return RECORD_TYPE_ICON[type] ?? "edit_note";
+export function recordTypeIcon(type: string): string {
+	return RECORD_TYPE_ICON[type as RecordType] ?? "edit_note";
 }
-export function recordTypeLabel(type: RecordType): string {
-	return RECORD_TYPE_LABEL[type] ?? type;
+export function recordTypeLabel(type: string): string {
+	return RECORD_TYPE_LABEL[type as RecordType] ?? type;
 }
 
 /** 計画ブロックの時刻レンジ表示（'HH:MM 〜 HH:MM' / 片方のみ / 空）。 */

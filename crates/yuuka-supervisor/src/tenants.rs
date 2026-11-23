@@ -103,6 +103,17 @@ impl TenantRegistry {
         }
     }
 
+    /// REST 更新を gateway のプロフィールキャッシュにも反映する。
+    fn cache_bot_account(&self, user: &GatewayBotUser) {
+        for slot in self.slots().values() {
+            if let Some(current) = slot.status.bot_user().filter(|u| u.id == user.id) {
+                let mut updated = user.clone();
+                updated.avatar_url = current.avatar_url;
+                slot.status.set_bot_user(updated);
+            }
+        }
+    }
+
     /// 稼働中テナントの REST クライアント（非稼働は `None`。guild-options 照会用）。
     #[must_use]
     pub fn http_client(&self, bot_id: &str) -> Option<Arc<HttpClient>> {
@@ -308,6 +319,10 @@ impl yuuka_orchestrator::BotViewRuntime for RegistryBotViewRuntime {
 /// 表示名キャッシュの TTL（ギルド/チャンネル/メンバー名は変化が稀・REST 連打を避ける）。
 const NAME_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// ギルド候補（ロール/メンバー/チャンネル）キャッシュの TTL。guild の channels/members は
+/// rate limit が厳しく、設定画面の複数欄が別々に引くと数十秒待たされるため短時間だけ共有する。
+const OPTIONS_CACHE_TTL: Duration = Duration::from_secs(60);
+
 /// [`yuuka_orchestrator::DiscordLive`] の live 実装（sync-discord の Bot ユーザー参照・
 /// guild-options のロール/メンバー候補・UI 表示名の解決）。
 ///
@@ -317,6 +332,10 @@ pub struct RegistryDiscordLive {
     registry: Arc<TenantRegistry>,
     /// `"g:<id>"` / `"c:<id>"` / `"m:<gid>:<uid>"` → (取得時刻, 解決結果)。
     names: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
+    /// `"<bot_id>:<guild_id>"` → (取得時刻, ギルド候補)。取得できたもの（available）だけ載せる。
+    options: Mutex<HashMap<String, (std::time::Instant, yuuka_orchestrator::GuildOptions)>>,
+    /// ギルド候補取得の直列化（同時要求で REST を重複させない）。
+    options_fetch: tokio::sync::Mutex<()>,
 }
 
 impl RegistryDiscordLive {
@@ -325,6 +344,8 @@ impl RegistryDiscordLive {
         Self {
             registry,
             names: Mutex::new(HashMap::new()),
+            options: Mutex::new(HashMap::new()),
+            options_fetch: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -355,6 +376,26 @@ impl RegistryDiscordLive {
             .map(|(_, v)| v.clone())
     }
 
+    fn options_get(&self, key: &str) -> Option<yuuka_orchestrator::GuildOptions> {
+        let options = self
+            .options
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        options
+            .get(key)
+            .filter(|(at, _)| at.elapsed() < OPTIONS_CACHE_TTL)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn options_put(&self, key: String, value: yuuka_orchestrator::GuildOptions) {
+        let mut options = self
+            .options
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        options.retain(|_, (at, _)| at.elapsed() < OPTIONS_CACHE_TTL);
+        options.insert(key, (std::time::Instant::now(), value));
+    }
+
     fn cache_put(&self, key: String, value: Option<String>) {
         let mut names = self
             .names
@@ -368,6 +409,57 @@ impl RegistryDiscordLive {
 
 #[async_trait::async_trait]
 impl yuuka_orchestrator::DiscordLive for RegistryDiscordLive {
+    async fn fetch_bot_account(
+        &self,
+        bot_id: &str,
+    ) -> Result<yuuka_orchestrator::DiscordBotUser, String> {
+        let client = self
+            .registry
+            .http_client(bot_id)
+            .ok_or("DiscordのBotが未連携または停止中です。連携と起動状態を確認してください。")?;
+        let response = client.current_user().await.map_err(|error| {
+            tracing::warn!(%error, bot_id, "Discord アカウント取得失敗");
+            "DiscordのBotアカウントを取得できませんでした。トークンと接続状態を確認してください。"
+        })?;
+        let user = response
+            .model()
+            .await
+            .map_err(|_| "Discordの応答を読み取れませんでした。")?;
+        let account = GatewayBotUser {
+            id: user.id.to_string(),
+            username: user.name,
+            avatar_url: String::new(),
+        };
+        self.registry.cache_bot_account(&account);
+        Ok(Self::to_bot_user(account))
+    }
+
+    async fn rename_bot_account(
+        &self,
+        bot_id: &str,
+        name: &str,
+    ) -> Result<yuuka_orchestrator::DiscordBotUser, String> {
+        let client = self
+            .registry
+            .http_client(bot_id)
+            .ok_or("DiscordのBotが未連携または停止中です。連携と起動状態を確認してください。")?;
+        let response = client.update_current_user().username(name).await.map_err(|error| {
+            tracing::warn!(%error, bot_id, "Discord アカウント名更新失敗");
+            "DiscordのBotアカウント名を更新できませんでした。名前の制約・変更頻度・接続状態を確認して再試行してください。"
+        })?;
+        let user = response
+            .model()
+            .await
+            .map_err(|_| "Discordの応答を読み取れませんでした。")?;
+        let account = GatewayBotUser {
+            id: user.id.to_string(),
+            username: user.name,
+            avatar_url: String::new(),
+        };
+        self.registry.cache_bot_account(&account);
+        Ok(Self::to_bot_user(account))
+    }
+
     async fn custom_bot_user(&self, bot_id: &str) -> Option<yuuka_orchestrator::DiscordBotUser> {
         self.registry.bot_user(bot_id).map(Self::to_bot_user)
     }
@@ -383,6 +475,15 @@ impl yuuka_orchestrator::DiscordLive for RegistryDiscordLive {
         bot_id: &str,
         guild_id: &str,
     ) -> yuuka_orchestrator::GuildOptions {
+        let key = format!("{bot_id}:{guild_id}");
+        if let Some(cached) = self.options_get(&key) {
+            return cached;
+        }
+        // 同時に来た要求（設定画面の複数欄）は直列化し、後続は先行の結果をキャッシュから受け取る。
+        let _guard = self.options_fetch.lock().await;
+        if let Some(cached) = self.options_get(&key) {
+            return cached;
+        }
         // Node `getBotClientForUser`: 独自クライアントがあればそれ、無ければデフォルトへフォールバック。
         let Some(client) = self.client_for(bot_id) else {
             return yuuka_orchestrator::GuildOptions::default();
@@ -392,12 +493,17 @@ impl yuuka_orchestrator::DiscordLive for RegistryDiscordLive {
             id: e.id,
             name: e.name,
         };
-        yuuka_orchestrator::GuildOptions {
+        let result = yuuka_orchestrator::GuildOptions {
             roles: opts.roles.into_iter().map(entry).collect(),
             members: opts.members.into_iter().map(entry).collect(),
+            channels: opts.channels.into_iter().map(entry).collect(),
             members_complete: opts.members_complete,
             available: opts.available,
+        };
+        if result.available {
+            self.options_put(key, result.clone());
         }
+        result
     }
 
     async fn guild_name(&self, bot_id: &str, guild_id: &str) -> Option<String> {
@@ -422,12 +528,7 @@ impl yuuka_orchestrator::DiscordLive for RegistryDiscordLive {
         name
     }
 
-    async fn member_display(
-        &self,
-        bot_id: &str,
-        guild_id: &str,
-        user_id: &str,
-    ) -> Option<String> {
+    async fn member_display(&self, bot_id: &str, guild_id: &str, user_id: &str) -> Option<String> {
         let key = format!("m:{guild_id}:{user_id}");
         if let Some(cached) = self.cache_get(&key) {
             return cached;

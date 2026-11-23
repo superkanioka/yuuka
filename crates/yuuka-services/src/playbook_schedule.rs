@@ -21,9 +21,9 @@ use yuuka_playbook::cron::DueSchedule;
 use yuuka_playbook::repo::PlaybookRepo;
 
 use crate::context::ServiceContext;
-use crate::cron_util;
 use crate::notifier::Notification;
 use crate::schedule::{CronService, Schedule};
+use yuuka_core::cron_util;
 
 /// マクロ定期実行サービス。
 pub struct PlaybookScheduleService;
@@ -241,7 +241,7 @@ mod tests {
         let db = Db::open(&path).expect("open db");
         let conn = rusqlite::Connection::open(&path).expect("seed conn");
         conn.execute(
-            "INSERT INTO users (discord_id, username, password_hash, salt) VALUES ('u','u','x','x')",
+            "INSERT INTO users (discord_id, username, salt) VALUES ('u','u','x')",
             [],
         )
         .unwrap();
