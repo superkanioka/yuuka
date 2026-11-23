@@ -24,7 +24,7 @@
 		"deploy": "deploy/prod/deploy-develop.sh",
 		"deploy:verify": "deploy/prod/deploy-develop.sh verify",
 		"deploy:rollback": "deploy/prod/deploy-develop.sh rollback",
-		"deploy:logs": "journalctl --user -u yuuka.service -n 100 -f",
+		"deploy:logs": "deploy/prod/deploy-develop.sh logs",
 		"build": "cargo build --release --bin yuuka && pnpm build:front && pnpm build:pwa",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",

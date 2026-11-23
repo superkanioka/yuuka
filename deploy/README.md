@@ -9,6 +9,7 @@
 ```
 deploy/
   systemd/                      ユーザー systemd のユニットの例（~/.config/systemd/user/ にコピーして使う）
+    system/                       システム systemd 版（User= で動かす・fork 独自。下の「システム systemd で動かす」）
     yuuka.service.example         本番（ExecStart = deploy/prod/run-yuuka.sh）
     yuuka-dev.service.example     dev API（作業ディレクトリ = deploy/dev/runtime）
     yuuka-redis.service.example   セッション用 Redis（本番と dev で共有・保存しない）
@@ -52,6 +53,49 @@ pnpm run deploy:logs                  # 本番の journal を追う
 - 確認に失敗しても自動では戻さない（マイグレーション後に古いバイナリへ戻すには DB も戻す必要があり、デプロイ後の
   書き込みが消えるため）。表示される `rollback` コマンドで戻すかを判断する。退避も消さない。
 - DB マイグレーションは起動時に自動で当たる。前方専用なので、戻すときは DB ごと戻す（rollback がそうする）。
+
+## システム systemd で動かす（fork 独自）
+
+Ubuntu 24.04 以降は `kernel.apparmor_restrict_unprivileged_userns=1` のため、ユーザー systemd では
+マウント名前空間を作れず、ユニット例の隔離（`ProtectHome`・`ProtectSystem`・`PrivateTmp` など）で起動に
+失敗する（`status=218/CAPABILITIES` など）。隔離を外して動かすと、Bot・LLM のツール・Chromium から
+ホーム全体（`~/.ssh` など）が読めてしまう。このようなホストでは、ユニットをシステム systemd に置いて
+`User=` で一般ユーザーとして動かす。root が名前空間を作るので、同じ隔離がそのまま効く。
+
+1. 例を書き換えて置く（`USER` とチェックアウトの場所を合わせる。パス→ユーザー名の順に置換する）。
+
+   ```bash
+   for u in yuuka yuuka-redis; do
+     sed -e 's#/home/USER/yuuka#/home/mkib/mkib/yuuka#g' -e 's#USER#mkib#g' \
+       deploy/systemd/system/$u.service.example | sudo tee /etc/systemd/system/$u.service >/dev/null
+   done
+   sudo systemctl daemon-reload
+   ```
+
+2. `deploy-develop.sh` が sudo のパスワードなしで start / stop できるよう、このユニットだけを許可する
+   （`sudo visudo -f /etc/sudoers.d/yuuka`）。ログを読むために `systemd-journal` グループにも入れる。
+
+   ```
+   mkib ALL=(root) NOPASSWD: /usr/bin/systemctl start yuuka.service, /usr/bin/systemctl stop yuuka.service, /usr/bin/systemctl restart yuuka.service
+   ```
+
+   ```bash
+   sudo usermod -aG systemd-journal mkib   # 反映は再ログイン後
+   ```
+
+3. ユーザー側を止めて消し、システム側で起動する。`deploy-develop.sh` は**ユーザー側に `yuuka.service` が
+   あればそちらを優先する**ので、ユーザー側のユニットファイルは必ず消す。
+
+   ```bash
+   systemctl --user disable --now yuuka.service yuuka-redis.service
+   rm ~/.config/systemd/user/yuuka.service ~/.config/systemd/user/yuuka-redis.service
+   systemctl --user daemon-reload
+   sudo systemctl enable --now yuuka-redis.service yuuka.service
+   deploy/prod/deploy-develop.sh verify
+   ```
+
+`pnpm run deploy:logs`（= `deploy-develop.sh logs`）も、ユニットのある側のログを読む。
+`yuuka-backup.service` / `.timer` を使う場合も、同じようにシステム側へ置き換える（例はユーザー側のみ）。
 
 ## 暗号化シークレットのローテーション
 

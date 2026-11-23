@@ -4,6 +4,7 @@
 #   deploy/prod/deploy-develop.sh                  # origin/develop の最新を本番へ
 #   deploy/prod/deploy-develop.sh rollback <dir>   # 退避した状態（バイナリ・画面・DB）へ戻す
 #   deploy/prod/deploy-develop.sh verify           # 確認だけ
+#   deploy/prod/deploy-develop.sh logs             # ログを追う（ユーザー／システムのどちらのユニットでも）
 #   （pnpm run deploy / deploy:rollback <dir> / deploy:verify からも呼べる）
 #
 # 本番は本体のチェックアウト（/home/suki/apps/yuuka・develop）を作業ディレクトリに動いている:
@@ -19,6 +20,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROD="$ROOT/deploy/prod"
 SERVICE=yuuka.service
+# yuuka.service はユーザー systemd（既定）とシステム systemd（User= で動かす）のどちらに置いてもよい。
+# ユーザー側にあればそちらを、無くてシステム側にあればそちらを操作する。システム側の start / stop は
+# `sudo -n` で行うので、sudoers でこのユニットの操作だけをパスワードなしで許可しておく（deploy/README.md）。
+if systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
+  SCOPE=user
+elif systemctl cat "$SERVICE" >/dev/null 2>&1; then
+  SCOPE=system
+else
+  SCOPE=user
+fi
+svc() { # <systemctl のサブコマンド> [引数...]
+  if [ "$SCOPE" = user ]; then systemctl --user "$@"
+  elif [ "$1" = is-active ]; then systemctl "$@"
+  else sudo -n systemctl "$@"; fi
+}
+journal() { if [ "$SCOPE" = user ]; then journalctl --user "$@"; else journalctl "$@"; fi; }
+if [ "$SCOPE" = user ]; then JOURNAL_CMD="journalctl --user -u $SERVICE"; else JOURNAL_CMD="journalctl -u $SERVICE"; fi
 # deploy/prod/backups に残すデプロイ時の退避の数（1 件で約 120MB）。
 KEEP_BACKUPS=3
 PORT="$(grep -E '^PORT:' "$PROD/config.yaml" | grep -oE '[0-9]+' | head -1)"
@@ -65,7 +83,7 @@ wait_healthy() {
 # 起動後の確認。失敗したら非 0。
 verify() {
   local since="$1" ok=1 code
-  systemctl --user is-active --quiet "$SERVICE" || { echo "❌ $SERVICE が動いていません"; return 1; }
+  svc is-active --quiet "$SERVICE" || { echo "❌ $SERVICE が動いていません"; return 1; }
   wait_healthy || { echo "❌ $BASE/ が 200 を返しません"; return 1; }
   check() { # <説明> <期待する HTTP コード> <パス>
     code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE$3")"
@@ -86,12 +104,12 @@ verify() {
   local logs
   # Discord のログインは HTTP が応答し始めてから数秒後になる。最大 20 秒待ってから数える。
   for _ in $(seq 1 20); do
-    logs="$(journalctl --user -u "$SERVICE" --since "$since" --no-pager -o cat 2>/dev/null || true)"
+    logs="$(journal -u "$SERVICE" --since "$since" --no-pager -o cat 2>/dev/null || true)"
     echo "$logs" | grep -q 'Discord ログイン成功' && break
     sleep 1
   done
   sleep 3
-  logs="$(journalctl --user -u "$SERVICE" --since "$since" --no-pager -o cat 2>/dev/null || true)"
+  logs="$(journal -u "$SERVICE" --since "$since" --no-pager -o cat 2>/dev/null || true)"
   if echo "$logs" | grep -q 'db migrations applied successfully'; then
     echo "  ✅ マイグレーション: $(echo "$logs" | grep -oE 'applying migration: V[0-9]+__[a-z_]+' | sed 's/applying migration: //' | paste -sd ' ' - | sed 's/^$/なし/')"
   else echo "  ❌ マイグレーションの完了ログがありません"; ok=0; fi
@@ -108,15 +126,15 @@ rollback() {
   [ "$answer" = yes ] || die '中止しました'
   local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
   local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
-  systemctl --user stop "$SERVICE"
+  svc stop "$SERVICE"
   snapshot "$PROD/backups/${ts}-before-rollback"
   install -m 755 "$dir/yuuka" "$PROD/bin/yuuka.new" && mv "$PROD/bin/yuuka.new" "$PROD/bin/yuuka"
   rm -rf "$ROOT/dist/public.old" && mv "$ROOT/dist/public" "$ROOT/dist/public.old" && cp -a "$dir/public" "$ROOT/dist/public" && rm -rf "$ROOT/dist/public.old"
   rm -f "$ROOT/data/yuuka.db-wal" "$ROOT/data/yuuka.db-shm"
   cp -a "$dir/data/." "$ROOT/data/"
   cp -a "$dir"/deployed-revision "$dir"/deployed-frontend-revision "$PROD/" 2>/dev/null || true
-  systemctl --user start "$SERVICE"
-  wait_healthy && echo "✅ 戻しました（今の状態は $PROD/backups/${ts}-before-rollback に退避）" || die "起動を確認できません: journalctl --user -u $SERVICE --since '$since'"
+  svc start "$SERVICE"
+  wait_healthy && echo "✅ 戻しました（今の状態は $PROD/backups/${ts}-before-rollback に退避）" || die "起動を確認できません: $JOURNAL_CMD --since '$since'"
 }
 
 deploy() {
@@ -156,7 +174,7 @@ deploy() {
   log '本番を止めて退避・入れ替え'
   local backup="$PROD/backups/${ts}-develop-${short}" since
   since="$(date '+%Y-%m-%d %H:%M:%S')"
-  systemctl --user stop "$SERVICE"
+  svc stop "$SERVICE"
   snapshot "$backup"
   mkdir -p "$PROD/bin" "$ROOT/dist"
   mv "$stage/yuuka" "$PROD/bin/yuuka.new" && mv "$PROD/bin/yuuka.new" "$PROD/bin/yuuka"
@@ -166,7 +184,7 @@ deploy() {
   rm -rf "$stage"
   echo "$rev" > "$PROD/deployed-revision"
   echo "$rev" > "$PROD/deployed-frontend-revision"
-  systemctl --user start "$SERVICE"
+  svc start "$SERVICE"
 
   log '確認'
   local result=ok
@@ -186,7 +204,7 @@ JSON
     prune_backups
     echo "✅ $short を本番へデプロイしました（直前の状態: $backup）"
   else
-    echo "❌ 確認に失敗しました。ログ: journalctl --user -u $SERVICE --since '$since'"
+    echo "❌ 確認に失敗しました。ログ: $JOURNAL_CMD --since '$since'"
     echo "   戻すなら: $0 rollback $backup"
     exit 1
   fi
@@ -199,5 +217,6 @@ case "${1:-deploy}" in
   deploy) deploy ;;
   rollback) rollback "${2:-}" ;;
   verify) verify "$(date -d '-10 min' '+%Y-%m-%d %H:%M:%S')" ;;
-  *) die "usage: $0 [deploy | rollback <backup-dir> | verify]" ;;
+  logs) journal -u "$SERVICE" -n 100 -f ;;
+  *) die "usage: $0 [deploy | rollback <backup-dir> | verify | logs]" ;;
 esac
