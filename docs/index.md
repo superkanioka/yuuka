@@ -10,14 +10,24 @@
 ```
 docs/
 ├── index.md                 ← このファイル（目次）
-├── project_overview.md      ← AI/開発者向けの全体像・モジュールマップ
-├── architecture/            ← 実装規範・設計（最優先で従う）
-│   └── architecture_v2.md
+├── project_overview.md      ← AI/開発者向けの全体像・クレート/ディレクトリマップ（現行の入口）
+├── guide/                   ← 現行の利用・運用ガイド（features / setup / deployment）
+├── architecture/            ← 設計資料
+│   └── architecture_v2.md   ← ⚠️ 旧 Node/TS 実装（schema v16）時点の履歴資料（現行の規範ではない）
 ├── spec/                    ← 機能仕様・要件
 │   ├── discordbot_spec.md
 │   └── bot_attributes_requirements.md
-└── skills/                  ← LLM 実行時に注入されるスキル仕様
-    └── search_skills.md
+├── skills/                  ← LLM 向けスキル仕様（ビルド時にバイナリへ埋め込み、システムプロンプトへ注入）
+│   └── search_skills.md
+├── design/                  ← 設計方針（旧 Node 実装時点の記述を含む。下記「設計文書」の注記参照）
+│   ├── function_modularization.md          ← 機能モジュール化（P1〜P6 実装済み）
+│   ├── synapse_cognitive_architecture.md   ← 設計思想・研究裏付け（R0/R1 実装済み）
+│   ├── self_hosting.md                     ← セルフホスト化の設計（ログイン・配布・上限・TZ・バックアップ。提案）
+│   ├── memory_retention.md                 ← 会話記憶（シナプス）の評価と選別（入口フィルタ・LLM 評価・忘却。段階 1〜4 実装済み）
+│   ├── mcp_standard_protocol.md            ← MCP を標準仕様どおりに使う（OAuth 2.1・MCP Apps。実装済み）
+│   └── desktop_client/                     ← 汎用チャットAPI/デスクトップ（Phase 0/1 実装済み）
+├── audits/                  ← 調査記録（日付付き。機能差分・重複整理・障害の時系列）
+└── rust-rewrite/            ← Rust 移行の計画・実施記録（2026-07-16 時点のアーカイブ）
 ```
 
 ---
@@ -26,30 +36,60 @@ docs/
 
 | 知りたいこと | 読む文書 |
 |---|---|
+| **現行アーキテクチャを図で把握する（HTML）** | [architecture-current.html](architecture-current.html) |
 | プロジェクト全体像・どのファイルを触ればよいか | [project_overview.md](project_overview.md) |
-| 実装の規範・不変条件・DB スキーマ・ファイル所有マップ | [architecture/architecture_v2.md](architecture/architecture_v2.md) |
+| Node → Rust の機能欠落・重複と全API/会話ツールの対応表 | [機能差分・重複の棚卸し（2026-10-08）](audits/2026-10-08-feature-parity.md) |
+| 現行の実装（バックエンド）・DB スキーマ | `crates/`（クレート一覧は [../Cargo.toml](../Cargo.toml)）/ `crates/yuuka-db/migrations/`（V17 baseline〜V36） |
+| ローカルセットアップ・本番デプロイ（systemd）・機能一覧 | [guide/setup.md](guide/setup.md) / [guide/deployment.md](guide/deployment.md) / [guide/features.md](guide/features.md) |
+| PWA クライアント（Vue）の開発手順 | [../clients/pwa/README.md](../clients/pwa/README.md) |
+| セルフホスト化の設計（ログイン方式・設定項目・着手順・利用者ごとの上限） | [design/self_hosting.md](design/self_hosting.md) |
+| 会話記憶（シナプス）を全部残さず評価して選別する計画 | [design/memory_retention.md](design/memory_retention.md) |
+| MCP の認可（OAuth 2.1）と画面（MCP Apps）・サンドボックスのオリジン | [design/mcp_standard_protocol.md](design/mcp_standard_protocol.md) |
+| Gemini 503・応答遅延の時系列と対策案の比較（2026-11-11） | [audits/2026-11-11-gemini-503-countermeasures.md](audits/2026-11-11-gemini-503-countermeasures.md) |
+| DB の定期バックアップ（`yuuka backup`・timer・戻し方） | [guide/deployment.md](guide/deployment.md#db-のバックアップ) |
+| 旧 Node 実装時点の不変条件・DB スキーマ v16・ファイル所有マップ（**履歴資料**） | [architecture/architecture_v2.md](architecture/architecture_v2.md) |
 | 各機能の詳細仕様（ToDo・家計・ブラウザ操作 等） | [spec/discordbot_spec.md](spec/discordbot_spec.md) |
 | Bot の動作モード（秘書 / MCP アシスタント）・能力 | [spec/bot_attributes_requirements.md](spec/bot_attributes_requirements.md) |
 | 検索クロール時の LLM 指示（天気・運行・ニュース） | [skills/search_skills.md](skills/search_skills.md) |
+| 機能モジュールのユーザー×Bot単位ON/OFF（設計・実装済み） | [design/function_modularization.md](design/function_modularization.md) |
+| シナプス認知アーキテクチャ（記憶層 R0/R1 実装済み） | [design/synapse_cognitive_architecture.md](design/synapse_cognitive_architecture.md)（現行実装は `crates/yuuka-synapse`。旧 Node 版の規範は [architecture_v2.md](architecture/architecture_v2.md) §13） |
+| 汎用チャットAPI・デスクトップクライアント（Phase 0/1 実装済み） | [design/desktop_client/](design/desktop_client/index.md)（現行実装は `/ws/chat`＝`crates/yuuka-supervisor/src/ws.rs`、デバイス認証＝`crates/yuuka-auth`。旧 Node 版の規範は [architecture_v2.md](architecture/architecture_v2.md) §15） |
+| バックエンド Rust 移行の意思決定・実施経緯（履歴資料。2026-07-16 時点） | [rust-rewrite/README.md](rust-rewrite/README.md) |
 
 ---
 
-## 📚 文書一覧と権威順序
+## 📚 文書一覧と参照の優先順位
 
-矛盾した場合は **上にある文書が優先**します。
+**現行の実装・運用については、コード（`crates/`・`frontend/`・`clients/pwa/`）とマイグレーション（`crates/yuuka-db/migrations/`）を一次情報とします。** 下記の文書は意図・要件・経緯を補うもので、コードと食い違う場合は**コードが正**です（食い違いを見つけたら文書側を更新してください）。旧 Node/TS 実装向けに書かれた文書（`architecture_v2.md` など）は、Rust への全面移行（[#68](https://github.com/kawaii-music-moe/yuuka/pull/68) で Node 撤去）後は履歴資料であり、規範ではありません。これらの文書が挙げる `src/*.ts` などのパスは現行リポジトリに存在しません（リンク切れを含む）。撤去前のソースは `git show 390df39^:<path>`（例: `git show 390df39^:src/gemini.ts`）で参照できます。
 
-### 1. [architecture/architecture_v2.md](architecture/architecture_v2.md) — 実装規範（最優先）
-仕様を既存コードへ落とし込むための実装コントラクト。**§0 の不変条件（do-not-change）**、§1 共有型、§2 DB スキーマ、§3 暗号、§10 ファイル所有マップを定義。仕様書と矛盾する場合は本書が優先。
+### 1. 現行の実装（一次情報）
+- **バックエンド**: `crates/`（Rust workspace。クレート構成は [../Cargo.toml](../Cargo.toml)、各クレートの役割は [project_overview.md](project_overview.md) §5）。
+- **DB スキーマ**: `crates/yuuka-db/migrations/`（`V17__baseline.sql` ＋ `V18`〜`V26` の前方専用マイグレーション）。
+- **管理画面 / PWA**: `frontend/`（Svelte 5 + Vite）/ `clients/pwa/`（Vue 3 + Vite）。
+- **セットアップ・運用**: [guide/setup.md](guide/setup.md) / [guide/deployment.md](guide/deployment.md)。
 
 ### 2. [spec/bot_attributes_requirements.md](spec/bot_attributes_requirements.md) — Bot 属性拡張要件
-Bot の動作モード（**secretary 秘書 / mcp_assistant 汎用**）の能力プリセット、2 層メモリ、汎用モードの分離スコープ（`bot_id × user_id` / `bot_id × guild_id`）を規定。architecture_v2 を Bot モード向けに精緻化。
+Bot の動作モード（**secretary 秘書 / mcp_assistant 汎用**）の能力プリセット、2 層メモリ、汎用モードの分離スコープ（`bot_id × user_id` / `bot_id × guild_id`）を規定。要件としては有効だが、実装への言及（`gemini.ts`・`migrations.ts` 等）は旧 Node 実装時点のもの。
 
-### 3. [spec/discordbot_spec.md](spec/discordbot_spec.md) — マスター機能仕様（v0.6.2）
-全機能の要件定義。§3 Bot 機能（対話・タスク・リマインド・家計・ブラウザ・マクロ・メモリ・日報・連絡先・会話検索・Webhook・音声）、§4 ペルソナ/API/MCP、§5 ユーザー/Bot 管理、§6 PW マネージャ、§7 会話履歴、§8 バックアップ、§9 外部連携、§10 非機能要件。
+### 3. [spec/discordbot_spec.md](spec/discordbot_spec.md) — マスター機能仕様（v0.6.4）
+全機能の要件定義。§3 Bot 機能（対話・タスク・リマインド・家計・ブラウザ・マクロ・メモリ・日報・連絡先・会話ログ要約・Webhook・音声）、§4 ペルソナ/API/MCP、§5 ユーザー/Bot 管理、§6 PW マネージャ、§7 会話履歴、§8 バックアップ、§9 外部連携、§10 非機能要件。v0.6.4 で認証（§5.4 sk-account 一本化）・Webhook の Bot 帰属・グラフ描画を現行に合わせた。それ以外の実装への言及（Node.js・`*.ts` 等）は旧実装時点のもの。
 
 ### 4. [skills/search_skills.md](skills/search_skills.md) — 検索クロールスキル
 LLM が `searchWeb` / `fetchDynamicPage` を使う際の推奨ドメイン・クエリ・巡回フロー（天気=気象庁優先、運行=Yahoo、ニュース=一次ソース）。
-**⚠️ このファイルは [../src/gemini.ts](../src/gemini.ts) が実行時に読み込みシステムプロンプトへインライン注入します。移動・改名する場合は `loadSearchSkills()` の候補パスも更新すること。**
+`crates/yuuka-orchestrator/src/system_prompt.rs` が `include_str!` で**ビルド時にバイナリへ埋め込み**、システムプロンプトの「ファクトチェック」と「機能一覧」の間へ注入します（システムデフォルト Bot には注入しない。R12・#109）。**このファイルを変えたら、反映にはバイナリの再ビルドが必要です。**
+
+### 5. [architecture/architecture_v2.md](architecture/architecture_v2.md) — 旧 Node/TS 実装のアーキテクチャ規範（**履歴資料**）
+Rust 移行前（DB schema v16）の不変条件・共有型・DB スキーマ・暗号・ファイル所有マップを定義していた文書。**現行の規範ではなく、他の文書に優先しません。** 冒頭に現行の参照先（`crates/`・マイグレーション等）をまとめています。全面的な書き直しは未実施。
 
 ### （横断）[project_overview.md](project_overview.md) — AI オンボーディングガイド
-リポジトリ全体のアーキテクチャ図・ディレクトリ/モジュールマップ・主要ランタイムフロー・不変条件・コーディング規約を 1 枚に集約。新規参加者（人間・AI）の最初の入口。
+リポジトリ全体のアーキテクチャ図・クレート/ディレクトリマップ・主要ランタイムフロー・不変条件・コーディング規約を 1 枚に集約。新規参加者（人間・AI）の最初の入口。
+
+---
+
+## 🧪 設計文書（一部実装済み / 一部は将来構想）
+
+設計の why/what を記す文書群。多くは旧 Node/TS 実装の時点で書かれており、本文中の `src/*.ts` 等のパスは現在存在しません（現行の実装は `crates/`）。設計意図の参照用であり、未実装部分は現行コードへの拘束力を持ちません。
+
+- [design/function_modularization.md](design/function_modularization.md) — **機能モジュール化 設計書**（**P1〜P6 実装済み**）。ユーザーが Bot ごとに有効な機能モジュール（todo/finance/…約14）を選び、有効分の宣言のみ LLM へ渡し UI も該当設定のみ表示する。ユーザー×Bot 単位の上書き層（`bot_user_modules`）でデフォルト Bot 含む全 Bot を個別切替。現行の実装は `crates/yuuka-orchestrator/src/module_catalog.rs`（カタログ）と `bot_user_modules` テーブル（`crates/yuuka-db/migrations/V17__baseline.sql`）。旧 Node 版の規範は [architecture_v2.md §14](architecture/architecture_v2.md)（履歴）。
+- [design/synapse_cognitive_architecture.md](design/synapse_cognitive_architecture.md) — **シナプス駆動 認知アーキテクチャ設計方針書**（思想・研究裏付け）。思考補助を「生履歴注入」から「データ層へ外付けしたシナプス記憶＋2-Hop連想」へ刷新。**記憶層 R0/R1（ツール実績記録・Rust エンジン＋L2 想起注入・シナプス抽出）は実装済み**で、現行の実装は `crates/yuuka-synapse`（インプロセス）と `crates/yuuka-orchestrator` の `synapse_*`。旧 Node 版の規範は [architecture_v2.md §13](architecture/architecture_v2.md)（履歴）。R2（2nd Hop 勝率提示）以降は将来フェーズ。
+- [design/desktop_client/](design/desktop_client/index.md) — **Yuuka Desktop / 汎用チャット API の設計資料**。OAuth デバイスフロー認証と WebSocket `/ws/chat` の設計経緯を収録。現行コードは `clients/desktop/`、`crates/yuuka-supervisor/src/ws.rs`、`crates/yuuka-auth` を参照してください。Node 版のパスや Phase 計画は履歴情報です。収録: [index](design/desktop_client/index.md) / [requirements](design/desktop_client/requirements.md) / [architecture](design/desktop_client/architecture.md) / [backend_api](design/desktop_client/backend_api.md) / [client_design](design/desktop_client/client_design.md) / [roadmap](design/desktop_client/roadmap.md)。

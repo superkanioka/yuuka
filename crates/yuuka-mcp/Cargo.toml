@@ -1,0 +1,46 @@
+[package]
+name = "yuuka-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "yuuka MCP クライアント（公式 SDK rmcp）・OAuth 2.1 認可・MCP Apps ホスト API（/api/mcp-servers*）"
+
+[dependencies]
+yuuka-core.workspace = true
+yuuka-outbound.workspace = true
+yuuka-db.workspace = true
+yuuka-web.workspace = true
+yuuka-auth.workspace = true
+yuuka-crypto.workspace = true
+axum.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+sha1 = "0.10"                       # 動的ツール名の衝突退避に使う決定的短ハッシュ（Node createHash("sha1") パリティ・lockfile 既存版）
+# MCP の通信（Streamable HTTP・OAuth 2.1 認可）はすべて公式 SDK rmcp に任せる。rmcp は reqwest 0.13 を
+# 要求する（workspace は 0.12）ため、このクレートだけ 0.13 を直接使う。workspace の 0.12 は使わない。
+# TLS は rustls-no-provider（aws-lc-rs を入れない）。workspace の reqwest 0.12・twilight が使う ring と
+# 両方有効になると rustls が既定の CryptoProvider を決められず、ClientConfig::builder() が panic するため。
+# provider は guarded_http で ring を明示的に入れる。
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rmcp = { workspace = true, features = ["transport-streamable-http-client-reqwest", "auth"] }
+http = "1"                          # rmcp の OAuth HTTP シーム（OAuthHttpClient）の要求/応答型
+url = "2"                           # OAuth の redirect URI・origin 判定
+tokio.workspace = true              # async HTTP とテスト（workspace は features=full）
+tracing.workspace = true            # 復号失敗等の縮退ログ（Node console.error パリティ）
+
+[dev-dependencies]
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }
+# ルート統合テストの FakeAuth（AuthBackend 実装）が返す SessionUser/Role のため（テスト専用・
+# 実行時依存は増やさない）。
+yuuka-types.workspace = true
+
+[lints]
+workspace = true

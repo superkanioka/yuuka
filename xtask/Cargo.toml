@@ -1,0 +1,26 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "yuuka 開発補助タスク（ts-rs 型生成 gen-types・ドリフト検査・旧環境 DB のスナップショット salvage-snapshot と投入 salvage-import）"
+
+[dependencies]
+yuuka-types.workspace = true
+yuuka-todo.workspace = true
+yuuka-finance.workspace = true
+yuuka-schedule.workspace = true
+yuuka-timeline.workspace = true
+yuuka-reminder.workspace = true
+yuuka-personal.workspace = true
+yuuka-credential.workspace = true
+yuuka-playbook.workspace = true
+yuuka-persona.workspace = true
+yuuka-db.workspace = true    # salvage-snapshot（yuuka_db::snapshot を共用）
+rusqlite.workspace = true    # salvage-import（旧スナップショット → 新 DB）
+getrandom.workspace = true   # salvage-import（新しい秘書 Bot の id）
+
+[lints]
+workspace = true

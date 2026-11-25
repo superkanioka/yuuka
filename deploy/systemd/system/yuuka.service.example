@@ -1,0 +1,65 @@
+# 本番の yuuka（システム systemd・User= で一般ユーザーとして動かす）。fork（superkanioka/yuuka）独自。
+# ユーザー systemd の隔離（ProtectHome など）が使えないホスト向け。Ubuntu 24.04 以降は
+# kernel.apparmor_restrict_unprivileged_userns=1 のため、ユーザー systemd ではマウント名前空間を作れず
+# 隔離の設定で起動に失敗する（status=218/CAPABILITIES など）。システム systemd なら root が名前空間を
+# 作るので、同じ隔離をそのまま使える。
+#   USER と /home/USER/yuuka（チェックアウトの場所）を書き換えて置く:
+#   sudo cp deploy/systemd/system/yuuka.service.example /etc/systemd/system/yuuka.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now yuuka.service
+# システム側では %h が root のホームになるので、パスはすべて絶対パスで書く。
+# deploy-develop.sh はユーザー側に yuuka.service が無ければシステム側を操作する（start / stop は
+# sudo -n。許可の書き方は deploy/README.md）。ユーザー側のユニットは必ず消しておくこと。
+# 設定・シークレットの置き方はユーザー側の例（deploy/systemd/yuuka.service.example）と同じ。
+[Unit]
+Description=Yuuka
+Requires=yuuka-redis.service
+After=network.target yuuka-redis.service
+
+[Service]
+Type=simple
+User=USER
+Group=USER
+WorkingDirectory=/home/USER/yuuka
+Environment=TZ=Asia/Tokyo
+# ブラウザ操作に使う Chromium（既知のパスに無いときだけ指定する）。
+#Environment=CHROME_EXECUTABLE_PATH=/usr/bin/chromium
+# Chromium の同時起動数の上限（対話セッションと 1 回きりの起動の合計）。未設定なら上限なし。
+#Environment=YUUKA_BROWSER_MAX_PROCESSES=3
+ExecStart=/home/USER/yuuka/deploy/prod/run-yuuka.sh
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# ─── 資源の上限（Chromium もこの枠に入る。ホストのメモリに合わせて変える） ───
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=512
+
+# ─── 隔離（Bot やブラウザ操作が破られてもホームの他の場所に届かないようにする） ───
+# ホームは空に見せ、チェックアウトは読み取りのみ、data/ だけ書き込める。
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/USER/yuuka
+BindPaths=/home/USER/yuuka/data
+# Nix で入れた Chromium（~/.nix-profile）や puppeteer の Chrome を使うとき用（無ければ無視される）。
+BindReadOnlyPaths=-/home/USER/.nix-profile -/home/USER/.local/state/nix -/home/USER/.cache/puppeteer
+ProtectSystem=strict
+PrivateTmp=yes
+# Chromium の既定プロファイル（1 回きりの起動で使う）を、ホームではなく /tmp に置く。
+Environment=XDG_CONFIG_HOME=/tmp/xdg/config XDG_CACHE_HOME=/tmp/xdg/cache
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Chromium のサンドボックスは名前空間と JIT を使うので、RestrictNamespaces・
+# MemoryDenyWriteExecute は付けない。
+
+[Install]
+WantedBy=multi-user.target

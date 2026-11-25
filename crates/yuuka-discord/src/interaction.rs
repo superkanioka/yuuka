@@ -1,0 +1,1050 @@
+//! ボタンインタラクション処理（現行 `handleInteraction` [`src/bot.ts:377-532`]）。
+//!
+//! `custom_id` を `action:id:extra` で分解し、共有招待の承認/辞退・利用申請の申請/承認/却下・
+//! 推奨ペルソナのインポートを処理する。判定ロジック [`decide`] は twilight 非依存の注入ポート
+//! （[`MembershipService`]/[`BotDirectory`]）越しなので fake でユニットテストできる。twilight への
+//! 送信は [`respond`] に隔離する。エラーは握り潰さず（現行の空 `catch{}` は廃止）ログする。
+
+use std::sync::Arc;
+
+use twilight_http::Client;
+use twilight_model::application::interaction::{Interaction, InteractionData};
+use twilight_model::channel::message::component::ComponentType;
+use twilight_model::channel::message::MessageFlags;
+use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
+use twilight_util::builder::InteractionResponseDataBuilder;
+use yuuka_core::{BotId, UserId};
+
+use crate::manager::default_allowed_mentions;
+use crate::ports::{
+    self, BotDirectory, MemberDecision, MemberDmSender, MembershipService, RichEmbed,
+};
+use crate::reply::{to_twilight_components, to_twilight_embeds};
+
+/// インタラクション処理に必要な依存（注入ポート＋twilight http）。
+#[derive(Clone)]
+pub struct InteractionDeps {
+    pub http: Arc<Client>,
+    pub membership: Arc<dyn MembershipService>,
+    pub directory: Arc<dyn BotDirectory>,
+    /// 利用申請の受付 DM 送信（Node `sendMemberRequestDM`）。
+    pub dm: Arc<dyn MemberDmSender>,
+}
+
+/// チャネル中立のボタン処理ポート。Discord REST クライアントを要求しない。
+#[derive(Clone)]
+pub struct ComponentInteractionDeps {
+    pub membership: Arc<dyn MembershipService>,
+    pub directory: Arc<dyn BotDirectory>,
+    pub dm: Arc<dyn MemberDmSender>,
+}
+
+impl From<&InteractionDeps> for ComponentInteractionDeps {
+    fn from(deps: &InteractionDeps) -> Self {
+        Self {
+            membership: deps.membership.clone(),
+            directory: deps.directory.clone(),
+            dm: deps.dm.clone(),
+        }
+    }
+}
+
+/// フォローアップ送信の記述（共有承認後の推奨ペルソナ導入確認）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Followup {
+    pub content: String,
+    pub components: Vec<ports::ActionRow>,
+}
+
+/// インタラクションへの応答計画（twilight 非依存・テスト検証用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionPlan {
+    /// ephemeral な即時返信（`interaction.reply({ ephemeral: true })`）。
+    Reply(String),
+    /// 元メッセージ更新でボタンを消して結果表示（`interaction.update`）。任意でフォローアップを続ける。
+    /// `embeds` が空でなければ元メッセージの埋め込みを置き換える（空なら元のまま）。
+    Update {
+        content: String,
+        embeds: Vec<RichEmbed>,
+        followup: Option<Followup>,
+    },
+    /// 何もしない（未知 action・非ボタン）。
+    Ignore,
+}
+
+/// `custom_id` を `action:id:extra` へ分解する（現行 `customId.split(":")`・最大 3 分割）。
+#[must_use]
+pub fn parse_custom_id(custom_id: &str) -> (&str, &str, &str) {
+    let mut parts = custom_id.splitn(3, ':');
+    let action = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    let extra = parts.next().unwrap_or("");
+    (action, id, extra)
+}
+
+/// ボタン以外・データ無しなら `None`、ボタンなら `custom_id` を返す（現行 `interaction.isButton()`）。
+#[must_use]
+pub fn button_custom_id(interaction: &Interaction) -> Option<&str> {
+    match interaction.data.as_ref()? {
+        InteractionData::MessageComponent(data) if data.component_type == ComponentType::Button => {
+            Some(&data.custom_id)
+        }
+        _ => None,
+    }
+}
+
+/// インタラクション処理の判定本体（現行 `handleInteraction` の分岐 1:1）。
+///
+/// `invoker` は操作したユーザー、`applicant_label`/`guild_label` は memreq_apply の可読性向上のため
+/// 呼び出し側が best-effort 解決した表示名（現行 `interaction.guild.members.fetch(...).displayName`）。
+///
+/// **利用申請の受付 DM（Node `sendMemberRequestDM`）は本関数から送る**（Discord ボタン経路）。
+/// WebSocket も同じ通知ポートを注入して利用する。
+pub async fn decide(
+    deps: &InteractionDeps,
+    action: &str,
+    id_str: &str,
+    extra: &str,
+    invoker: &UserId,
+    applicant_label: Option<String>,
+    guild_label: Option<String>,
+) -> InteractionPlan {
+    decide_component(
+        &ComponentInteractionDeps::from(deps),
+        action,
+        id_str,
+        extra,
+        invoker,
+        applicant_label,
+        guild_label,
+    )
+    .await
+}
+
+/// Discord と WebSocket が共有する業務処理。
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_component(
+    deps: &ComponentInteractionDeps,
+    action: &str,
+    id_str: &str,
+    extra: &str,
+    invoker: &UserId,
+    applicant_label: Option<String>,
+    guild_label: Option<String>,
+) -> InteractionPlan {
+    match action {
+        // ── 利用申請（メンバー外ユーザーがボタンから申請） ──
+        "memreq_apply" => {
+            let (bot_id, guild_id) = (id_str, extra);
+            if bot_id.is_empty() || guild_id.is_empty() {
+                return InteractionPlan::Reply("申請情報が不正です。".to_owned());
+            }
+            // owner 宛 DM 用の表示ラベルを先に解決（Node: `applicantLabel?.trim() || ユーザー ${id}`）。
+            let applicant_dm_label = label_or(applicant_label.as_deref(), || {
+                format!("ユーザー {}", invoker.as_str())
+            });
+            let guild_dm_label = label_or(guild_label.as_deref(), || format!("ギルド {guild_id}"));
+            let outcome = deps
+                .membership
+                .submit_member_request(
+                    &BotId::new(bot_id),
+                    guild_id,
+                    invoker,
+                    applicant_label,
+                    guild_label,
+                )
+                .await;
+            // 受付を Bot オーナーへ DM（承認/却下ボタン付き・Node `sendMemberRequestDM`）。ボタン経由は
+            // note 無し。fire-and-forget（false は握り潰す・DB 上の申請は Web 管理から拾える）。
+            if outcome.ok {
+                if let (Some(owner), Some(name), Some(rid)) =
+                    (&outcome.owner_id, &outcome.bot_name, outcome.request_id)
+                {
+                    let sent = deps
+                        .dm
+                        .send_request_dm(
+                            owner,
+                            name,
+                            &applicant_dm_label,
+                            &guild_dm_label,
+                            None,
+                            rid,
+                        )
+                        .await;
+                    // Web から決定したときに DM を編集できるよう所在を控える。
+                    if let Some(dm) = sent {
+                        deps.membership.record_request_dm(rid, &dm).await;
+                    }
+                }
+            }
+            let msg = if outcome.ok {
+                "✅ 利用申請を送信しました。Bot作成者の承認をお待ちください。".to_owned()
+            } else {
+                format!("⚠️ {}", outcome.message)
+            };
+            InteractionPlan::Reply(msg)
+        }
+
+        // ── 利用申請の承認/却下（Bot オーナーが DM ボタンから操作） ──
+        "memreq_approve" | "memreq_reject" => {
+            let decision = if action == "memreq_approve" {
+                MemberDecision::Approved
+            } else {
+                MemberDecision::Rejected
+            };
+            let Some(request_id) = parse_id(id_str) else {
+                return InteractionPlan::Reply("申請が見つかりません。".to_owned());
+            };
+            let outcome = deps
+                .membership
+                .decide_member_request(request_id, decision, invoker)
+                .await;
+            let (true, Some(request)) = (outcome.ok, outcome.request) else {
+                return InteractionPlan::Reply(outcome.message);
+            };
+            // 押された受付 DM 自体を決定済みの embed へ置き換えてボタンを外す（Web で決定した場合と
+            // 同じ表示）。結果は申請者へ別途 DM しない。
+            InteractionPlan::Update {
+                content: String::new(),
+                embeds: vec![request.embed()],
+                followup: None,
+            }
+        }
+
+        // ── 共有招待の承認/辞退 ──
+        "share_accept" | "share_decline" => {
+            let share = match parse_id(id_str) {
+                Some(sid) => deps.membership.get_share(sid).await,
+                None => None,
+            };
+            let Some(share) = share else {
+                return InteractionPlan::Reply(
+                    "この招待はあなた宛ではないか、既に無効です。".to_owned(),
+                );
+            };
+            if &share.shared_user_id != invoker {
+                return InteractionPlan::Reply(
+                    "この招待はあなた宛ではないか、既に無効です。".to_owned(),
+                );
+            }
+            if share.status != "pending" {
+                return InteractionPlan::Reply("この招待は既に処理済みです。".to_owned());
+            }
+            if action == "share_decline" {
+                deps.membership
+                    .revoke_share(&share.bot_id, &share.shared_user_id)
+                    .await;
+                return InteractionPlan::Update {
+                    content: "招待を辞退しました。".to_owned(),
+                    embeds: Vec::new(),
+                    followup: None,
+                };
+            }
+            // accept
+            deps.membership
+                .accept_share(&share.bot_id, &share.shared_user_id)
+                .await;
+            let bot = deps.directory.get_bot(&share.bot_id).await;
+            let bot_name = bot
+                .as_ref()
+                .map_or_else(|| share.bot_id.as_str().to_owned(), |b| b.name.clone());
+            let content = format!("✅ Bot「**{bot_name}**」へのアクセスが有効になりました！");
+
+            // 推奨ペルソナ（公開）のインポート確認をフォローアップ（§5.2.2）。
+            let followup =
+                build_persona_followup(deps, bot.and_then(|b| b.recommended_persona_id)).await;
+            InteractionPlan::Update {
+                content,
+                embeds: Vec::new(),
+                followup,
+            }
+        }
+
+        // ── 推奨ペルソナのインポート ──
+        "persona_import" => {
+            if !deps.directory.is_registered_user(invoker).await {
+                return InteractionPlan::Reply("先にユーザー登録を完了してください。".to_owned());
+            }
+            let Some(persona_id) = parse_id(id_str) else {
+                return InteractionPlan::Update {
+                    content:
+                        "ペルソナのインポートに失敗しました（非公開化された可能性があります）。"
+                            .to_owned(),
+                    embeds: Vec::new(),
+                    followup: None,
+                };
+            };
+            let ok = deps.membership.import_persona(invoker, persona_id).await;
+            let content = if ok {
+                "✅ ペルソナをインポートしました。管理画面の「ペルソナ」から適用できます。"
+                    .to_owned()
+            } else {
+                "ペルソナのインポートに失敗しました（非公開化された可能性があります）。".to_owned()
+            };
+            InteractionPlan::Update {
+                content,
+                embeds: Vec::new(),
+                followup: None,
+            }
+        }
+
+        _ => InteractionPlan::Ignore,
+    }
+}
+
+/// 推奨ペルソナが公開なら、インポート確認ボタン付きフォローアップを組み立てる。
+async fn build_persona_followup(
+    deps: &ComponentInteractionDeps,
+    recommended_persona_id: Option<i64>,
+) -> Option<Followup> {
+    let persona_id = recommended_persona_id?;
+    let persona = deps.membership.get_public_persona(persona_id).await?;
+    // ラベルはペルソナ名を 60 字で切る（現行 `persona.name.slice(0, 60)`）。
+    let short_name: String = persona.name.chars().take(60).collect();
+    Some(Followup {
+        content:
+            "このBotの推奨ペルソナをインポートしますか？（任意です。インポート後は独立したコピーとなります）"
+                .to_owned(),
+        components: vec![ports::ActionRow {
+            buttons: vec![ports::Button {
+                custom_id: format!("persona_import:{}", persona.id),
+                label: format!("ペルソナ「{short_name}」をインポート"),
+                style: ports::ButtonStyle::Primary,
+            }],
+        }],
+    })
+}
+
+/// `parseInt(idStr, 10)` 相当（非数値/空は None）。
+fn parse_id(s: &str) -> Option<i64> {
+    s.trim().parse::<i64>().ok()
+}
+
+/// 表示ラベルを trim して非空なら採用、無ければ `fallback`（Node の `label?.trim() || default`）。
+fn label_or(label: Option<&str>, fallback: impl FnOnce() -> String) -> String {
+    match label.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_owned(),
+        None => fallback(),
+    }
+}
+
+/// 判定結果を twilight で応答送信する（現行 `interaction.reply/update/followUp`）。
+///
+/// 失敗は握り潰さずログする。`application_id`/`interaction.id`/`interaction.token` を使い
+/// `InteractionClient::create_response`（＋必要なら `create_followup`）を呼ぶ。
+pub async fn respond(deps: &InteractionDeps, interaction: &Interaction, plan: InteractionPlan) {
+    let client = deps.http.interaction(interaction.application_id);
+    match plan {
+        InteractionPlan::Ignore => {}
+        InteractionPlan::Reply(content) => {
+            let data = InteractionResponseDataBuilder::new()
+                .content(content)
+                .flags(MessageFlags::EPHEMERAL)
+                .allowed_mentions(default_allowed_mentions())
+                .build();
+            let resp = InteractionResponse {
+                kind: InteractionResponseType::ChannelMessageWithSource,
+                data: Some(data),
+            };
+            if let Err(e) = client
+                .create_response(interaction.id, &interaction.token, &resp)
+                .await
+            {
+                tracing::warn!(error = %e, "インタラクション応答の送信に失敗");
+            }
+        }
+        InteractionPlan::Update {
+            content,
+            embeds,
+            followup,
+        } => {
+            // 元メッセージを更新し、ボタンを消す（components を空で送る）。埋め込みは指定時だけ置き換える。
+            // `create_response` にはクライアントの既定 allowed_mentions が効かないので明示する。
+            let mut data = InteractionResponseDataBuilder::new()
+                .content(content)
+                .components(std::iter::empty())
+                .allowed_mentions(default_allowed_mentions());
+            if !embeds.is_empty() {
+                data = data.embeds(to_twilight_embeds(&embeds));
+            }
+            let resp = InteractionResponse {
+                kind: InteractionResponseType::UpdateMessage,
+                data: Some(data.build()),
+            };
+            if let Err(e) = client
+                .create_response(interaction.id, &interaction.token, &resp)
+                .await
+            {
+                tracing::warn!(error = %e, "インタラクション更新の送信に失敗");
+                return;
+            }
+            if let Some(followup) = followup {
+                let components = to_twilight_components(&followup.components);
+                let mut req = client
+                    .create_followup(&interaction.token)
+                    .content(&followup.content);
+                if !components.is_empty() {
+                    req = req.components(&components);
+                }
+                if let Err(e) = req.await {
+                    tracing::warn!(error = %e, "フォローアップの送信に失敗");
+                }
+            }
+        }
+    }
+}
+
+/// 応答の前に Discord REST（ギルド名の取得・オーナー宛 DM）を挟む操作か。
+///
+/// これらは先に ACK しないと 3 秒の応答期限を過ぎ、申請自体は登録されたのに申請者には失敗と出る。
+#[must_use]
+pub fn needs_defer(action: &str) -> bool {
+    action == "memreq_apply"
+}
+
+/// 本人にだけ見える「考え中…」で先に ACK する（現行 `interaction.deferReply({ ephemeral: true })`）。
+///
+/// ACK できなければ（期限切れ・別プロセスが応答済みなど）`false`。呼び出し側は処理せずに終える。
+pub async fn defer_ephemeral(deps: &InteractionDeps, interaction: &Interaction) -> bool {
+    let resp = InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(
+            InteractionResponseDataBuilder::new()
+                .flags(MessageFlags::EPHEMERAL)
+                .build(),
+        ),
+    };
+    match deps
+        .http
+        .interaction(interaction.application_id)
+        .create_response(interaction.id, &interaction.token, &resp)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "インタラクションの ACK に失敗");
+            false
+        }
+    }
+}
+
+/// [`defer_ephemeral`] 済みの応答を判定結果へ書き換える（現行 `interaction.editReply`）。
+///
+/// 先に ACK する操作（[`needs_defer`]）の判定は返信（[`InteractionPlan::Reply`]）だけなので、
+/// それ以外は「考え中…」を残さないよう消す。
+pub async fn respond_deferred(
+    deps: &InteractionDeps,
+    interaction: &Interaction,
+    plan: InteractionPlan,
+) {
+    let client = deps.http.interaction(interaction.application_id);
+    let result = match plan {
+        InteractionPlan::Reply(content) => client
+            .update_response(&interaction.token)
+            .content(Some(&content))
+            .await
+            .map(drop),
+        InteractionPlan::Update { .. } | InteractionPlan::Ignore => {
+            client.delete_response(&interaction.token).await.map(drop)
+        }
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "インタラクション応答の書き換えに失敗");
+    }
+}
+
+/// invoker（操作ユーザー）の UserId を取り出す（`interaction.author_id()`）。
+#[must_use]
+pub fn invoker_id(interaction: &Interaction) -> Option<UserId> {
+    interaction
+        .author_id()
+        .map(|id| UserId::new(id.get().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::ports::{
+        BotRecord, DecidedRequest, DecisionOutcome, DmMessageRef, MemberDmSender, PersonaRecord,
+        ShareRecord, SubmitOutcome,
+    };
+
+    #[test]
+    fn parse_custom_id_splits_three() {
+        assert_eq!(
+            parse_custom_id("share_accept:42"),
+            ("share_accept", "42", "")
+        );
+        assert_eq!(
+            parse_custom_id("memreq_apply:bot1:guild9"),
+            ("memreq_apply", "bot1", "guild9")
+        );
+        assert_eq!(
+            parse_custom_id("persona_import"),
+            ("persona_import", "", "")
+        );
+        // extra に `:` が含まれても 3 分割で残りは extra へ（現行 split の 3 要素 destructure と一致）。
+        assert_eq!(parse_custom_id("a:b:c:d"), ("a", "b", "c:d"));
+    }
+
+    // ── fake ports ──────────────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeMembership {
+        share: Option<ShareRecord>,
+        persona: Option<PersonaRecord>,
+        submit_ok: bool,
+        decide: Option<DecisionOutcome>,
+        import_ok: bool,
+        /// `record_request_dm` で控えた (request_id, DM 所在)。
+        recorded_dms: Arc<Mutex<Vec<(i64, DmMessageRef)>>>,
+    }
+
+    #[async_trait]
+    impl MembershipService for FakeMembership {
+        async fn submit_member_request(
+            &self,
+            _bot_id: &BotId,
+            _guild_id: &str,
+            _applicant: &UserId,
+            _applicant_label: Option<String>,
+            _guild_label: Option<String>,
+        ) -> SubmitOutcome {
+            SubmitOutcome {
+                ok: self.submit_ok,
+                message: if self.submit_ok {
+                    String::new()
+                } else {
+                    "既に申請済みです。".to_owned()
+                },
+                owner_id: self.submit_ok.then(|| "owner1".to_owned()),
+                bot_name: self.submit_ok.then(|| "テストBot".to_owned()),
+                request_id: self.submit_ok.then_some(99),
+            }
+        }
+        async fn decide_member_request(
+            &self,
+            _request_id: i64,
+            _decision: MemberDecision,
+            _actor: &UserId,
+        ) -> DecisionOutcome {
+            self.decide.clone().unwrap_or(DecisionOutcome {
+                ok: false,
+                message: "申請が見つかりません。".to_owned(),
+                request: None,
+            })
+        }
+        async fn record_request_dm(&self, request_id: i64, dm: &DmMessageRef) {
+            self.recorded_dms
+                .lock()
+                .unwrap()
+                .push((request_id, dm.clone()));
+        }
+        async fn get_share(&self, _share_id: i64) -> Option<ShareRecord> {
+            self.share.clone()
+        }
+        async fn accept_share(&self, _bot_id: &BotId, _shared_user: &UserId) {}
+        async fn revoke_share(&self, _bot_id: &BotId, _shared_user: &UserId) {}
+        async fn import_persona(&self, _user_id: &UserId, _persona_id: i64) -> bool {
+            self.import_ok
+        }
+        async fn get_public_persona(&self, _persona_id: i64) -> Option<PersonaRecord> {
+            self.persona.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDirectory {
+        bot: Option<BotRecord>,
+        registered: bool,
+    }
+
+    #[async_trait]
+    impl BotDirectory for FakeDirectory {
+        async fn get_bot(&self, _bot_id: &BotId) -> Option<BotRecord> {
+            self.bot.clone()
+        }
+        async fn list_all_bots(&self) -> Vec<BotRecord> {
+            Vec::new()
+        }
+        async fn list_bots_for_user(&self, _user_id: &UserId) -> Vec<BotId> {
+            Vec::new()
+        }
+        async fn decrypt_token(&self, _bot_id: &BotId) -> Option<secrecy::SecretString> {
+            None
+        }
+        async fn update_profile(&self, _b: &BotId, _u: &str, _a: &str, _d: &str) {}
+        async fn is_registered_user(&self, _user_id: &UserId) -> bool {
+            self.registered
+        }
+        async fn is_bot_member(&self, _b: &BotId, _g: &GuildId, _u: &UserId) -> bool {
+            false
+        }
+        async fn is_guild_allowed(&self, _b: &BotId, _g: &GuildId) -> bool {
+            false
+        }
+        async fn is_channel_enabled(&self, _b: &BotId, _g: &GuildId, _c: &str) -> bool {
+            false
+        }
+        async fn is_channel_muted(&self, _b: &BotId, _g: &GuildId, _c: &str) -> bool {
+            false
+        }
+        async fn is_any_role_allowed(&self, _b: &BotId, _g: &GuildId, _r: &[String]) -> bool {
+            false
+        }
+    }
+
+    use yuuka_core::GuildId;
+
+    /// 受付 DM の記録（owner_id, request_id, applicant_label, guild_label, note あり?）。
+    type RequestDm = (String, i64, String, String, bool);
+
+    /// 送信された DM を記録する fake（member DM 配線 + ラベル解決の検証用）。
+    #[derive(Default)]
+    struct FakeDmSender {
+        request_dms: Mutex<Vec<RequestDm>>,
+    }
+
+    #[async_trait]
+    impl MemberDmSender for FakeDmSender {
+        async fn send_request_dm(
+            &self,
+            owner_id: &str,
+            _bot_name: &str,
+            applicant_label: &str,
+            guild_label: &str,
+            note: Option<&str>,
+            request_id: i64,
+        ) -> Option<DmMessageRef> {
+            self.request_dms.lock().unwrap().push((
+                owner_id.to_owned(),
+                request_id,
+                applicant_label.to_owned(),
+                guild_label.to_owned(),
+                note.is_some(),
+            ));
+            Some(DmMessageRef {
+                channel_id: "dmch".to_owned(),
+                message_id: format!("dmmsg{request_id}"),
+            })
+        }
+        async fn close_request_dm(&self, _dm: &DmMessageRef, _request: &DecidedRequest) -> bool {
+            true
+        }
+    }
+
+    fn deps(membership: FakeMembership, directory: FakeDirectory) -> InteractionDeps {
+        deps_dm(membership, directory, Arc::new(FakeDmSender::default()))
+    }
+
+    fn deps_dm(
+        membership: FakeMembership,
+        directory: FakeDirectory,
+        dm: Arc<FakeDmSender>,
+    ) -> InteractionDeps {
+        InteractionDeps {
+            http: Arc::new(Client::new(String::new())),
+            membership: Arc::new(membership),
+            directory: Arc::new(directory),
+            dm,
+        }
+    }
+
+    #[tokio::test]
+    async fn memreq_apply_invalid_info() {
+        let d = deps(FakeMembership::default(), FakeDirectory::default());
+        let plan = decide(&d, "memreq_apply", "", "", &UserId::new("u"), None, None).await;
+        assert_eq!(
+            plan,
+            InteractionPlan::Reply("申請情報が不正です。".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn memreq_apply_success() {
+        let d = deps(
+            FakeMembership {
+                submit_ok: true,
+                ..Default::default()
+            },
+            FakeDirectory::default(),
+        );
+        let plan = decide(
+            &d,
+            "memreq_apply",
+            "bot1",
+            "g9",
+            &UserId::new("u"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            plan,
+            InteractionPlan::Reply(
+                "✅ 利用申請を送信しました。Bot作成者の承認をお待ちください。".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn share_accept_wrong_recipient_is_rejected() {
+        let d = deps(
+            FakeMembership {
+                share: Some(ShareRecord {
+                    bot_id: BotId::new("bot1"),
+                    shared_user_id: UserId::new("other"),
+                    status: "pending".to_owned(),
+                }),
+                ..Default::default()
+            },
+            FakeDirectory::default(),
+        );
+        let plan = decide(&d, "share_accept", "1", "", &UserId::new("me"), None, None).await;
+        assert_eq!(
+            plan,
+            InteractionPlan::Reply("この招待はあなた宛ではないか、既に無効です。".to_owned())
+        );
+    }
+
+    /// 共有招待 DM（`DiscordMessenger::send_share_invite_dm`）のボタンが、本ハンドラで処理される
+    /// custom_id になっていること（押して動くこと）を往復で確認する。
+    #[tokio::test]
+    async fn share_invite_dm_buttons_round_trip_to_decide() {
+        let components = crate::manager::share_invite_components(42);
+        let ids: Vec<&str> = components[0]
+            .buttons
+            .iter()
+            .map(|b| b.custom_id.as_str())
+            .collect();
+        assert_eq!(ids, ["share_accept:42", "share_decline:42"]);
+        for (custom_id, expected) in [
+            (
+                "share_accept:42",
+                "✅ Bot「**bot1**」へのアクセスが有効になりました！",
+            ),
+            ("share_decline:42", "招待を辞退しました。"),
+        ] {
+            let d = deps(
+                FakeMembership {
+                    share: Some(ShareRecord {
+                        bot_id: BotId::new("bot1"),
+                        shared_user_id: UserId::new("me"),
+                        status: "pending".to_owned(),
+                    }),
+                    ..Default::default()
+                },
+                FakeDirectory::default(),
+            );
+            let (action, id, extra) = parse_custom_id(custom_id);
+            let plan = decide(&d, action, id, extra, &UserId::new("me"), None, None).await;
+            assert_eq!(
+                plan,
+                InteractionPlan::Update {
+                    content: expected.to_owned(),
+                    embeds: Vec::new(),
+                    followup: None,
+                },
+                "{custom_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn share_accept_offers_persona_followup() {
+        let d = deps(
+            FakeMembership {
+                share: Some(ShareRecord {
+                    bot_id: BotId::new("bot1"),
+                    shared_user_id: UserId::new("me"),
+                    status: "pending".to_owned(),
+                }),
+                persona: Some(PersonaRecord {
+                    id: 7,
+                    name: "ずんだもん".to_owned(),
+                }),
+                ..Default::default()
+            },
+            FakeDirectory {
+                bot: Some(BotRecord {
+                    id: BotId::new("bot1"),
+                    owner_id: UserId::new("owner"),
+                    name: "テスト秘書".to_owned(),
+                    suspended: false,
+                    stopped: false,
+                    recommended_persona_id: Some(7),
+                    is_guild_assistant: false,
+                    has_gemini_key: true,
+                }),
+                registered: true,
+            },
+        );
+        let plan = decide(&d, "share_accept", "1", "", &UserId::new("me"), None, None).await;
+        assert!(
+            matches!(plan, InteractionPlan::Update { .. }),
+            "expected Update, got {plan:?}"
+        );
+        let InteractionPlan::Update {
+            content, followup, ..
+        } = plan
+        else {
+            return;
+        };
+        assert!(content.contains("テスト秘書"), "bot 名を含む: {content}");
+        let f = followup.expect("推奨ペルソナのフォローアップ");
+        assert_eq!(f.components[0].buttons[0].custom_id, "persona_import:7");
+    }
+
+    #[tokio::test]
+    async fn persona_import_requires_registration() {
+        let d = deps(
+            FakeMembership {
+                import_ok: true,
+                ..Default::default()
+            },
+            FakeDirectory {
+                registered: false,
+                ..Default::default()
+            },
+        );
+        let plan = decide(&d, "persona_import", "7", "", &UserId::new("u"), None, None).await;
+        assert_eq!(
+            plan,
+            InteractionPlan::Reply("先にユーザー登録を完了してください。".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_action_ignored() {
+        let d = deps(FakeMembership::default(), FakeDirectory::default());
+        let plan = decide(
+            &d,
+            "totally_unknown",
+            "1",
+            "",
+            &UserId::new("u"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(plan, InteractionPlan::Ignore);
+    }
+
+    #[tokio::test]
+    async fn memreq_apply_sends_owner_dm_on_success() {
+        let dm = Arc::new(FakeDmSender::default());
+        let d = deps_dm(
+            FakeMembership {
+                submit_ok: true,
+                ..Default::default()
+            },
+            FakeDirectory::default(),
+            dm.clone(),
+        );
+        let plan = decide(
+            &d,
+            "memreq_apply",
+            "bot1",
+            "g9",
+            &UserId::new("u"),
+            Some("申請太郎".to_owned()),
+            Some("テストギルド".to_owned()),
+        )
+        .await;
+        assert!(matches!(plan, InteractionPlan::Reply(_)));
+        let sent = dm.request_dms.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "owner1", "owner 宛");
+        assert_eq!(sent[0].1, 99, "request_id");
+        assert_eq!(sent[0].2, "申請太郎", "trim 済み表示ラベル採用");
+        assert_eq!(sent[0].3, "テストギルド");
+        assert!(!sent[0].4, "ボタン経路は note なし");
+    }
+
+    /// 送った受付 DM の所在を申請に控える（Web から決定したときに DM を編集するため）。
+    #[tokio::test]
+    async fn memreq_apply_records_owner_dm_location() {
+        let membership = FakeMembership {
+            submit_ok: true,
+            ..Default::default()
+        };
+        let recorded = membership.recorded_dms.clone();
+        let d = deps(membership, FakeDirectory::default());
+        let _ = decide(
+            &d,
+            "memreq_apply",
+            "bot1",
+            "g9",
+            &UserId::new("u"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            &[(
+                99,
+                DmMessageRef {
+                    channel_id: "dmch".to_owned(),
+                    message_id: "dmmsg99".to_owned(),
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn memreq_apply_dm_uses_label_fallback_when_absent() {
+        let dm = Arc::new(FakeDmSender::default());
+        let d = deps_dm(
+            FakeMembership {
+                submit_ok: true,
+                ..Default::default()
+            },
+            FakeDirectory::default(),
+            dm.clone(),
+        );
+        // applicant_label 無し・guild_label は空白のみ → Node の `label?.trim() || default` フォールバック。
+        let _ = decide(
+            &d,
+            "memreq_apply",
+            "bot1",
+            "g9",
+            &UserId::new("u"),
+            None,
+            Some("   ".to_owned()),
+        )
+        .await;
+        let sent = dm.request_dms.lock().unwrap();
+        assert_eq!(
+            sent[0].2, "ユーザー u",
+            "applicant 無しは ユーザー+id フォールバック"
+        );
+        assert_eq!(
+            sent[0].3, "ギルド g9",
+            "guild 空白は ギルド+guildId フォールバック"
+        );
+    }
+
+    fn decided(decision: MemberDecision) -> DecidedRequest {
+        DecidedRequest {
+            decision,
+            bot_name: "テストBot".to_owned(),
+            applicant_id: "applicant1".to_owned(),
+            applicant_label: Some("申請太郎".to_owned()),
+            guild_id: "g9".to_owned(),
+            guild_label: Some("テストギルド".to_owned()),
+            note: None,
+        }
+    }
+
+    /// 承認/却下ボタンは押された受付 DM 自体を決定済みの embed へ置き換える（本文は消す）。
+    #[tokio::test]
+    async fn memreq_decide_replaces_owner_dm_with_embed() {
+        for (action, decision, title) in [
+            (
+                "memreq_approve",
+                MemberDecision::Approved,
+                "✅ 利用申請が承認されました",
+            ),
+            (
+                "memreq_reject",
+                MemberDecision::Rejected,
+                "🚫 利用申請が却下されました",
+            ),
+        ] {
+            let d = deps(
+                FakeMembership {
+                    decide: Some(DecisionOutcome {
+                        ok: true,
+                        message: String::new(),
+                        request: Some(decided(decision)),
+                    }),
+                    ..Default::default()
+                },
+                FakeDirectory::default(),
+            );
+            let plan = decide(&d, action, "5", "", &UserId::new("owner"), None, None).await;
+            assert!(
+                matches!(plan, InteractionPlan::Update { .. }),
+                "{action}: expected Update, got {plan:?}"
+            );
+            let InteractionPlan::Update {
+                content,
+                embeds,
+                followup,
+            } = plan
+            else {
+                return;
+            };
+            assert!(content.is_empty(), "{action}: 本文は消す");
+            assert!(followup.is_none());
+            assert_eq!(embeds, vec![decided(decision).embed()]);
+            assert_eq!(embeds[0].title.as_deref(), Some(title));
+        }
+    }
+
+    #[tokio::test]
+    async fn memreq_decide_failure_replies_with_reason() {
+        let d = deps(FakeMembership::default(), FakeDirectory::default());
+        let plan = decide(
+            &d,
+            "memreq_approve",
+            "5",
+            "",
+            &UserId::new("owner"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            plan,
+            InteractionPlan::Reply("申請が見つかりません。".to_owned())
+        );
+    }
+
+    /// 決定済み embed は申請時に控えた表示名を使い、無ければ ID（申請者はメンション）で示す。
+    #[test]
+    fn decided_request_embed_fields() {
+        let named = decided(MemberDecision::Approved).embed();
+        let values: Vec<(&str, &str)> = named
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("Bot", "テストBot"),
+                ("申請者", "申請太郎"),
+                ("ギルド", "テストギルド"),
+            ]
+        );
+
+        let unnamed = DecidedRequest {
+            applicant_label: None,
+            guild_label: None,
+            note: Some("よろしくお願いします".to_owned()),
+            ..decided(MemberDecision::Rejected)
+        }
+        .embed();
+        let values: Vec<(&str, &str)> = unnamed
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("Bot", "テストBot"),
+                ("申請者", "<@applicant1>"),
+                ("ギルド", "g9"),
+                ("申請メッセージ", "よろしくお願いします"),
+            ]
+        );
+        assert_ne!(named.color, unnamed.color, "承認と却下で色を分ける");
+    }
+}

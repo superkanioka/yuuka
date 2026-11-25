@@ -1,0 +1,1073 @@
+//! yuuka-supervisor（bin `yuuka`）— 起動シーケンスと監督。
+//!
+//! 起動: telemetry 初期化 → `config.yaml`+env 読込（**欠落型不一致は fail-fast**）→ 既存 SQLite
+//! を開く → Redis セッション接続（不可でも縮退で継続）→ 実 [`CompositeAuth`] 構築 →
+//! web サービスを [`Supervisor`] 配下へ登録 → JoinSet 監督ループを graceful shutdown 付きで駆動。
+//!
+//! web は **supervised task**（panic 隔離＋指数バックオフ再起動・絶対制約2）として動く。
+//! bot/gemini/services は Phase 3/4 で `Supervisor::service` に追加していく（同一監督下）。
+//! Node の web と同居可能＝strangler 移行。
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::Router;
+use yuuka_auth::{AuthRuntime, CompositeAuth, OidcClient, SessionStore};
+use yuuka_core::secrets::ExposeSecret;
+use yuuka_core::telemetry::init_telemetry;
+use yuuka_core::{Config, DbError};
+use yuuka_crypto::{rotate_secret_key, SystemCrypto, LEGACY_FALLBACK_SECRET};
+use yuuka_discord::{rate_limit_message, DiscordManager, ManagerPorts, Prepared, RateLimiter};
+use yuuka_orchestrator::{
+    ChatEngine, DbBotDirectory, DbMembership, InMemoryRateLimiter, RecallSettings,
+};
+use yuuka_services::{InstagramSettings, MetricsRegistry, NotifierDeliveryRunner, ServiceContext};
+use yuuka_supervisor::{
+    build_app, build_supervised_services, build_tool_registry, ws_routes_with_interactions,
+    GeminiAuxText, MessengerWebhookNotifier, RegistryBotRuntime, RegistryBotViewRuntime,
+    RegistryDiscordLive, RegistryLifecycle, ServiceError, ShutdownToken, SupervisedService,
+    Supervisor, TenantRegistry,
+};
+use yuuka_web::{AppState, Db, WebConfig};
+
+/// 設定ファイルの既定パス（cwd 相対・Node と同じ `config.yaml`）。
+const CONFIG_PATH: &str = "config.yaml";
+/// ビルド済み SPA の配信元（vite `outDir` = `dist/public`）。
+const DIST_DIR: &str = "dist/public";
+/// PWA（`clients/pwa`）のビルド出力（issue #33。`pnpm build:pwa` が生成する）。
+/// ビルド成果物はリポジトリにコミットしない（#46）ため、ここが唯一の配信元。
+const PWA_DIST_DIR: &str = "dist/public/pwa";
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    // サブコマンド（サーバーを起動しないもの）。引数なしが従来どおりのサーバー起動。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("backup") => return run_backup(args.get(1..).unwrap_or(&[])),
+        Some("--version" | "-V" | "version") => {
+            println!("yuuka {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some(other) => {
+            eprintln!(
+                "不明な引数: {other}\nusage: yuuka [backup ... | --version]\n{}",
+                yuuka_supervisor::backup::USAGE
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    init_telemetry();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // 起動失敗は fail-fast（非ゼロ終了）。設定/DB 不備で中途半端に動かさない（§5.6）。
+            tracing::error!(error = %e, "起動に失敗しました");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `yuuka backup`（issue #241）。DB のパスは `--db` か、サーバーと同じ config.yaml / 環境変数から取る。
+fn run_backup(args: &[String]) -> ExitCode {
+    let result = Config::load_and_validate(Path::new(CONFIG_PATH))
+        .map_err(|e| format!("config load failed: {e}"))
+        .and_then(|cfg| yuuka_supervisor::backup::parse_args(args, cfg.db_path))
+        .and_then(|opts| yuuka_supervisor::backup::run(&opts, chrono::Local::now()));
+    match result {
+        Ok(report) => {
+            println!(
+                "バックアップを保存しました: {}（整合性検査 ok）",
+                report.written.display()
+            );
+            for old in &report.removed {
+                println!("古い世代を消しました: {}", old.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("バックアップに失敗しました: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 起動シーケンス本体（起動時 config/DB 不備のみ fail-fast・§5.6/§5.7）。
+async fn run() -> Result<(), String> {
+    yuuka_gemini::init_llm_defaults().map_err(|e| e.to_string())?;
+    // 1) config.yaml + 環境変数（欠落は既定へ・壊れた YAML/不正値は致命）。
+    let cfg = Config::load_and_validate(Path::new(CONFIG_PATH))
+        .map_err(|e| format!("config load failed: {e}"))?;
+
+    // 1.5) 保存時暗号シークレットの必須 + 強度チェック（Node `index.ts` §6.2・**N2**）。未設定/脆弱鍵での
+    //      起動を拒否する。これが無いと Rust は暗号鍵ゼロでも起動を続け（setup/register だけ 500 に縮退）、
+    //      at-rest 秘密（Gemini/Discord/OAuth トークン）に依存する機能が静かに壊れる Rust 固有の退行になる。
+    require_encryption_secret(&cfg)?;
+
+    // 2) SQLite を read pool + 単一 writer actor で開く（writer 起動時に migrations が適用
+    //    される）。既定は DB ファイルが事前に用意されていることが前提（無ければ起動失敗）。
+    //    新規インスタンスは `YUUKA_INIT_DB=1` で無ければ新規作成させる（issue #55）。
+    let db = Db::open(&cfg.db_path).map_err(|e| format!("open db {:?}: {e}", cfg.db_path))?;
+
+    // 2.5) 鍵ローテーション（P1-5・Node `rotateSecretKey` パリティ）。`YUUKA_ENCRYPTION_SECRET_NEW`
+    //      が設定されていれば、サービス起動前に **writer actor 上で 1 回だけ**全暗号化列を
+    //      旧鍵→新鍵で再暗号化する（R-2: 第二 writer 経路を作らない）。migrations 適用後・
+    //      web/cron が書き込みを始める前に完了させる（Node の同期起動ローテーションと同じ位置）。
+    rotate_secret_if_requested(&db, &cfg).await?;
+
+    // 3) Redis セッション（到達不能でも起動継続＝Cookie のみ縮退）。発行（login/setup）と検証
+    //    （CompositeAuth）で同一ストアを共有する（同じ clone を両者へ渡す）。
+    let sessions = SessionStore::connect(&cfg.redis_url).await;
+
+    // 3.5) ログインに使う OIDC プロバイダー（標準は sk-account）。シークレット未設定ならログインできない
+    //      （既存のセッションはそのまま使える）。ログインのルートとセッション検証で同じものを共有する。
+    let public_base = cfg
+        .base_url
+        .as_deref()
+        .map(|b| b.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| format!("http://{}:{}", cfg.host, cfg.port));
+    let oidc = OidcClient::from_settings(&cfg.oidc, &public_base).map(Arc::new);
+    if oidc.is_none() {
+        tracing::warn!(
+            issuer = %cfg.oidc.issuer,
+            "OIDC_CLIENT_SECRET が未設定のためログインできません"
+        );
+    }
+
+    // 4) 実 AuthBackend（Cookie=Redis / Bearer=SQLite）。
+    let auth = Arc::new(
+        CompositeAuth::new(db.clone(), sessions.clone(), cfg.session_ttl_days)
+            .with_desktop_token_ttl_days(cfg.desktop_token_ttl_days)
+            .with_oidc(oidc.clone()),
+    );
+    let web_config = WebConfig::from_core(&cfg);
+    let state = AppState::new(auth, web_config, db.clone());
+
+    // 4.5) 共有暗号（Gemini キー・Bot トークン等の暗号化）。`YUUKA_ENCRYPTION_SECRET` 未設定なら `None`
+    //      （暗号を要する機能のみ縮退）。
+    let crypto = match SystemCrypto::from_config(&cfg) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            tracing::warn!(error = %e, "SystemCrypto を構築できません（暗号を要する機能のみ縮退）");
+            None
+        }
+    };
+
+    // 4.6) 会話エンジン（ChatEngine）— `/ws/chat`（デスクトップ）を駆動する（P1-2）。ツールレジストリ +
+    //      暗号（Gemini キー復号）+ DB を保持。crypto 未設定でも構築でき、キー未設定ユーザーは ⚠️ 応答。
+    //      操作履歴レコーダー（Node actionRecorder の in-memory フォールバック相当）はプロセス内で 1 つ
+    //      共有し、FC ループ（書き）とツール `getRecentActionHistory`（読み）へ同じ Arc を渡す。
+    let action_recorder = Arc::new(yuuka_core::ActionRecorder::new());
+    // Google/MCP の実 HTTP に使う共有 reqwest クライアント（接続プール共有・30s タイムアウト）。MCP 実 HTTP
+    // クライアントは ChatEngine（動的ツール探索）と MCP ルート（tools/list・dashboard・proxy）で同一
+    // インスタンスを共有し、MCP 接続キャッシュを 1 つに統一する（A4・SSRF ガード付き）。
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    // Google OAuth/Calendar クライアント（A3・reqwest）。暗号鍵 + GOOGLE_CLIENT_ID/SECRET があれば
+    // GoogleHttpClient、無ければ Null へ縮退する。ChatEngine の systemInstruction（連携カレンダー一覧・
+    // P2-E-2）と settings/integrated ルートで同一 Arc を共有するため、ツールレジストリ（予定の Google 同期）・ChatEngine 構築前にここで 1 度だけ生成する。
+    let (google_oauth, google_calendar, google_events): (
+        Arc<dyn yuuka_google::GoogleOAuthPort>,
+        Arc<dyn yuuka_google::CalendarPort>,
+        Arc<dyn yuuka_google::CalendarEventsPort>,
+    ) = if let Some(crypto) = crypto.clone() {
+        let client = Arc::new(yuuka_google::GoogleHttpClient::new(
+            cfg.google_client_id.clone().unwrap_or_default(),
+            cfg.google_client_secret.clone().unwrap_or_default(),
+            crypto,
+            db.clone(),
+            http_client.clone(),
+        ));
+        (client.clone(), client.clone(), client)
+    } else {
+        (
+            Arc::new(yuuka_google::NullGoogleOAuth),
+            Arc::new(yuuka_google::NullCalendar),
+            Arc::new(yuuka_google::NullCalendarEvents),
+        )
+    };
+    // runPeriodicReportNow（`deliver: true`）のテスト配信 runner（issue #136）。実 runner が使う Messenger は
+    // 会話エンジン（＝このレジストリ）を受け取る Discord マネージャから作られるため、ここでは空の
+    // LateDeliveryRunner を渡し、Messenger 生成後（配信設定ルータの配線時）に同じ runner を設定する。
+    let briefing_delivery = Arc::new(yuuka_briefing::LateDeliveryRunner::new());
+    // 4.6.5) シナプス認知エンジン（in-process・旧 rust_synapse daemon をライブラリ吸収）。起動時に DB を
+    //        read-only で読み RAM ベクトル索引を 1 度だけ構築する（Node「DB から N 件のシナプスを RAM
+    //        索引へロード」相当）。DB が読めなくても空索引で起動を継続する（想起は "" へデグレード・
+    //        panic 厳禁）。ChatEngine の想起（read）と抽出（write）、forgetMemory ツールと
+    //        /api/memories の削除で単一の索引を Arc<Mutex> 共有する。
+    let synapse_engine = {
+        let (engine, outcome) =
+            yuuka_synapse::SynapseEngine::boot(cfg.db_path.clone(), yuuka_synapse::DEFAULT_DIM);
+        match outcome {
+            yuuka_synapse::LoadOutcome::Loaded(n) => {
+                tracing::info!(loaded = n, db = ?cfg.db_path, "DB から {n} 件のシナプスを RAM 索引へロードしました");
+            }
+            yuuka_synapse::LoadOutcome::Empty(e) => {
+                tracing::warn!(error = %e, db = ?cfg.db_path, "シナプス索引を読めませんでした（空索引で起動を継続します）");
+            }
+        }
+        Arc::new(tokio::sync::Mutex::new(engine))
+    };
+    let tool_registry = build_tool_registry(
+        &db,
+        crypto.clone(),
+        Some(action_recorder.clone()),
+        Some(google_events.clone()),
+        Some(briefing_delivery.clone()),
+        Some(synapse_engine.clone()),
+    )
+    .map_err(|e| format!("build tool registry: {e}"))?;
+    let mcp_client: Arc<dyn yuuka_mcp::McpClient> = match yuuka_mcp::RmcpClient::new(
+        crypto.clone(),
+        db.clone(),
+    ) {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            // MCP は付加機能。構築に失敗しても Discord・Web・cron は止めず、MCP だけ縮退させる。
+            tracing::warn!(error = %e, "MCP クライアントを構築できないため、MCP を無効にして起動を続けます");
+            Arc::new(yuuka_mcp::NullMcpClient)
+        }
+    };
+    // 実利用メトリクス（Node `services/metrics.ts`）。会話エンジンが書き込み、cron の定期ログ
+    // （`MetricsLogService`）が同じインスタンスの snapshot を 5 分毎に出す（R23・#120）。
+    let metrics = Arc::new(MetricsRegistry::new());
+    let rate_limiter: Arc<dyn RateLimiter> = Arc::new(InMemoryRateLimiter::new(db.clone()));
+    let chat_engine = Arc::new(
+        ChatEngine::with_real_gemini(
+            db.clone(),
+            crypto.clone(),
+            tool_registry,
+            Some(action_recorder),
+            mcp_client.clone(),
+            Some(synapse_engine.clone()),
+        )
+        // L2 想起の取得件数・recency ブースト（config `SYNAPSE_*`・R26）。
+        .with_recall_settings(RecallSettings::from_config(&cfg))
+        .with_calendar(google_events.clone())
+        // ツール実行実績を tool_outcomes へ永続化する（Node `recordToolOutcome`・R22）。
+        .with_tool_outcomes(Arc::new(yuuka_orchestrator::DbToolOutcomeSink::new(
+            db.clone(),
+        )))
+        .with_metrics(metrics.clone())
+        .with_rate_limiter(rate_limiter.clone()),
+    );
+
+    // PWA チャット送信（issue #41）。上の共有 `rate_limiter` を Discord と同一インスタンスで消費する
+    // （guildId スロット="pwa"・finance の ReceiptParserAdapter の "web" と同型）。
+    let client_api_routes =
+        yuuka_client_api::routes_with(chat_engine.clone(), rate_limiter.clone());
+    // 再起動で取り残された PWA チャットの応答待ちを終端させる（issue #77・fail-closed）。新プロセスは
+    // in-flight ターンを持たないため、serve 開始（下の supervisor.run）前の 1 回だけ実行する。
+    yuuka_client_api::recover_orphaned_chat_turns(&db).await;
+
+    // 4.7) Discord マルチテナント（P1-3）。実ポート（BotDirectory/RateLimiter/MembershipService）＋
+    //      会話エンジン（processor）を注入して DiscordManager を組み、`prepare` でトークン解決 +
+    //      共有 Messenger を作る（ここでは twilight REST クライアント生成のみ・gateway 未接続）。
+    //      Messenger は登録コード DM（下）・cron 通知（P1-4）の共通配信基盤として使う。gateway の
+    //      起動は後述の YUUKA_RUST_DISCORD ゲートで制御する（二重 gateway ＝二重応答の回避）。
+    let discord_manager = Arc::new(DiscordManager::new(ManagerPorts {
+        directory: Arc::new(DbBotDirectory::new(db.clone(), crypto.clone())),
+        processor: chat_engine.clone(),
+        membership: Arc::new(DbMembership::new(db.clone())),
+    }));
+    let Prepared { runners, messenger } = discord_manager.prepare().await;
+    let chat_ws_routes = ws_routes_with_interactions(
+        chat_engine.clone(),
+        cfg.desktop_max_upload_mb,
+        yuuka_discord::interaction::ComponentInteractionDeps {
+            membership: Arc::new(DbMembership::new(db.clone())),
+            directory: Arc::new(DbBotDirectory::new(db.clone(), crypto.clone())),
+            dm: messenger.clone(),
+        },
+        cfg.desktop_demo_components,
+    );
+
+    // Discord テナントの live ライフサイクルレジストリ（web ⇄ gateway 配線）。gateway を Rust が
+    // 所有する時のみ作る（Node 所有時に web から起動すると二重 gateway＝二重応答になるため、
+    // その間は Null シーム縮退を維持する）。
+    let tenant_registry = rust_discord_enabled().then(|| {
+        Arc::new(TenantRegistry::new(
+            discord_manager.clone(),
+            messenger.clone(),
+        ))
+    });
+
+    // 管理ルータ（/api/admin/*）。セッション一括失効は auth と同一ストアを共有（ロール変更/削除の
+    // 即時反映）、デフォルト Bot トークン暗号化は同じ crypto を使う。runtime 効果（Bot 再起動/停止/
+    // 稼働状態）は Rust が gateway を所有する時のみ live（TenantRegistry）、Node 所有時は
+    // NullBotRuntime へ縮退する（DB 効果は常に完全に働く）。
+    let bot_runtime: Arc<dyn yuuka_admin::BotRuntime> = match &tenant_registry {
+        Some(reg) => Arc::new(RegistryBotRuntime(reg.clone())),
+        None => Arc::new(yuuka_admin::NullBotRuntime),
+    };
+    // `http_client`（共有 reqwest）・`mcp_client`（共有 RmcpClient）は上（ChatEngine 構築前）で 1 度だけ
+    // 生成済み。以降の Google クライアント・MCP ルートはそれを再利用する（接続プール/セッションキャッシュ統一）。
+    let admin_runtime = Arc::new(yuuka_admin::AdminRuntime::new(
+        sessions.clone(),
+        crypto.clone(),
+        bot_runtime.clone(),
+        cfg.privacy_policy_url.clone(),
+        cfg.terms_url.clone(),
+    ));
+    let admin_routes = yuuka_admin::routes(admin_runtime);
+
+    // 設定ルータ（/api/settings/*・/api/status）。セッション再発行/一括失効は auth と同一ストア、Gemini
+    // キー/Discord トークン暗号化は同じ crypto、所有 Bot 停止/再起動は admin と同一の BotRuntime シームを
+    // 共有する。Google OAuth/Calendar/Drive バックアップは HTTP サブシステム未配線のため Null シームへ
+    // 縮退する（DB 効果＝アカウント行・カレンダー列・トークン列は常に完全に働く）。OAuth state ストアは
+    // web 再起動を跨ぐよう main で 1 度だけ生成する。
+    // Google OAuth/Calendar（google_oauth/google_calendar）は ChatEngine 構築前（上）で 1 度だけ生成済み。
+    // Drive バックアップ（BackupPort）は下でゲート付きに配線する（crypto + ID/SECRET 揃えば live）。
+    // Drive バックアップ（BackupPort）: 暗号鍵 + GOOGLE_CLIENT_ID/SECRET が揃えば実 Drive アップロード
+    // （GoogleBackupClient・OAuth と同一のトークン経路）、揃わなければ NullBackup（backup/trigger は 500）。
+    // A3 の GoogleHttpClient と同じゲート（crypto 有無 + is_configured 相当の ID/SECRET 存在）で判定する。
+    // 同一 Arc を settings ルート（手動 trigger）と cron 常駐サービス（定期実行）へ共有する。
+    let google_backup_client: Option<Arc<yuuka_google::GoogleBackupClient>> = match crypto.clone() {
+        Some(crypto) if cfg.google_client_id.is_some() && cfg.google_client_secret.is_some() => {
+            Some(Arc::new(
+                yuuka_google::GoogleBackupClient::new(
+                    cfg.google_client_id.clone().unwrap_or_default(),
+                    cfg.google_client_secret.clone().unwrap_or_default(),
+                    crypto,
+                    db.clone(),
+                    http_client.clone(),
+                )
+                .with_media_dir(yuuka_web::WebConfig::from_core(&cfg).media_dir),
+            ))
+        }
+        _ => None,
+    };
+    let google_backup: Arc<dyn yuuka_google::BackupPort> = match &google_backup_client {
+        Some(client) => client.clone(),
+        None => Arc::new(yuuka_google::NullBackup),
+    };
+    let oauth_state = Arc::new(yuuka_google::OAuthStateStore::new());
+    let settings_runtime = Arc::new(yuuka_settings::SettingsRuntime::new(
+        sessions.clone(),
+        cfg.session_ttl_days,
+        crypto.clone(),
+        bot_runtime.clone(),
+        google_oauth.clone(),
+        google_calendar.clone(),
+        google_backup.clone(),
+        oauth_state.clone(),
+    ));
+    let settings_routes = yuuka_settings::routes(settings_runtime);
+
+    // MCP ルータ（サーバー管理・OAuth 認可・MCP Apps）。auth_credential 暗号化に crypto を注入する。
+    // MCP サーバーへの通信は RmcpClient（rmcp + SSRF ガード付き HTTP）で処理する。
+    let mcp_routes = yuuka_mcp::routes(Arc::new(yuuka_mcp::McpRuntime::new(
+        crypto.clone(),
+        // ChatEngine と同一の RmcpClient を共有（管理 API と動的ツール探索で MCP 接続キャッシュと
+        // OAuth の認可待ちを 1 つに統一する）。
+        mcp_client.clone(),
+    )));
+
+    // 統合設定ルータ（overview / bot lifecycle / grants / google accounts）。Bot 起動停止は Rust が
+    // gateway を所有する時のみ live（TenantRegistry）、Node 所有時は NullBotLifecycle へ縮退する。
+    // カレンダー取得は settings と同一のシームを共有する。
+    let bot_lifecycle: Arc<dyn yuuka_integrated::BotLifecycle> = match &tenant_registry {
+        Some(reg) => Arc::new(RegistryLifecycle(reg.clone())),
+        None => Arc::new(yuuka_integrated::NullBotLifecycle),
+    };
+    let integrated_routes = yuuka_integrated::routes(Arc::new(
+        yuuka_integrated::IntegratedRuntime::new(bot_lifecycle, google_calendar.clone()),
+    ));
+
+    // finance ルータ（A1 配線）: upload-receipt を実 ChatEngine の秘書ターン（画像 OCR）へ橋渡す。
+    // レート制限は Discord/PWA と同じ共有 `rate_limiter` を消費する（guildId スロット="web"）。Node の
+    // `consumeRateLimit` も窓は全経路で共通なので、別インスタンスにするとレシート読み取りで
+    // ユーザー単位の上限を迂回できてしまう（X02 #134）。
+    let finance_routes = yuuka_finance::routes_with(Arc::new(ReceiptParserAdapter {
+        engine: chat_engine.clone(),
+    }));
+
+    // schedule ルータ: 管理画面からの登録・削除もエージェントと同じく Google カレンダーへ反映する（#127）。
+    let schedule_routes = yuuka_schedule::routes_with_calendar(Some(google_events.clone()));
+
+    // ユーザー本人のキーで行う補助テキスト生成（Webhook 整形・定期報告のニュース要約と活動データのまとめで共有）。
+    let aux_text: Arc<dyn yuuka_core::aux_text::AuxTextGenerator> =
+        Arc::new(GeminiAuxText::new(db.clone(), crypto.clone()));
+
+    // Webhook ルータ（署名検証・通知・ToDo/リマインド化・受信履歴を実処理へ配線）。
+    let webhook_routes = yuuka_webhook::routes_with(
+        crypto.clone(),
+        Arc::new(yuuka_webhook::RealWebhookProcessor::new(
+            db.clone(),
+            crypto.clone(),
+            Arc::new(MessengerWebhookNotifier::new(messenger.clone())),
+            aux_text.clone(),
+        )),
+    );
+
+    // Discord ライブ照会（sync-discord の Bot ユーザー参照・guild-options のロール/メンバー候補）。
+    // Rust が gateway を所有する時のみ live（TenantRegistry）、Node 所有時は NullDiscordLive へ縮退する。
+    let discord_live: Arc<dyn yuuka_orchestrator::DiscordLive> = match &tenant_registry {
+        Some(reg) => Arc::new(RegistryDiscordLive::new(reg.clone())),
+        None => Arc::new(yuuka_orchestrator::NullDiscordLive),
+    };
+
+    // Bot 属性ルータ（Gemini キー暗号化に crypto を注入）。
+    let bot_attribute_routes =
+        yuuka_orchestrator::bot_attribute_routes_with(crypto.clone(), discord_live.clone());
+
+    // credential ルータ（register の保存時ユーザー鍵暗号化に crypto を注入・crypto 未設定なら register は
+    // 400 に縮退・list/delete は暗号非依存で動作）。
+    let credential_routes = yuuka_credential::routes_with(crypto.clone());
+
+    // Bot 管理ルータ（一覧の稼働表示・削除時停止）。Rust が gateway を所有する時のみ live
+    // （TenantRegistry）、Node 所有時は NullBotViewRuntime へ縮退する（integrated/admin と同じゲート）。
+    // crypto は discord_application_id 導出（保存トークン復号）に使う。
+    let bot_view_runtime: Arc<dyn yuuka_orchestrator::BotViewRuntime> = match &tenant_registry {
+        Some(reg) => Arc::new(RegistryBotViewRuntime(reg.clone())),
+        None => Arc::new(yuuka_orchestrator::NullBotViewRuntime),
+    };
+    let bot_management_routes = yuuka_orchestrator::bot_management_routes_with(
+        bot_view_runtime,
+        crypto.clone(),
+        discord_live,
+    );
+
+    // 定期報告ルータ（issue #99）: 定期報告のテスト配信を、定時配信と同じ生成・送信経路で
+    // Discord Messenger へ送る。REST 送信は gateway 非依存のため YUUKA_RUST_CRON/DISCORD に関わらず live。
+    // 同じ runner を runPeriodicReportNow（`deliver: true`）にも設定する（issue #136）。
+    let delivery_runner: Arc<dyn yuuka_briefing::DeliveryRunner> = Arc::new(
+        NotifierDeliveryRunner::new(db.clone(), messenger.clone()).with_aux_text(aux_text.clone()),
+    );
+    briefing_delivery.set(delivery_runner.clone());
+    let briefing_routes = yuuka_briefing::routes_with(delivery_runner);
+
+    // 利用申請 + Bot 共有招待ルータ（issue #100/#101）。DM は Discord ボタン経路（interaction）と同じ
+    // messenger（共有デフォルト Bot）から送り、入口（Web / Discord）によらず同じ通知が届くようにする。
+    // gateway ゲート非依存（REST 送信のみ）。デフォルト Bot 未起動なら送信 false → warn のみで応答は成功。
+    let member_share_routes = yuuka_orchestrator::member_request_routes_with(messenger.clone())
+        .merge(yuuka_orchestrator::bot_share_routes_with(messenger.clone()))
+        // 会話記憶の一覧・削除（docs/design/memory_retention.md §4-E）。削除は会話エンジンと同じ RAM 索引からも除く。
+        .merge(yuuka_orchestrator::memory_routes_with(
+            synapse_engine.clone(),
+        ));
+
+    // デバイスフロー（RFC 8628）ルータ。device_code の一時状態はインメモリ store（web 再起動を跨ぐよう
+    // main で 1 度だけ生成し注入）。承認 URL ベースは公開 URL（3.5 の public_base）。
+    let device_auth_routes =
+        yuuka_auth::device_auth_routes(yuuka_auth::DeviceAuthStore::with_ttls(
+            public_base,
+            cfg.desktop_device_code_ttl_secs,
+            cfg.desktop_token_ttl_days,
+        ));
+
+    // Instagram 連携（§3.16）のトークン暗号化に使うため、AuthRuntime へ move される前に確保する。
+    let instagram_crypto = crypto.clone();
+    let auth_runtime = Arc::new(AuthRuntime::new(
+        sessions,
+        cfg.session_ttl_days,
+        cfg.admin_discord_ids.clone(),
+        oidc,
+    ));
+    let auth_routes = yuuka_auth::routes(auth_runtime);
+
+    // 5) 静的配信元（dist/public があれば SPA を載せる）。
+    let dist = PathBuf::from(DIST_DIR);
+    let dist_dir = dist.is_dir().then_some(dist);
+    if dist_dir.is_none() {
+        tracing::warn!(
+            dir = DIST_DIR,
+            "SPA ディレクトリが無いため静的配信を無効化（API のみ）"
+        );
+    }
+
+    // 5.5) PWA（issue #33）配信元。ビルド出力（`dist/public/pwa`）のみを配信する（コミット済み
+    //      成果物へのフォールバックは #46 で廃止）。無ければ PWA 静的配信を無効化（API のみ）。
+    //      `pnpm build`（build:front → build:pwa の順）で生成すること。
+    let pwa_dist = PathBuf::from(PWA_DIST_DIR);
+    let pwa_dist_dir = pwa_dist.is_dir().then_some(pwa_dist);
+    if pwa_dist_dir.is_none() {
+        tracing::warn!(
+            dir = PWA_DIST_DIR,
+            "PWA ディレクトリが無いため PWA 静的配信を無効化（/api/client/* は引き続き動作）。`pnpm build:pwa` で生成してください"
+        );
+    }
+
+    // 6) web を supervised task として登録し、JoinSet 監督ループを駆動する。
+    //    ここから先は「落ちない」— web の panic/一過性障害は隔離＋指数バックオフ再起動される。
+    let addr = SocketAddr::new(cfg.host, cfg.port);
+    let web = Arc::new(WebService {
+        state,
+        auth_routes,
+        admin_routes,
+        settings_routes,
+        webhook_routes,
+        bot_attribute_routes,
+        credential_routes,
+        device_auth_routes,
+        ws_routes: chat_ws_routes,
+        mcp_routes,
+        integrated_routes,
+        finance_routes,
+        schedule_routes,
+        bot_management_routes,
+        member_share_routes,
+        client_api_routes,
+        briefing_routes,
+        addr,
+        dist_dir,
+        pwa_dist_dir,
+    });
+    let mut supervisor = Supervisor::new().service(web);
+
+    // 6.5) Discord ゲートウェイ（P1-3・strangler カットオーバーの env ゲート）。移行期は Node が gateway
+    //      を所有し、同一トークンで Rust も接続すると MESSAGE_CREATE が二重処理される（＝二重応答）。
+    //      Node bot を停止したら `YUUKA_RUST_DISCORD=1` で各テナント（Shard poll ループ）を監督下へ置く
+    //      （panic 隔離 + 指数バックオフ・恒久クローズ=無効トークン等は再起動しない）。REST 送信（登録
+    //      DM・通知）は gateway 非依存のため本ゲートに関わらず messenger 経由で機能する。
+    if let Some(reg) = &tenant_registry {
+        if runners.is_empty() {
+            tracing::warn!(
+                "YUUKA_RUST_DISCORD 有効ですが起動対象 Bot がありません（トークン未登録 or 暗号鍵未設定）"
+            );
+        }
+        for runner in runners {
+            tracing::info!(bot_id = %runner.bot_id(), "Discord テナントを監督下に配置");
+            reg.adopt(runner);
+        }
+    } else {
+        drop(runners);
+        tracing::info!(
+            "Rust Discord ゲートウェイは無効（既定・Node が gateway を所有）。有効化は YUUKA_RUST_DISCORD=1（Node bot 停止後）"
+        );
+    }
+
+    // 7) cron 常駐サービス群（Phase 4）。**strangler カットオーバー用の env ゲート**で制御する:
+    //    移行期は Node が cron を所有し Rust は read-only（二重 writer 回避が絶対条件・R-1）。
+    //    Node cron を停止したら `YUUKA_RUST_CRON=1` で Rust cron を起動する（reminder は起動時
+    //    即時実行で取りこぼしを復帰・§10）。通知先 Discord は未配線のため縮退（NullNotifier）で
+    //    始まり、リマインド等は配信可能になるまで pending のまま保持される。
+    //    P1-4: `impl yuuka_services::Notifier for DiscordMessenger`（notify_bridge）+ 上の Discord
+    //    Messenger 構築（P1-3）が揃ったので、通知先を実 Discord Messenger に配線する。デフォルト Bot が
+    //    未起動ならリマインド等は送信 false のまま保持され、Bot 起動後に配信可能になる。
+    // R05: interactive ToDo tagging is always active, independent of the legacy cron gate.
+    let tag_ctx = ServiceContext::new(
+        db.clone(),
+        messenger.clone(),
+        metrics.clone(),
+        Arc::new(yuuka_services::NullPlaybookRunner),
+    );
+    supervisor = supervisor.service(Arc::new(yuuka_supervisor::CronSupervised::new(
+        Arc::new(yuuka_services::auto_tags::AutoTagService {
+            generator: Arc::new(GeminiAuxText::new(db.clone(), crypto.clone())),
+        }),
+        tag_ctx,
+    )));
+
+    if rust_cron_enabled() {
+        // マクロ定期実行（playbook）は会話エンジンを秘書ターンとして起動する。services→orchestrator の
+        // 逆依存を避けるため、両者を知る supervisor 層でアダプタ経由に注入する（P2 縮退の解消）。
+        let mut service_ctx = ServiceContext::new(
+            db.clone(),
+            messenger,
+            metrics,
+            Arc::new(PlaybookRunnerAdapter {
+                engine: chat_engine.clone(),
+            }),
+        )
+        .with_aux_text(aux_text);
+        // 定期バックアップの実行ポートを注入（実 Drive クライアントがあれば live・無ければ NullBackupRunner
+        // 据え置き＝走査はするが実行は失敗）。手動 trigger（settings）と同一の GoogleBackupClient を共有する。
+        if let Some(client) = google_backup_client.clone() {
+            service_ctx = service_ctx.with_backup(Arc::new(BackupRunnerAdapter { client }));
+        }
+        // Google カレンダー → Yuuka の定期取り込み（アカウントを明示指定したエージェントのみ）。
+        let calendar_sync = Arc::new(CalendarSyncAdapter {
+            db: service_ctx.db.clone(),
+            calendar: google_events.clone(),
+        });
+        service_ctx = service_ctx.with_calendar_sync(calendar_sync);
+        // Instagram 新規投稿の Discord 転送（§3.16）。転送先チャンネルと暗号鍵が揃っている場合のみ
+        // 登録する（未設定ならサービス自体を持たない＝既存挙動に影響しない）。配信はチャンネル露出
+        // ガードを通るため、在籍確認の対象となるオーナーの Discord ユーザー ID が要る。
+        if let (Some(channel_id), Some(crypto)) =
+            (cfg.instagram_channel_id.clone(), instagram_crypto)
+        {
+            if let Some(owner_user_id) = instagram_owner_id(&cfg) {
+                service_ctx = service_ctx.with_instagram(Arc::new(InstagramSettings {
+                    channel_id,
+                    poll_cron: cfg.instagram_poll_cron.clone(),
+                    owner_user_id,
+                    bot_id: "system_default".to_owned(),
+                    seed_token: cfg.instagram_access_token.clone(),
+                    app_secret: cfg.instagram_app_secret.clone(),
+                    crypto,
+                }));
+            } else {
+                tracing::warn!(
+                    "Instagram 連携: オーナーの Discord ユーザー ID が未設定のため開始しません（INSTAGRAM_OWNER_DISCORD_ID もしくは ADMIN_DISCORD_IDS）"
+                );
+            }
+        }
+        let cron = build_supervised_services(&service_ctx, &cfg.reminder_cron);
+        tracing::warn!(
+            count = cron.len(),
+            "YUUKA_RUST_CRON 有効: Rust cron 常駐サービスを監督下に配置（Node cron が停止済みであること）"
+        );
+        for svc in cron {
+            supervisor = supervisor.service(svc);
+        }
+        // 会話記憶の評価・減衰・忘却（memory_retention.md）。評価は秘書なら本人キー、ギルドなら Bot キー。
+        let memory_service = yuuka_supervisor::memory::SynapseMaintenanceService::new(
+            synapse_engine.clone(),
+            Arc::new(yuuka_supervisor::memory::GeminiMemoryLlm::new(
+                db.clone(),
+                crypto.clone(),
+            )),
+        );
+        supervisor = supervisor.service(Arc::new(yuuka_supervisor::CronSupervised::new(
+            Arc::new(memory_service),
+            service_ctx.clone(),
+        )));
+    } else {
+        tracing::info!(
+            "Rust cron は無効（既定・Node が cron を所有）。有効化は YUUKA_RUST_CRON=1（Node cron 停止後）"
+        );
+    }
+
+    tracing::info!(%addr, "yuuka supervisor 起動（web を監督下に配置）");
+    supervisor.run(shutdown_signal()).await;
+    // テナントはレジストリ所有（動的 start/stop のため Supervisor 外）。ここで graceful に閉じる
+    // （close フレーム送出＝Discord セッションを綺麗に終える。旧 supervisor 配置時と同じ終端）。
+    if let Some(reg) = &tenant_registry {
+        reg.shutdown().await;
+    }
+    tracing::info!("yuuka supervisor stopped");
+    Ok(())
+}
+
+/// [`yuuka_services::CalendarSyncRunner`] を Google クライアント + 予定の取り込み処理へ橋渡しするアダプタ。
+///
+/// 取り込み対象は Google アカウントを明示的に割り当てたエージェントだけ（既定＝メインアカウントの
+/// ままのエージェントは Yuuka → Google の登録のみ）。取り込んだ予定はアカウント所有者 × エージェントの
+/// データになる。
+struct CalendarSyncAdapter {
+    db: yuuka_web::Db,
+    calendar: Arc<dyn yuuka_google::CalendarEventsPort>,
+}
+
+#[async_trait]
+impl yuuka_services::CalendarSyncRunner for CalendarSyncAdapter {
+    async fn sync_all(&self) {
+        let targets = match yuuka_google::repo::list_explicit_bot_accounts(&self.db).await {
+            Ok(targets) => targets,
+            Err(e) => {
+                tracing::error!(error = %e, "Google カレンダー取り込み対象の取得に失敗しました");
+                return;
+            }
+        };
+        let now = chrono::Local::now().naive_local();
+        for target in targets {
+            let scope = yuuka_core::UserScope::new(
+                yuuka_core::UserId::new(target.user_id.as_str()),
+                yuuka_core::BotId::new(target.bot_id.as_str()),
+            );
+            match yuuka_schedule::google_sync::pull_from_google(
+                &self.db,
+                &self.calendar,
+                &scope,
+                target.account_id,
+                now,
+                yuuka_schedule::google_sync::DEFAULT_SYNC_DAYS,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    tracing::debug!(bot_id = %target.bot_id, ?summary, "Google カレンダーを取り込みました")
+                }
+                Err(e) => {
+                    tracing::warn!(bot_id = %target.bot_id, error = %e, "Google カレンダーの取り込みに失敗しました")
+                }
+            }
+        }
+    }
+}
+
+/// [`yuuka_services::PlaybookRunner`] を [`ChatEngine`] へ橋渡しするアダプタ（マクロ定期実行）。
+///
+/// `services → orchestrator` の逆依存（循環）を避けるため、両者を知る supervisor 層でブリッジする
+/// （notify_bridge と同思想の孤児回避）。playbook は本人の Gemini キー/データで秘書ターンとして実行し、
+/// 進捗プレゼンスは cron では不要なため no-op の [`StatusSink`](yuuka_discord::StatusSink) を渡す。
+struct PlaybookRunnerAdapter {
+    engine: Arc<ChatEngine>,
+}
+
+#[async_trait]
+impl yuuka_services::PlaybookRunner for PlaybookRunnerAdapter {
+    async fn run_secretary(
+        &self,
+        bot_id: &yuuka_core::BotId,
+        user_id: &yuuka_core::UserId,
+        prompt: String,
+    ) -> Result<String, String> {
+        let msg = yuuka_discord::IncomingChat {
+            text: prompt,
+            ..Default::default()
+        };
+        let status: yuuka_discord::StatusSink = Arc::new(|_| {});
+        match self
+            .engine
+            .secretary_turn(
+                self.engine
+                    .acquire_turn(bot_id, user_id, yuuka_orchestrator::Channel::Automation)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?,
+                msg,
+                &status,
+            )
+            .await
+        {
+            Ok(reply) => Ok(reply.text),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// 定期バックアップの [`yuuka_services::BackupRunner`] を実 [`yuuka_google::GoogleBackupClient`] へ
+/// 橋渡すアダプタ。`services → google` の逆依存を避けるため、両者を知る supervisor 層で注入する
+/// （[`PlaybookRunnerAdapter`] と同思想）。手動 trigger（settings の `BackupPort`）と同一クライアントを
+/// 共有し、`run_backup` は Node `runBackup`（export → zip → Drive アップロード → 世代管理 → last_run 更新）
+/// をそのまま起動する。失敗は [`yuuka_google::GoogleError`] を人間可読な文言へ写す。
+struct BackupRunnerAdapter {
+    client: Arc<yuuka_google::GoogleBackupClient>,
+}
+
+#[async_trait]
+impl yuuka_services::BackupRunner for BackupRunnerAdapter {
+    async fn run_backup(&self, user_id: &str) -> Result<String, String> {
+        use yuuka_google::BackupPort as _;
+        self.client
+            .run_backup(user_id)
+            .await
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// finance の `upload-receipt` を実 [`ChatEngine`] の秘書ターン（画像 OCR）へ橋渡すアダプタ（A1 配線・
+/// Node `receiptParser.parseReceipt` パリティ）。services→orchestrator の逆依存を避けるため、両者を知る
+/// supervisor 層で注入する（[`PlaybookRunnerAdapter`] と同思想）。**コスト増幅 DoS 対策**で LLM 呼び出し
+/// 前にレート制限を消費する（Node `consumeRateLimit(botId, "web", userId)`＝web 管理画面は guildId スロット
+/// に `"web"` を使う）。応答はフロント `ReceiptResultModal` の `{ response: string }` 契約に合わせ秘書ターン
+/// のテキストを返す（記帳自体は system prompt の OCR ルール + ツール呼び出しでサーバ側実行）。
+struct ReceiptParserAdapter {
+    engine: Arc<ChatEngine>,
+}
+
+#[async_trait]
+impl yuuka_finance::ReceiptParser for ReceiptParserAdapter {
+    async fn parse_receipt(
+        &self,
+        bot_id: &str,
+        user_id: &str,
+        image_base64: &str,
+        mime_type: &str,
+        additional_text: Option<&str>,
+    ) -> Result<serde_json::Value, yuuka_finance::ReceiptError> {
+        let bid = yuuka_core::BotId::new(bot_id);
+        let uid = yuuka_core::UserId::new(user_id);
+        let permit = self
+            .engine
+            .acquire_turn(&bid, &uid, yuuka_orchestrator::Channel::Web)
+            .await
+            .map_err(|exceeded| {
+                yuuka_finance::ReceiptError::RateLimited(rate_limit_message(exceeded))
+            })?;
+        // 入口で共通検証・正規化済み。OCR 自体も同じ検証を使う。
+        let image = yuuka_discord::InlineMedia {
+            data_base64: image_base64.to_owned(),
+            mime_type: mime_type.to_owned(),
+        };
+        let status: yuuka_discord::StatusSink = Arc::new(|_| {});
+        match self
+            .engine
+            .receipt_turn(
+                permit,
+                image,
+                additional_text.map(str::to_owned),
+                // 管理画面のレシート読み取りは会話添付を持たない（タイムライン保存候補なし）。
+                Vec::new(),
+                &status,
+            )
+            .await
+        {
+            Ok(reply) => Ok(serde_json::Value::String(reply.text)),
+            // 秘書ターンの hard failure（LLM ソフトエラーは Ok(reply) に畳まれる）→ 503。
+            Err(_) => Err(yuuka_finance::ReceiptError::Unavailable),
+        }
+    }
+}
+
+/// 保存時暗号シークレットの起動時チェック（Node `index.ts` §6.2 パリティ・**N2**）。
+///
+/// `YUUKA_ENCRYPTION_SECRET`（と鍵ローテ用 `_NEW`）が **どちらも未設定なら起動拒否**。設定済みでも
+/// 32 文字未満なら起動拒否する（脆弱鍵は KDF 強度に関わらず総当たりの前提条件になる）。`_NEW` のみ
+/// 設定はプレリリース版からのローテーション起動として許可する（[`rotate_secret_if_requested`]）。
+///
+/// # Errors
+/// 両シークレット未設定、またはいずれかが `MIN_SECRET_LEN` 未満のとき `Err`（起動中断＝非ゼロ終了）。
+fn require_encryption_secret(cfg: &Config) -> Result<(), String> {
+    // Node は `String.length`（UTF-16 code unit）。base64 秘密は ASCII なので `chars().count()` と一致。
+    check_secret_strength(
+        cfg.encryption_secret
+            .as_ref()
+            .map(|s| s.expose_secret().chars().count()),
+        cfg.encryption_secret_new
+            .as_ref()
+            .map(|s| s.expose_secret().chars().count()),
+    )
+}
+
+/// [`require_encryption_secret`] の純粋な判定部（テスト可能）。引数は各シークレットの文字長（未設定は `None`）。
+///
+/// # Errors
+/// 両方 `None`（未設定）、またはいずれかが `MIN_SECRET_LEN` 未満のとき `Err`。
+fn check_secret_strength(secret_len: Option<usize>, new_len: Option<usize>) -> Result<(), String> {
+    /// Node `MIN_SECRET_LEN`（`index.ts`）。
+    const MIN_SECRET_LEN: usize = 32;
+
+    if secret_len.is_none() && new_len.is_none() {
+        return Err(
+            "YUUKA_ENCRYPTION_SECRET が未設定です。十分に長いランダム文字列（例: openssl rand -base64 48）を \
+             設定してください。プレリリース版からの移行は YUUKA_ENCRYPTION_SECRET_NEW に新鍵を設定して起動 \
+             （鍵ローテーション）します。"
+                .to_owned(),
+        );
+    }
+    for (name, len) in [
+        ("YUUKA_ENCRYPTION_SECRET", secret_len),
+        ("YUUKA_ENCRYPTION_SECRET_NEW", new_len),
+    ] {
+        if let Some(n) = len {
+            if n < MIN_SECRET_LEN {
+                return Err(format!(
+                    "{name} が短すぎます（{n} 文字）。推測困難な {MIN_SECRET_LEN} 文字以上のランダム値 \
+                     （例: openssl rand -base64 48）を設定してください。"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `YUUKA_ENCRYPTION_SECRET_NEW` が設定されていれば鍵ローテーションを実行する（Node パリティ）。
+///
+/// 旧鍵は現行 `YUUKA_ENCRYPTION_SECRET`、未設定ならプレリリース版フォールバック鍵
+/// （Node `rotateSecretKey` と同一のレスキュー動作）。writer actor 上で単一 Tx を回し、
+/// 1 件でも復号失敗すれば全ロールバックして起動を fail-fast させる（部分適用を残さない）。
+///
+/// # Errors
+/// ローテーション（DB/復号/鍵導出）失敗で `Err`（起動中断）。
+async fn rotate_secret_if_requested(db: &Db, cfg: &Config) -> Result<(), String> {
+    let Some(new_secret) = cfg.encryption_secret_new.as_ref() else {
+        return Ok(()); // _NEW 未設定＝通常起動（ローテーションしない）。
+    };
+    let new = new_secret.expose_secret().to_owned();
+
+    // 旧鍵: 現行 secret。未設定なら既知フォールバック鍵からの移行（漏えい済みとみなす）。
+    let old = match cfg.encryption_secret.as_ref() {
+        Some(cur) => cur.expose_secret().to_owned(),
+        None => {
+            tracing::warn!(
+                "YUUKA_ENCRYPTION_SECRET 未設定のためプレリリース版フォールバック鍵で復号して再暗号化します。\
+                 移行後は保存済みトークン/APIキー等を各プロバイダ側で必ずローテーションしてください"
+            );
+            LEGACY_FALLBACK_SECRET.to_owned()
+        }
+    };
+
+    let rotated = db
+        .writer
+        .execute(move |conn| {
+            rotate_secret_key(conn, &old, &new).map_err(|e| DbError::Operation(e.to_string()))
+        })
+        .await
+        .map_err(|e| format!("secret rotation failed: {e}"))?;
+
+    tracing::warn!(
+        rotated,
+        "YUUKA_ENCRYPTION_SECRET ローテーション完了。次手順: _NEW の値を _SECRET に昇格し _NEW を削除して再起動"
+    );
+    Ok(())
+}
+
+/// Instagram 転送のチャンネル露出ガードで在籍確認する対象ユーザー（§3.16）。
+///
+/// `INSTAGRAM_OWNER_DISCORD_ID` を優先し、未設定なら `ADMIN_DISCORD_IDS` の先頭で代替する。
+/// どちらも無ければ `None`＝Instagram 連携は開始しない。
+fn instagram_owner_id(cfg: &yuuka_core::Config) -> Option<String> {
+    cfg.instagram_owner_discord_id
+        .clone()
+        .or_else(|| cfg.admin_discord_ids.first().cloned())
+}
+
+/// Rust cron 常駐サービスを起動するか（strangler カットオーバーの env ゲート）。
+/// `YUUKA_RUST_CRON` が `1`/`true`/`yes`（大小無視）のときのみ有効。
+fn rust_cron_enabled() -> bool {
+    std::env::var("YUUKA_RUST_CRON")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Rust Discord ゲートウェイ（各テナントの Shard poll ループ）を起動するか（strangler カットオーバーの
+/// env ゲート）。`YUUKA_RUST_DISCORD` が `1`/`true`/`yes`（大小無視）のときのみ有効。無効時も REST 送信
+/// （登録 DM・通知）は messenger 経由で機能する（gateway 二重接続＝二重応答のみを避ける）。
+fn rust_discord_enabled() -> bool {
+    std::env::var("YUUKA_RUST_DISCORD")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// web サーバを [`SupervisedService`] 化する（絶対制約2: panic 隔離＋バックオフ再起動）。
+///
+/// `run` は毎回ルータを組み立て直して bind→serve する。bind/serve 失敗は
+/// `ServiceError::Transient`（supervisor が再起動）、shutdown での正常停止は Ok(())（再起動しない）。
+struct WebService {
+    state: AppState,
+    /// 認証発行ルータ（`AuthRuntime` を `Extension` で内包済み・再起動毎に clone して merge）。
+    auth_routes: Router<AppState>,
+    /// 管理ルータ（`AdminRuntime` を `Extension` で内包済み・`/api/admin/*`）。
+    admin_routes: Router<AppState>,
+    /// 設定ルータ（`SettingsRuntime` を `Extension` で内包済み・`/api/settings/*`）。
+    settings_routes: Router<AppState>,
+    /// Webhook ルータ（crypto/プロセッサを `Extension` で内包済み・`/hook/*` + `/api/webhooks/*`）。
+    webhook_routes: Router<AppState>,
+    /// Bot 属性ルータ（crypto を `Extension` で内包済み・`/api/bots/attributes` + `/api/bots/assistant/*`）。
+    bot_attribute_routes: Router<AppState>,
+    /// credential ルータ（register 暗号化 crypto を `Extension` で内包済み・`/api/credentials*`）。
+    credential_routes: Router<AppState>,
+    /// デバイスフロー ルータ（device_code の一時状態 store を `Extension` で内包済み・`/api/auth/device/*`）。
+    device_auth_routes: Router<AppState>,
+    /// 会話 WS ルータ（`ChatEngine` を `Extension` で内包済み・`/ws/chat`）。
+    ws_routes: Router<AppState>,
+    /// MCP ルータ（`McpRuntime` を `Extension` で内包済み・`/api/mcp-servers*` + `/mcp-apps/sandbox`）。
+    mcp_routes: Router<AppState>,
+    /// 統合設定ルータ（`IntegratedRuntime` を `Extension` で内包済み・`/api/integrated/*`）。
+    integrated_routes: Router<AppState>,
+    /// finance ルータ（`ReceiptParser` を `Extension` で内包済み・`/api/expenses/*`・upload-receipt live）。
+    finance_routes: Router<AppState>,
+    /// schedule ルータ（予定の Google 同期先を `Extension` で内包済み・`/api/schedules*`）。
+    schedule_routes: Router<AppState>,
+    /// Bot 管理ルータ（`BotViewRuntime`/crypto を `Extension` で内包済み・`/api/bots*`）。
+    bot_management_routes: Router<AppState>,
+    /// 利用申請 + Bot 共有招待ルータ（`DiscordMessenger` の DM sender を `Extension` で内包済み・
+    /// `/api/bots/member-requests*` + `/api/bots/shares*`）。
+    member_share_routes: Router<AppState>,
+    /// PWA クライアント API ルータ（`ChatEngine`/`RateLimiter` を `Extension` で内包済み・
+    /// `/api/client/*`・チャット送信は issue #41）。
+    client_api_routes: Router<AppState>,
+    /// 定期報告ルータ（`DeliveryRunner` を `Extension` で内包済み・`/api/periodic-reports*`）。
+    briefing_routes: Router<AppState>,
+    addr: SocketAddr,
+    dist_dir: Option<PathBuf>,
+    /// PWA（issue #33）配信元。`None` なら PWA 静的配信を無効化（`/api/client/*` のみ動作）。
+    pwa_dist_dir: Option<PathBuf>,
+}
+
+#[async_trait]
+impl SupervisedService for WebService {
+    fn name(&self) -> String {
+        "web".to_owned()
+    }
+
+    async fn run(&self, mut shutdown: ShutdownToken) -> Result<(), ServiceError> {
+        let app = build_app(
+            self.state.clone(),
+            self.auth_routes.clone(),
+            self.admin_routes.clone(),
+            self.settings_routes.clone(),
+            self.webhook_routes.clone(),
+            self.bot_attribute_routes.clone(),
+            self.credential_routes.clone(),
+            self.device_auth_routes.clone(),
+            self.ws_routes.clone(),
+            self.mcp_routes.clone(),
+            self.integrated_routes.clone(),
+            self.finance_routes.clone(),
+            self.schedule_routes.clone(),
+            self.bot_management_routes.clone(),
+            self.member_share_routes.clone(),
+            self.client_api_routes.clone(),
+            self.briefing_routes.clone(),
+            self.dist_dir.as_deref(),
+            self.pwa_dist_dir.as_deref(),
+        );
+        let listener = tokio::net::TcpListener::bind(self.addr)
+            .await
+            .map_err(|e| ServiceError::transient(format!("bind {}: {e}", self.addr)))?;
+        tracing::info!(addr = %self.addr, "yuuka web serving");
+        // ConnectInfo<SocketAddr> を有効化し、レート制限のクライアント IP 解決（Node getClientIp
+        // 相当）が peer アドレスを参照できるようにする（信頼プロキシ配下では XFF を優先）。
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .map_err(|e| ServiceError::transient(format!("serve: {e}")))?;
+        tracing::info!("yuuka web stopped");
+        Ok(())
+    }
+}
+
+/// Ctrl-C または SIGTERM を待つ（graceful shutdown のトリガ）。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM ハンドラ登録に失敗（Ctrl-C のみ有効）");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal を受信。graceful shutdown を開始");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_secret_strength;
+
+    #[test]
+    fn both_absent_is_rejected() {
+        // N2 の核心: 暗号鍵が一切無い起動は拒否する（Node index.ts の process.exit(1) 相当）。
+        assert!(check_secret_strength(None, None).is_err());
+    }
+
+    #[test]
+    fn weak_secret_is_rejected() {
+        assert!(check_secret_strength(Some(31), None).is_err());
+        assert!(check_secret_strength(None, Some(10)).is_err());
+    }
+
+    #[test]
+    fn strong_secret_is_accepted() {
+        assert!(check_secret_strength(Some(32), None).is_ok());
+        assert!(check_secret_strength(Some(48), None).is_ok());
+        // 鍵ローテーション（_NEW のみ・十分長）も許可。
+        assert!(check_secret_strength(None, Some(48)).is_ok());
+    }
+}

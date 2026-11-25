@@ -1,0 +1,91 @@
+//! yuuka-services — cron 常駐タスク群（現行 `src/services/*` の `start*`/`stop*`）。
+//!
+//! Phase 4。各サービスは [`CronService`] を実装し、[`build_services`] が全サービスをまとめて返す。
+//! supervisor はこれを [`crate::run_cron`] 経由で `SupervisedService` へアダプトし、JoinSet 監督下で
+//! 回す（panic 隔離＋指数バックオフ再起動・絶対制約2）。**本 crate は supervisor に依存しない**
+//! （DAG: `services → web/core/domains`）。
+//!
+//! # 横断アクセス
+//! cron は全ユーザーを跨いで走査する（`listDuePending` 等）。通常の `UserScope` 経路から隔離する
+//! ため、各ドメイン crate の **`CronScan` メソッド**（[`CrossUserAccess`](yuuka_core::CrossUserAccess)
+//! 証憑必須）を使う。証憑は [`ServiceContext`] が保持し、cron の起点をそこに限定する（grep 可能）。
+//!
+//! # 実装済み
+//! - metrics / clipboard / reminder / todo-recurrence / payment-recurrence / birthday /
+//!   **playbook-schedule**（マクロ定期実行・[`turn::PlaybookRunner`] ポート経由で会話エンジンを起動）/
+//!   **periodic-report**（定期報告＝天気・ニュース・タスク等を組み合わせた報告の定時配信・
+//!   生成は `yuuka-briefing` の `build_report_embed` を再利用）/ **backup**（ユーザー別 Google Drive
+//!   バックアップの定期実行・実 Drive アップロードは [`backup::BackupRunner`] ポート経由＝main で
+//!   `GoogleBackupClient` へ橋渡し）
+//! - 定期報告の**テスト配信**（[`NotifierDeliveryRunner`]・`yuuka_briefing::DeliveryRunner` の実装。
+//!   定時配信と同じ `deliver` を本人・選択中 Bot の定期報告で 1 回呼ぶ）
+
+use std::sync::Arc;
+
+pub mod auto_tags;
+pub mod backup;
+pub mod calendar_sync;
+pub mod context;
+pub mod instagram;
+pub mod metrics;
+pub mod notifier;
+pub mod schedule;
+pub mod turn;
+
+mod birthday;
+mod clipboard;
+mod delivery;
+mod payment_recurrence;
+mod periodic_report;
+mod planned_payment;
+mod playbook_schedule;
+mod reminder;
+mod todo_recurrence;
+
+#[cfg(test)]
+mod test_support;
+
+pub use backup::{BackupRunner, NullBackupRunner};
+pub use calendar_sync::{CalendarSyncRunner, NullCalendarSyncRunner};
+pub use context::ServiceContext;
+pub use delivery::NotifierDeliveryRunner;
+pub use instagram::{InstagramFeedService, InstagramSettings};
+pub use metrics::MetricsRegistry;
+pub use notifier::{Notification, Notifier, NotifyFile, NotifyTarget, NullNotifier};
+pub use schedule::{run_cron, CronService, Schedule};
+pub use turn::{NullPlaybookRunner, PlaybookRunner};
+
+/// 全 cron サービスを構築して返す（登録レジストリ）。supervisor はこれを監督下タスクへ変換する。
+///
+/// backup は実行ポート（[`backup::BackupRunner`]）を [`ServiceContext`] から得る。未配線時は
+/// [`backup::NullBackupRunner`] へ縮退し、走査はするが実行は失敗（Node の Google 未連携と同じ非致命）。
+///
+/// `reminder_cron` はリマインドエンジンの実行周期（config `REMINDER_CRON`・起動時に検証済みの値）。
+#[must_use]
+pub fn build_services(reminder_cron: &str) -> Vec<Arc<dyn CronService>> {
+    vec![
+        Arc::new(reminder::ReminderService::new(reminder_cron)),
+        Arc::new(todo_recurrence::TodoRecurrenceService),
+        Arc::new(payment_recurrence::PaymentRecurrenceService),
+        Arc::new(birthday::BirthdayReminderService),
+        Arc::new(clipboard::ClipboardCleanupService),
+        Arc::new(metrics::MetricsLogService),
+        Arc::new(playbook_schedule::PlaybookScheduleService),
+        Arc::new(periodic_report::PeriodicReportService),
+        Arc::new(backup::BackupService),
+        Arc::new(calendar_sync::CalendarSyncService),
+    ]
+}
+
+/// 設定があるときだけ登録する fork 独自のサービス（[`build_services`] とは分けて upstream との衝突を避ける）。
+///
+/// Instagram 連携（§3.16）は `INSTAGRAM_CHANNEL_ID` 未設定なら [`ServiceContext::instagram`] が
+/// `None` で、サービス自体を持たない。
+#[must_use]
+pub fn build_optional_services(ctx: &ServiceContext) -> Vec<Arc<dyn CronService>> {
+    let mut services: Vec<Arc<dyn CronService>> = Vec::new();
+    if let Some(settings) = ctx.instagram.clone() {
+        services.push(Arc::new(instagram::InstagramFeedService::new(settings)));
+    }
+    services
+}

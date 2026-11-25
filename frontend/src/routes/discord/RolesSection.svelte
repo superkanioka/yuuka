@@ -1,0 +1,165 @@
+<script lang="ts">
+// 利用可能ロール（旧 renderAssistantRoles + loadGuildOptions("role") + btn-add-assistant-role）。
+
+import { botAttributeApi } from "$lib/api/services";
+import { confirmDialog, Select } from "$lib/components/ui";
+import { pushToast, toastError } from "$lib/stores/toast";
+import type {
+	AssistantGuild,
+	AssistantRole,
+	GuildOptionItem,
+	GuildOptionsResp,
+} from "../config/configTypes";
+import { guildLabel, guildOptions } from "../config/configTypes";
+import AddButton from "./AddButton.svelte";
+import DeleteButton from "./DeleteButton.svelte";
+import OptionCombobox from "./OptionCombobox.svelte";
+
+interface Props {
+	botId: string;
+	guilds: AssistantGuild[];
+	roles: AssistantRole[];
+	onchanged: () => void;
+}
+let { botId, guilds, roles, onchanged }: Props = $props();
+
+let selectedGuild = $state("");
+let selectedRole = $state("");
+let roleOptions = $state<GuildOptionItem[]>([]);
+let available = $state(true);
+
+$effect(() => {
+	if (guilds.length === 0) {
+		selectedGuild = "";
+		return;
+	}
+	if (!guilds.some((g) => g.guild_id === selectedGuild)) {
+		selectedGuild = guilds[0].guild_id;
+	}
+});
+
+$effect(() => {
+	const gid = selectedGuild;
+	if (!gid) {
+		roleOptions = [];
+		return;
+	}
+	void loadOptions(gid);
+});
+
+async function loadOptions(guildId: string) {
+	try {
+		const res = (await botAttributeApi.guildOptions(botId, {
+			guildId,
+		})) as GuildOptionsResp;
+		if (!res.success) {
+			roleOptions = [];
+			available = false;
+			return;
+		}
+		available = res.available ?? true;
+		roleOptions = res.roles ?? [];
+		selectedRole = "";
+	} catch {
+		roleOptions = [];
+		available = false;
+	}
+}
+
+async function add() {
+	const guildId = selectedGuild;
+	const roleId = selectedRole;
+	const roleName = roleOptions.find((r) => r.id === roleId)?.name;
+	if (!guildId) {
+		pushToast("先に応答許可ギルドを追加してください。", "error");
+		return;
+	}
+	if (!/^\d{5,25}$/.test(roleId)) {
+		pushToast(
+			"ロールを候補から選択してください（Botが当該ギルドに参加・起動している必要があります）。",
+			"error",
+		);
+		return;
+	}
+	try {
+		const res = await botAttributeApi.setRoles({
+			botId,
+			guildId,
+			roleId,
+			roleName,
+			action: "add",
+		});
+		if (res.success) {
+			selectedRole = "";
+			onchanged();
+		} else pushToast(res.message ?? "操作に失敗しました。", "error");
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
+	}
+}
+
+async function remove(r: AssistantRole, shift: boolean) {
+	if (!shift) {
+		const ok = await confirmDialog({
+			message: `ロール ${r.role_name || r.role_id} を利用可能ロールから削除しますか？`,
+			danger: true,
+			confirmLabel: "削除",
+		});
+		if (!ok) return;
+	}
+	try {
+		const res = await botAttributeApi.setRoles({
+			botId,
+			guildId: r.guild_id,
+			roleId: r.role_id,
+			action: "remove",
+		});
+		if (res.success) onchanged();
+		else pushToast(res.message ?? "操作に失敗しました。", "error");
+	} catch (err) {
+		toastError(err, "通信エラーが発生しました。");
+	}
+}
+</script>
+
+<section class="config-card card">
+	<div class="column-header">
+		<h3><span class="material-symbols-outlined header-icon-symbol">shield_person</span>利用可能ロール</h3>
+	</div>
+	<div class="section-body">
+		<div class="add-row">
+			<div class="joined-field">
+				<Select
+					class="guild-select"
+					ariaLabel="ギルド"
+					options={guildOptions(guilds)}
+					bind:value={selectedGuild}
+				/>
+				<span class="divider" aria-hidden="true"></span>
+				<OptionCombobox
+					options={roleOptions.filter(
+						(o) => !roles.some((r) => r.guild_id === selectedGuild && r.role_id === o.id),
+					)}
+					bind:value={selectedRole}
+					placeholder={available ? "ロール名 または ID" : "Bot未起動/未参加のため取得できません"}
+				/>
+			</div>
+			<AddButton onclick={add} disabled={!selectedRole.trim()} icon="group_add" title="ロールを追加" />
+		</div>
+		<div class="row-list">
+			{#if roles.length === 0}
+				<span class="field-sub">許可中のロールはありません。</span>
+			{:else}
+				{#each roles as r (r.guild_id + ":" + r.role_id)}
+					<div class="list-row">
+						<span class="row-label">
+							{#if r.role_name}@{r.role_name}{:else}<span class="mono">{r.role_id}</span>{/if}
+							@ {guildLabel(guilds, r.guild_id)}
+						</span>
+						<DeleteButton title="Shiftを押しながらで確認なしに削除" onclick={(e) => remove(r, e.shiftKey)} />
+					</div>
+				{/each}
+			{/if}
+		</div>
+	</div>
+</section>

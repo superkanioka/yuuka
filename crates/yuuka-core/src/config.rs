@@ -1,0 +1,967 @@
+//! 型付き Config と厳密 load/validate（§6.8）。
+//!
+//! `config.yaml`（存在すれば）＋環境変数を **既存 Node `getSetting` と同一の優先順**
+//! （`yaml[KEY] ?? env[KEY] ?? default`・キーは **UPPERCASE**）で読み、型付き構造体へ
+//! 落とす。認証発行（P1-1）に必要な `ADMIN_DISCORD_IDS` は取り込む（初期 admin 昇格に使う）。
+//! それ以外の未知キー（`INVITE_CODES` 等・廃止/他系用）は **無視**する。型不一致・不正値は起動時に fail-fast
+//! （`ConfigError`。§5.6 の唯一の致命ポイント）。機密は本 struct に平文で持たず
+//! [`crate::secrets`] の `SecretString` で扱う。
+//!
+//! 例外として運用チューニング設定（`REMINDER_CRON`・`SYNAPSE_RECALL_K`・`SYNAPSE_RECENCY_*`・
+//! `DESKTOP_TOKEN_TTL_DAYS`・`DESKTOP_DEVICE_CODE_TTL_SEC`）は、不正値でも起動を止めず
+//! **警告ログを出して既定値へ戻す**（[`tuning_or_default`]。Node は `parseInt` 失敗で NaN になり
+//! 挙動が壊れていたため、既定へ倒す）。
+
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+mod yaml;
+
+pub use yaml::YamlError;
+use yaml::{Mapping, Value};
+
+use crate::error::ConfigError;
+use crate::secrets::{ExposeSecret, SecretString};
+
+/// 起動時に検証済みの型付き設定。以後サービスループへ不変で渡す。
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// 公開ベース URL（`https://` なら Cookie ハードニング + HSTS を強制）。
+    pub base_url: Option<String>,
+    /// バインドホスト（`HOST`・既定 `127.0.0.1`）。
+    pub host: IpAddr,
+    /// バインドポート（`PORT`・既定 `3000`）。
+    pub port: u16,
+    /// SQLite DB ファイルパス（`DB_PATH`・既定 `./data/yuuka.db`）。
+    pub db_path: PathBuf,
+    /// セッション TTL（日・`SESSION_TTL_DAYS`・既定 7）。
+    pub session_ttl_days: u32,
+    /// Redis 接続 URL（`REDIS_URL`・既定 `redis://127.0.0.1:6379`）。
+    pub redis_url: String,
+    /// ログインに使う OIDC プロバイダーの設定（`OIDC_*`）。
+    pub oidc: OidcSettings,
+    /// XFF 信頼判定に使う信頼プロキシ（`TRUSTED_PROXIES`・カンマ/YAML 配列）。
+    pub trusted_proxies: Vec<IpAddr>,
+    /// index.html へ差し込む google-site-verification 値（`GOOGLE_SITE_VERIFICATION`）。
+    pub google_site_verification: Option<String>,
+    /// サーバーでの音声生成（GPU の無い端末向け・`clients/pwa/server/tts`）の URL（`TTS_SERVER_URL`・
+    /// 例 `http://127.0.0.1:3410`）。未設定なら `/api/client/tts/*` は 404 で、PWA は標準の読み上げを使う。
+    pub tts_server_url: Option<String>,
+    /// 音声生成サーバーへの要求に付ける Ed25519 署名の秘密鍵（`TTS_SIGNING_KEY`・32 バイトの seed を base64）。
+    /// 音声生成サーバーは対応する公開鍵（`TTS_VERIFY_KEYS`）で確かめる。未設定なら署名を付けない
+    /// （音声生成サーバーが同じホストの 127.0.0.1 で待ち受けるときだけ使える）。
+    pub tts_signing_key: Option<SecretString>,
+    /// MCP Apps の画面を動かすサンドボックス用オリジン（`MCP_SANDBOX_ORIGIN`・例 `https://mcp-sandbox.example.com`）。
+    /// 本体と別のホスト名を同じ yuuka に向けておくと、MCP サーバーの画面を本体と別の実オリジンで動かす
+    /// （MCP Apps 仕様どおり）。未設定なら不透明オリジン（`sandbox` の `allow-same-origin` なし）で動かす。
+    pub mcp_sandbox_origin: Option<String>,
+    /// プライバシーポリシー URL（`PRIVACY_POLICY_URL`・`/api/me` で返す）。
+    pub privacy_policy_url: String,
+    /// 利用規約 URL（`TERMS_URL`・同上）。
+    pub terms_url: String,
+    /// 保存時暗号化のマスタ秘密（`YUUKA_ENCRYPTION_SECRET`）。API キー・Discord トークン・
+    /// OAuth トークン・資格情報等の at-rest 暗号鍵の導出材料（Node `config.secretKey`）。
+    /// 未設定なら `None`＝暗号層は fail-closed（[`crate::secrets`] で redact 保持）。
+    pub encryption_secret: Option<SecretString>,
+    /// 鍵ローテーション用の新秘密（`YUUKA_ENCRYPTION_SECRET_NEW`）。設定時は起動時に
+    /// 旧鍵→新鍵で全暗号化列を再暗号化する（Node `config.secretKeyNew` / `rotateSecretKey`）。
+    pub encryption_secret_new: Option<SecretString>,
+    /// 初期 admin に昇格する Discord ユーザー ID（`ADMIN_DISCORD_IDS`・任意・Node `config.adminDiscordIds`）。
+    /// `createUser` はこのリストに含まれる ID のみを admin ロールで作成する。
+    pub admin_discord_ids: Vec<String>,
+    /// デスクトップ `/ws/chat` の 1 メッセージ添付上限（MB・`DESKTOP_MAX_UPLOAD_MB`・既定 20・
+    /// Node `config.desktopMaxUploadMb`）。
+    pub desktop_max_upload_mb: u32,
+    /// デスクトップのボタン往復確認。既定無効。
+    pub desktop_demo_components: bool,
+    /// リマインダーのポーリング cron 式（`REMINDER_CRON`・既定 `* * * * *`・Node `config.reminderCron`）。
+    /// リマインドエンジンの実行周期に使い、`/api/status` の設定表示にも返す。不正な式は既定へ戻す。
+    pub reminder_cron: String,
+    /// L2 想起（1st Hop KNN）の取得件数（`SYNAPSE_RECALL_K`・既定 5・1 以上・Node `config.synapseRecallK`）。
+    pub synapse_recall_k: usize,
+    /// L2 想起の recency 加算ブースト重み（`SYNAPSE_RECENCY_WEIGHT`・既定 0.15・0 で無効・
+    /// Node `config.synapseRecencyWeight`）。
+    pub synapse_recency_weight: f32,
+    /// recency ブーストの半減期（時間・`SYNAPSE_RECENCY_HALFLIFE_HOURS`・既定 18・0 で無効・
+    /// Node `config.synapseRecencyHalflifeHours`）。
+    pub synapse_recency_halflife_hours: f32,
+    /// デスクトップトークンの TTL（日・`DESKTOP_TOKEN_TTL_DAYS`・既定 90・1〜36500・
+    /// Node `config.desktopTokenTtlDays`）。最終利用からのスライディング期限。
+    pub desktop_token_ttl_days: u32,
+    /// デバイスフローの device_code 有効期限（秒・`DESKTOP_DEVICE_CODE_TTL_SEC`・既定 600・1〜86400・
+    /// Node `config.desktopDeviceCodeTtlSec`）。
+    pub desktop_device_code_ttl_secs: u64,
+    /// Google OAuth2 クライアント ID（`GOOGLE_CLIENT_ID`・未設定は Google 連携無効・Node `config.googleClientId`）。
+    pub google_client_id: Option<String>,
+    /// Google OAuth2 クライアントシークレット（`GOOGLE_CLIENT_SECRET`・同上・Node `config.googleClientSecret`）。
+    pub google_client_secret: Option<String>,
+    /// Instagram 新規投稿の転送先 Discord チャンネル ID（`INSTAGRAM_CHANNEL_ID`・§3.16）。
+    /// 未設定なら Instagram 連携サービスは起動しない。
+    pub instagram_channel_id: Option<String>,
+    /// Instagram のポーリング間隔（5-field cron 式・`INSTAGRAM_POLL_CRON`・既定 `*/20 * * * *`。
+    /// 不正値は起動時に警告して既定へ戻す）。
+    pub instagram_poll_cron: String,
+    /// 初回連携用の Instagram アクセストークン（`INSTAGRAM_ACCESS_TOKEN`・短期トークン可）。
+    /// DB に未連携のときだけ使い、長期トークンへ交換して暗号化保存する。以後は DB 側が正。
+    pub instagram_access_token: Option<SecretString>,
+    /// Instagram アプリシークレット（`INSTAGRAM_APP_SECRET`・短期→長期トークンの交換に必要）。
+    pub instagram_app_secret: Option<SecretString>,
+    /// 転送先チャンネルの閲覧資格を検証する対象ユーザー（`INSTAGRAM_OWNER_DISCORD_ID`）。
+    /// 通知配信はチャンネル露出ガード（対象ユーザーの在籍確認）を通るため、オーナー本人の
+    /// Discord ユーザー ID が要る。未設定なら `ADMIN_DISCORD_IDS` の先頭を使う。
+    pub instagram_owner_discord_id: Option<String>,
+}
+
+impl Config {
+    /// `config.yaml`（あれば）＋環境変数を読み、厳密検証して返す。**起動時のみ**呼ぶ。
+    ///
+    /// `path` が無ければ Node 同様に警告扱いで env/既定へフォールバックする（欠落は致命に
+    /// しない。壊れた YAML＝パース失敗のみ致命）。
+    ///
+    /// # Errors
+    /// YAML パース失敗・型不一致・不正値で [`ConfigError`]。
+    pub fn load_and_validate(path: &Path) -> Result<Self, ConfigError> {
+        // config.yaml があれば mapping として読む（無ければ空＝env/既定のみ）。壊れた
+        // YAML はパース失敗＝致命（§5.6）。未知キーは Mapping なので自然に許容される。
+        let yaml: Mapping = match std::fs::read_to_string(path) {
+            Ok(raw) => yaml::from_str(&raw).map_err(|source| ConfigError::Parse { source })?,
+            Err(_) => Mapping::default(),
+        };
+
+        // getSetting(KEY) = yaml[KEY] ?? env[KEY]（Node `config.ts` と同一優先順）。
+        let get = |key: &str| get_setting(&yaml, key);
+
+        let host = parse_field(
+            "HOST",
+            &get("HOST").unwrap_or_else(|| "127.0.0.1".to_owned()),
+        )?;
+        let port = parse_field("PORT", &get("PORT").unwrap_or_else(|| "3000".to_owned()))?;
+        let db_path = PathBuf::from(get("DB_PATH").unwrap_or_else(|| "./data/yuuka.db".to_owned()));
+        let session_ttl_days = parse_field(
+            "SESSION_TTL_DAYS",
+            &get("SESSION_TTL_DAYS").unwrap_or_else(|| "7".to_owned()),
+        )?;
+        let redis_url = get("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".to_owned());
+        let trusted_proxies = parse_ip_list("TRUSTED_PROXIES", get("TRUSTED_PROXIES").as_deref())?;
+
+        let cfg = Self {
+            base_url: non_empty(get("BASE_URL")),
+            host,
+            port,
+            db_path,
+            session_ttl_days,
+            redis_url,
+            oidc: OidcSettings::from_lookup(&get),
+            trusted_proxies,
+            google_site_verification: non_empty(get("GOOGLE_SITE_VERIFICATION")),
+            tts_server_url: non_empty(get("TTS_SERVER_URL")),
+            tts_signing_key: non_empty(get("TTS_SIGNING_KEY")).map(SecretString::from),
+            mcp_sandbox_origin: non_empty(get("MCP_SANDBOX_ORIGIN"))
+                .map(|s| s.trim().trim_end_matches('/').to_owned()),
+            privacy_policy_url: get("PRIVACY_POLICY_URL").unwrap_or_default(),
+            terms_url: get("TERMS_URL").unwrap_or_default(),
+            encryption_secret: non_empty(get("YUUKA_ENCRYPTION_SECRET")).map(SecretString::from),
+            encryption_secret_new: non_empty(get("YUUKA_ENCRYPTION_SECRET_NEW"))
+                .map(SecretString::from),
+            admin_discord_ids: parse_string_list(get("ADMIN_DISCORD_IDS").as_deref()),
+            desktop_max_upload_mb: parse_field(
+                "DESKTOP_MAX_UPLOAD_MB",
+                &get("DESKTOP_MAX_UPLOAD_MB").unwrap_or_else(|| "20".to_owned()),
+            )?,
+            desktop_demo_components: parse_field(
+                "DESKTOP_DEMO_COMPONENTS",
+                &get("DESKTOP_DEMO_COMPONENTS").unwrap_or_else(|| "false".to_owned()),
+            )?,
+            reminder_cron: tuning_or_default(
+                "REMINDER_CRON",
+                get("REMINDER_CRON"),
+                DEFAULT_REMINDER_CRON.to_owned(),
+                |raw| Some(raw.to_owned()).filter(|c| crate::cron_util::is_valid(c)),
+            ),
+            synapse_recall_k: tuning_or_default(
+                "SYNAPSE_RECALL_K",
+                get("SYNAPSE_RECALL_K"),
+                DEFAULT_SYNAPSE_RECALL_K,
+                |raw| raw.parse::<usize>().ok().filter(|k| *k >= 1),
+            ),
+            synapse_recency_weight: tuning_or_default(
+                "SYNAPSE_RECENCY_WEIGHT",
+                get("SYNAPSE_RECENCY_WEIGHT"),
+                DEFAULT_SYNAPSE_RECENCY_WEIGHT,
+                parse_non_negative_f32,
+            ),
+            synapse_recency_halflife_hours: tuning_or_default(
+                "SYNAPSE_RECENCY_HALFLIFE_HOURS",
+                get("SYNAPSE_RECENCY_HALFLIFE_HOURS"),
+                DEFAULT_SYNAPSE_RECENCY_HALFLIFE_HOURS,
+                parse_non_negative_f32,
+            ),
+            desktop_token_ttl_days: tuning_or_default(
+                "DESKTOP_TOKEN_TTL_DAYS",
+                get("DESKTOP_TOKEN_TTL_DAYS"),
+                DEFAULT_DESKTOP_TOKEN_TTL_DAYS,
+                |raw| {
+                    raw.parse::<u32>()
+                        .ok()
+                        .filter(|d| (1..=MAX_DESKTOP_TOKEN_TTL_DAYS).contains(d))
+                },
+            ),
+            desktop_device_code_ttl_secs: tuning_or_default(
+                "DESKTOP_DEVICE_CODE_TTL_SEC",
+                get("DESKTOP_DEVICE_CODE_TTL_SEC"),
+                DEFAULT_DESKTOP_DEVICE_CODE_TTL_SECS,
+                |raw| {
+                    raw.parse::<u64>()
+                        .ok()
+                        .filter(|s| (1..=MAX_DESKTOP_DEVICE_CODE_TTL_SECS).contains(s))
+                },
+            ),
+            google_client_id: non_empty(get("GOOGLE_CLIENT_ID")),
+            google_client_secret: non_empty(get("GOOGLE_CLIENT_SECRET")),
+            instagram_channel_id: non_empty(get("INSTAGRAM_CHANNEL_ID")),
+            instagram_poll_cron: tuning_or_default(
+                "INSTAGRAM_POLL_CRON",
+                get("INSTAGRAM_POLL_CRON"),
+                "*/20 * * * *".to_owned(),
+                |raw| Some(raw.to_owned()).filter(|c| crate::cron_util::is_valid(c)),
+            ),
+            instagram_access_token: non_empty(get("INSTAGRAM_ACCESS_TOKEN"))
+                .map(SecretString::from),
+            instagram_app_secret: non_empty(get("INSTAGRAM_APP_SECRET")).map(SecretString::from),
+            instagram_owner_discord_id: non_empty(get("INSTAGRAM_OWNER_DISCORD_ID")),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// パース済み設定の値レベル検証。
+    ///
+    /// # Errors
+    /// ポート 0 や TTL 0 等の不正値で [`ConfigError::InvalidValue`]。
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "port",
+                reason: "port must be non-zero".to_owned(),
+            });
+        }
+        if self.session_ttl_days == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "session_ttl_days",
+                reason: "session TTL must be at least 1 day".to_owned(),
+            });
+        }
+        if let Some(key) = &self.tts_signing_key {
+            let seed = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                key.expose_secret().trim(),
+            );
+            if seed.map_or(true, |s| s.len() != 32) {
+                return Err(ConfigError::InvalidValue {
+                    field: "TTS_SIGNING_KEY",
+                    reason:
+                        "must be a 32-byte Ed25519 seed in base64 (clients/pwa/server/tts/keygen.ts)"
+                            .to_owned(),
+                });
+            }
+        }
+        if let Some(origin) = &self.mcp_sandbox_origin {
+            validate_sandbox_origin(origin, self.base_url.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// HTTPS 本番デプロイか（`base_url` が `https://` で始まるか・§6.8 の型表現）。
+    #[must_use]
+    pub fn is_https_deployment(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|u| u.to_ascii_lowercase().starts_with("https://"))
+    }
+}
+
+/// `MCP_SANDBOX_ORIGIN` を検証する。`https://host[:port]`（開発用に `http://localhost` 系も可）で、
+/// パス・認証情報を含まず、本体（`BASE_URL`）と同じオリジンでないこと。
+fn validate_sandbox_origin(origin: &str, base_url: Option<&str>) -> Result<(), ConfigError> {
+    let invalid = |reason: &str| ConfigError::InvalidValue {
+        field: "MCP_SANDBOX_ORIGIN",
+        reason: reason.to_owned(),
+    };
+    let lower = origin.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        let host = r.split(':').next().unwrap_or_default();
+        if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+            return Err(invalid(
+                "must use https:// (http:// is allowed only for localhost)",
+            ));
+        }
+        r
+    } else {
+        return Err(invalid("must start with https://"));
+    };
+    if rest.is_empty()
+        || rest.contains(['/', '?', '#', '@'])
+        || rest.chars().any(char::is_whitespace)
+    {
+        return Err(invalid(
+            "must be an origin like https://mcp-sandbox.example.com (no path or credentials)",
+        ));
+    }
+    if let Some(base) = base_url {
+        let base = base.to_ascii_lowercase();
+        let base_origin = base
+            .find("://")
+            .map(|i| {
+                let after = &base[i + 3..];
+                let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+                &base[..i + 3 + end]
+            })
+            .unwrap_or(base.as_str());
+        if base_origin == lower {
+            return Err(invalid("must differ from the BASE_URL origin"));
+        }
+    }
+    Ok(())
+}
+
+/// 標準のログイン先（sk-account）。`OIDC_ISSUER` 未設定のときに使う。
+pub const DEFAULT_OIDC_ISSUER: &str = "https://account.sk-9.net";
+/// 標準のログイン先の表示名。
+const DEFAULT_OIDC_LABEL: &str = "sk-9 Account";
+
+/// ログインに使う OIDC プロバイダー（`OIDC_*`）。
+///
+/// 本人認証は OIDC プロバイダーだけが担い、Yuuka はパスワードもパスキーも持たない。
+/// `OIDC_ISSUER` を省略すると標準の sk-account を使い、指定すれば任意の OIDC プロバイダーに替えられる。
+/// Yuuka は利用者を Discord ID で識別するので、プロバイダーは ID トークンの
+/// `OIDC_DISCORD_ID_CLAIM`（既定 `discord_id`）に Discord ID を入れる必要がある。
+#[derive(Debug, Clone)]
+pub struct OidcSettings {
+    /// issuer（`OIDC_ISSUER`・末尾の `/` は除く）。ブラウザはここの認可エンドポイントへ送る。
+    pub issuer: String,
+    /// サーバーからプロバイダーへ問い合わせる先（`OIDC_INTERNAL_URL`）。discovery の
+    /// サーバー向けエンドポイントのうち issuer で始まるものを、この URL へ置き換えて呼ぶ。未設定は issuer。
+    pub internal_url: Option<String>,
+    /// クライアント ID（`OIDC_CLIENT_ID`・既定 `yuuka`）。
+    pub client_id: String,
+    /// クライアントシークレット（`OIDC_CLIENT_SECRET`・`client_secret_basic`）。未設定ならログインできない。
+    pub client_secret: Option<SecretString>,
+    /// 要求する scope（`OIDC_SCOPE`・既定 `openid profile discord`）。
+    pub scope: String,
+    /// Discord ID を入れた claim の名前（`OIDC_DISCORD_ID_CLAIM`・既定 `discord_id`）。
+    pub discord_id_claim: String,
+    /// ログインボタンに出す名前（`OIDC_LABEL`）。既定は標準なら `sk-9 Account`、それ以外は issuer のホスト名。
+    pub label: String,
+}
+
+impl OidcSettings {
+    fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> Self {
+        let get = |key: &str| non_empty(get(key)).map(|v| v.trim().to_owned());
+        let issuer = get("OIDC_ISSUER").map_or_else(
+            || DEFAULT_OIDC_ISSUER.to_owned(),
+            |v| v.trim_end_matches('/').to_owned(),
+        );
+        let label = get("OIDC_LABEL").unwrap_or_else(|| {
+            if issuer == DEFAULT_OIDC_ISSUER {
+                DEFAULT_OIDC_LABEL.to_owned()
+            } else {
+                issuer_host(&issuer).to_owned()
+            }
+        });
+        Self {
+            internal_url: get("OIDC_INTERNAL_URL").map(|v| v.trim_end_matches('/').to_owned()),
+            client_id: get("OIDC_CLIENT_ID").unwrap_or_else(|| "yuuka".to_owned()),
+            client_secret: get("OIDC_CLIENT_SECRET").map(SecretString::from),
+            scope: get("OIDC_SCOPE").unwrap_or_else(|| "openid profile discord".to_owned()),
+            discord_id_claim: get("OIDC_DISCORD_ID_CLAIM")
+                .unwrap_or_else(|| "discord_id".to_owned()),
+            label,
+            issuer,
+        }
+    }
+}
+
+/// `https://host[:port]/path` のホスト部分（表示名の既定用。解釈できなければ全体）。
+fn issuer_host(issuer: &str) -> &str {
+    let rest = issuer.split_once("://").map_or(issuer, |(_, rest)| rest);
+    rest.split(['/', ':'])
+        .next()
+        .filter(|h| !h.is_empty())
+        .unwrap_or(issuer)
+}
+
+/// `REMINDER_CRON` の既定（毎分・Node `config.reminderCron` 既定）。
+pub const DEFAULT_REMINDER_CRON: &str = "* * * * *";
+/// `SYNAPSE_RECALL_K` の既定（Node 既定 5）。
+pub const DEFAULT_SYNAPSE_RECALL_K: usize = 5;
+/// `SYNAPSE_RECENCY_WEIGHT` の既定（Node 既定 0.15）。
+pub const DEFAULT_SYNAPSE_RECENCY_WEIGHT: f32 = 0.15;
+/// `SYNAPSE_RECENCY_HALFLIFE_HOURS` の既定（Node 既定 18）。
+pub const DEFAULT_SYNAPSE_RECENCY_HALFLIFE_HOURS: f32 = 18.0;
+/// `DESKTOP_TOKEN_TTL_DAYS` の既定（Node 既定 90）。
+pub const DEFAULT_DESKTOP_TOKEN_TTL_DAYS: u32 = 90;
+/// `DESKTOP_DEVICE_CODE_TTL_SEC` の既定（Node 既定 600）。
+pub const DEFAULT_DESKTOP_DEVICE_CODE_TTL_SECS: u64 = 600;
+/// `DESKTOP_TOKEN_TTL_DAYS` の上限（100 年）。SQLite の日付加算が溢れて全トークンが無効になるのを防ぐ。
+const MAX_DESKTOP_TOKEN_TTL_DAYS: u32 = 36_500;
+/// `DESKTOP_DEVICE_CODE_TTL_SEC` の上限（1 日）。device_code は短命が前提（RFC 8628）で、期限計算の溢れも防ぐ。
+const MAX_DESKTOP_DEVICE_CODE_TTL_SECS: u64 = 86_400;
+
+/// 運用チューニング設定を読む。未設定・空文字は黙って既定、`parse` が `None` を返す不正値は
+/// 警告ログを出して既定へ戻す（起動は止めない）。
+fn tuning_or_default<T: std::fmt::Debug>(
+    key: &'static str,
+    raw: Option<String>,
+    default: T,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> T {
+    let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else {
+        return default;
+    };
+    parse(raw.trim()).unwrap_or_else(|| {
+        tracing::warn!(
+            key,
+            value = %raw,
+            default = ?default,
+            "⚠️ 設定値が不正なため既定値を使います"
+        );
+        default
+    })
+}
+
+/// 0 以上の有限な小数（`SYNAPSE_RECENCY_*`。0 は recency ブースト無効）。
+fn parse_non_negative_f32(raw: &str) -> Option<f32> {
+    raw.parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// `yaml[key] ?? env[key]`（Node `getSetting` と同一・yaml 優先）。空文字も値として扱う。
+fn get_setting(yaml: &Mapping, key: &str) -> Option<String> {
+    yaml_string(yaml, key).or_else(|| std::env::var(key).ok())
+}
+
+/// YAML マッピングからキーの値を文字列化して取り出す（配列は Node 同様カンマ結合）。
+fn yaml_string(yaml: &Mapping, key: &str) -> Option<String> {
+    match yaml.get(key)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        // getSettingArray/getSetting は配列をカンマ結合する（config.ts）。
+        Value::Sequence(seq) => Some(
+            seq.iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        _ => None,
+    }
+}
+
+/// 空文字を `None` に畳む（Node は "" を返すが、Rust は「未設定」を Option で表現）。
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.is_empty())
+}
+
+/// 単一値の型付きパース（失敗は [`ConfigError::InvalidValue`]）。
+fn parse_field<T: std::str::FromStr>(field: &'static str, raw: &str) -> Result<T, ConfigError> {
+    raw.trim()
+        .parse::<T>()
+        .map_err(|_| ConfigError::InvalidValue {
+            field,
+            reason: format!("could not parse value {raw:?}"),
+        })
+}
+
+/// カンマ区切りの文字列リストをパースする（`getSettingArray` 相当：split(',')→trim→空除去）。
+///
+/// YAML 配列は `yaml_string` が事前にカンマ結合するため、env のカンマ区切りと同一経路で処理できる。
+fn parse_string_list(raw: Option<&str>) -> Vec<String> {
+    raw.map(|r| {
+        r.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// カンマ区切りの IP リストをパースする（空・未設定は空 Vec・`getSettingArray` 相当）。
+fn parse_ip_list(field: &'static str, raw: Option<&str>) -> Result<Vec<IpAddr>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<IpAddr>().map_err(|_| ConfigError::InvalidValue {
+                field,
+                reason: format!("invalid IP {s:?}"),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::io::Write;
+
+    fn write_yaml(body: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(body.as_bytes()).expect("write");
+        f
+    }
+
+    #[test]
+    fn loads_real_uppercase_yaml_and_ignores_unknown_keys() {
+        // 実 config.yaml 形式（UPPERCASE・bot 用の未知キー混在）を読めること。
+        let f = write_yaml(
+            "DB_PATH: \"./data/yuuka.db\"\n\
+             REDIS_URL: \"redis://127.0.0.1:6379\"\n\
+             PORT: 7854\n\
+             HOST: \"0.0.0.0\"\n\
+             SESSION_TTL_DAYS: 14\n\
+             TERMS_URL: \"https://ex.test/terms\"\n\
+             REMINDER_CRON: \"* * * * *\"\n\
+             INVITE_CODES:\n  - \"a\"\n  - \"b\"\n\
+             ADMIN_DISCORD_IDS: \"111, 222\"\n\
+             GOOGLE_CLIENT_ID: \"xxx\"\n",
+        );
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert_eq!(cfg.port, 7854);
+        assert_eq!(cfg.host.to_string(), "0.0.0.0");
+        assert_eq!(cfg.session_ttl_days, 14);
+        assert_eq!(cfg.db_path.to_str().unwrap(), "./data/yuuka.db");
+        assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
+        assert_eq!(cfg.terms_url, "https://ex.test/terms");
+        assert!(!cfg.is_https_deployment());
+        // P1-1: admin ID（カンマ区切り・trim）を取り込む。廃止した INVITE_CODES は無視する。
+        assert_eq!(
+            cfg.admin_discord_ids,
+            vec!["111".to_owned(), "222".to_owned()]
+        );
+    }
+
+    #[test]
+    fn missing_file_falls_back_to_defaults() {
+        // 欠落は致命にしない（env/既定へ）。パス不在でも既定で組み上がる。
+        let cfg = Config::load_and_validate(std::path::Path::new("/no/such/yuuka-config.yaml"))
+            .expect("defaults");
+        assert_eq!(cfg.port, 3000);
+        assert!(!cfg.desktop_demo_components);
+        assert_eq!(cfg.host.to_string(), "127.0.0.1");
+        assert_eq!(cfg.session_ttl_days, 7);
+        assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
+    }
+
+    #[test]
+    fn mcp_sandbox_origin_must_be_a_separate_origin() {
+        let ok = write_yaml(
+            "BASE_URL: \"https://yuuka.example\"\nMCP_SANDBOX_ORIGIN: \"https://mcp-sandbox.example/\"\n",
+        );
+        assert_eq!(
+            Config::load_and_validate(ok.path())
+                .expect("load")
+                .mcp_sandbox_origin
+                .as_deref(),
+            Some("https://mcp-sandbox.example")
+        );
+        let local = write_yaml("MCP_SANDBOX_ORIGIN: \"http://localhost:3001\"\n");
+        assert!(Config::load_and_validate(local.path()).is_ok());
+        for bad in [
+            "BASE_URL: \"https://yuuka.example/app\"\nMCP_SANDBOX_ORIGIN: \"https://yuuka.example\"\n",
+            "MCP_SANDBOX_ORIGIN: \"http://mcp-sandbox.example\"\n",
+            "MCP_SANDBOX_ORIGIN: \"https://mcp-sandbox.example/path\"\n",
+            "MCP_SANDBOX_ORIGIN: \"https://user@mcp-sandbox.example\"\n",
+            "MCP_SANDBOX_ORIGIN: \"mcp-sandbox.example\"\n",
+        ] {
+            let f = write_yaml(bad);
+            assert!(Config::load_and_validate(f.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tts_signing_key_must_be_a_32_byte_seed() {
+        let ok = write_yaml("TTS_SIGNING_KEY: \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"\n");
+        assert!(Config::load_and_validate(ok.path())
+            .expect("load")
+            .tts_signing_key
+            .is_some());
+        for bad in ["\"AAECAwQ=\"", "\"not base64!\""] {
+            let f = write_yaml(&format!("TTS_SIGNING_KEY: {bad}\n"));
+            assert!(Config::load_and_validate(f.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn oidc_defaults_to_the_standard_sk_account() {
+        let f = write_yaml("PORT: 7854\n");
+        let oidc = Config::load_and_validate(f.path()).expect("load").oidc;
+        assert_eq!(oidc.issuer, "https://account.sk-9.net");
+        assert_eq!(oidc.internal_url, None);
+        assert_eq!(oidc.client_id, "yuuka");
+        assert!(
+            oidc.client_secret.is_none(),
+            "シークレットが無ければログインを止める"
+        );
+        assert_eq!(oidc.scope, "openid profile discord");
+        assert_eq!(oidc.discord_id_claim, "discord_id");
+        assert_eq!(oidc.label, "sk-9 Account");
+    }
+
+    #[test]
+    fn oidc_can_point_to_another_provider() {
+        let f = write_yaml(
+            "OIDC_ISSUER: \"https://id.example.com:8443/realms/main/\"\n\
+             OIDC_INTERNAL_URL: \"http://127.0.0.1:8080/realms/main/\"\n\
+             OIDC_CLIENT_ID: \"yuuka-dev\"\n\
+             OIDC_CLIENT_SECRET: \" s3cret \"\n\
+             OIDC_SCOPE: \"openid profile\"\n\
+             OIDC_DISCORD_ID_CLAIM: \"discord_user_id\"\n",
+        );
+        let oidc = Config::load_and_validate(f.path()).expect("load").oidc;
+        assert_eq!(oidc.issuer, "https://id.example.com:8443/realms/main");
+        assert_eq!(
+            oidc.internal_url.as_deref(),
+            Some("http://127.0.0.1:8080/realms/main")
+        );
+        assert_eq!(oidc.client_id, "yuuka-dev");
+        assert_eq!(
+            oidc.client_secret
+                .as_ref()
+                .map(crate::secrets::ExposeSecret::expose_secret),
+            Some("s3cret")
+        );
+        assert_eq!(oidc.scope, "openid profile");
+        assert_eq!(oidc.discord_id_claim, "discord_user_id");
+        assert_eq!(
+            oidc.label, "id.example.com",
+            "表示名の既定は issuer のホスト名"
+        );
+    }
+
+    // ---- 運用チューニング設定（R26・Node と同じキー名と既定値） ----
+
+    /// 既定値（Node `config.ts` の既定と同じ・旧 Rust 定数と同じ）を検証する。
+    fn assert_tuning_defaults(cfg: &Config) {
+        assert_eq!(cfg.reminder_cron, "* * * * *");
+        assert_eq!(cfg.synapse_recall_k, 5);
+        assert!((cfg.synapse_recency_weight - 0.15).abs() < f32::EPSILON);
+        assert!((cfg.synapse_recency_halflife_hours - 18.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.desktop_token_ttl_days, 90);
+        assert_eq!(cfg.desktop_device_code_ttl_secs, 600);
+    }
+
+    #[test]
+    fn tuning_settings_default_when_unset() {
+        let f = write_yaml("PORT: 7854\n");
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert_tuning_defaults(&cfg);
+    }
+
+    #[test]
+    fn tuning_settings_are_read_from_yaml() {
+        let f = write_yaml(
+            "REMINDER_CRON: \"*/5 * * * *\"\n\
+             SYNAPSE_RECALL_K: 8\n\
+             SYNAPSE_RECENCY_WEIGHT: 0.3\n\
+             SYNAPSE_RECENCY_HALFLIFE_HOURS: 6\n\
+             DESKTOP_TOKEN_TTL_DAYS: 30\n\
+             DESKTOP_DEVICE_CODE_TTL_SEC: 900\n",
+        );
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert_eq!(cfg.reminder_cron, "*/5 * * * *");
+        assert_eq!(cfg.synapse_recall_k, 8);
+        assert!((cfg.synapse_recency_weight - 0.3).abs() < f32::EPSILON);
+        assert!((cfg.synapse_recency_halflife_hours - 6.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.desktop_token_ttl_days, 30);
+        assert_eq!(cfg.desktop_device_code_ttl_secs, 900);
+    }
+
+    #[test]
+    fn tuning_settings_zero_recency_disables_boost() {
+        // recency の重み・半減期は 0 を「無効」として受け付ける（Node と同じ）。
+        let f = write_yaml("SYNAPSE_RECENCY_WEIGHT: 0\nSYNAPSE_RECENCY_HALFLIFE_HOURS: 0\n");
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert!(cfg.synapse_recency_weight.abs() < f32::EPSILON);
+        assert!(cfg.synapse_recency_halflife_hours.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn invalid_tuning_settings_fall_back_to_defaults_without_failing() {
+        // 不正値は起動を止めず、警告を出して既定値へ戻す。
+        let f = write_yaml(
+            "REMINDER_CRON: \"not a cron\"\n\
+             SYNAPSE_RECALL_K: 0\n\
+             SYNAPSE_RECENCY_WEIGHT: -1\n\
+             SYNAPSE_RECENCY_HALFLIFE_HOURS: .nan\n\
+             DESKTOP_TOKEN_TTL_DAYS: \"90d\"\n\
+             DESKTOP_DEVICE_CODE_TTL_SEC: 0\n",
+        );
+        let cfg = Config::load_and_validate(f.path()).expect("invalid tuning is not fatal");
+        assert_tuning_defaults(&cfg);
+
+        // 範囲外（上限超え・負数）と空文字も既定へ戻す。
+        let f = write_yaml(
+            "REMINDER_CRON: \"\"\n\
+             SYNAPSE_RECALL_K: -3\n\
+             SYNAPSE_RECENCY_WEIGHT: .inf\n\
+             SYNAPSE_RECENCY_HALFLIFE_HOURS: abc\n\
+             DESKTOP_TOKEN_TTL_DAYS: 36501\n\
+             DESKTOP_DEVICE_CODE_TTL_SEC: 86401\n",
+        );
+        let cfg = Config::load_and_validate(f.path()).expect("invalid tuning is not fatal");
+        assert_tuning_defaults(&cfg);
+    }
+
+    #[test]
+    fn desktop_demo_components_is_explicitly_enabled() {
+        let f = write_yaml("DESKTOP_DEMO_COMPONENTS: true\n");
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert!(cfg.desktop_demo_components);
+    }
+
+    #[test]
+    fn invalid_port_is_rejected() {
+        let f = write_yaml("PORT: \"not-a-number\"\n");
+        assert!(Config::load_and_validate(f.path()).is_err());
+    }
+
+    #[test]
+    fn https_base_url_flags_https_deployment() {
+        let f = write_yaml("BASE_URL: \"https://yuuka.example\"\n");
+        let cfg = Config::load_and_validate(f.path()).expect("load");
+        assert!(cfg.is_https_deployment());
+    }
+
+    // ---- YAML 解釈の回帰テスト（serde_yaml 0.9 → granit-parser 移行で読み方を変えない） ----
+    //
+    // 期待値はすべて旧実装（serde_yaml 0.9 の `Mapping` + `yaml_string`）で実測した値。
+
+    /// `src` を読み、`key` を `yaml_string` で文字列化する（パース失敗は `Err(())`）。
+    fn setting(src: &str, key: &str) -> Result<Option<String>, ()> {
+        let yaml = super::yaml::from_str(src).map_err(|_| ())?;
+        Ok(super::yaml_string(&yaml, key))
+    }
+
+    fn s(v: &str) -> Result<Option<String>, ()> {
+        Ok(Some(v.to_owned()))
+    }
+
+    #[test]
+    fn repo_example_configs_load_as_before() {
+        // リポジトリ同梱のテンプレートが従来どおりの値で読めること。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = Config::load_and_validate(&root.join("example.yaml")).expect("example.yaml");
+        assert_eq!(cfg.port, 7854);
+        assert_eq!(cfg.host.to_string(), "127.0.0.1");
+        assert_eq!(cfg.session_ttl_days, 7);
+        assert_eq!(cfg.db_path.to_str(), Some("./data/yuuka.db"));
+        assert_eq!(cfg.reminder_cron, "* * * * *");
+        assert_eq!(cfg.base_url.as_deref(), Some("https://example.com"));
+        assert_eq!(cfg.terms_url, "/terms");
+        assert_eq!(cfg.google_client_id, None, "空文字は未設定に畳む");
+        assert_tuning_defaults(&cfg);
+
+        for (instance, port) in [("dev", 3403), ("prod", 3402)] {
+            let path = root.join(format!("deploy/{instance}/config.yaml.example"));
+            let cfg = Config::load_and_validate(&path).expect("deploy example");
+            assert_eq!(cfg.port, port, "{instance} example port");
+            assert_tuning_defaults(&cfg);
+        }
+    }
+
+    #[test]
+    fn yaml_numbers_and_strings_resolve_like_serde_yaml_09() {
+        assert_eq!(setting("K: 7854\n", "K"), s("7854"));
+        assert_eq!(setting("K: \"7854\"\n", "K"), s("7854"));
+        assert_eq!(setting("K: -12\n", "K"), s("-12"));
+        assert_eq!(setting("K: +12\n", "K"), s("12"));
+        // 先頭 0 の数字列は YAML 1.2 で文字列（招待コード等の 0 落ちを防ぐ）。
+        assert_eq!(setting("K: 0123\n", "K"), s("0123"));
+        assert_eq!(setting("K: 00\n", "K"), s("00"));
+        assert_eq!(setting("K: [0123, 7]\n", "K"), s("0123,7"));
+        // 0x/0o/0b は小文字のみ整数（大文字や `_` 区切りは文字列のまま）。
+        assert_eq!(setting("K: 0x1F\n", "K"), s("31"));
+        assert_eq!(setting("K: 0o17\n", "K"), s("15"));
+        assert_eq!(setting("K: 0b101\n", "K"), s("5"));
+        assert_eq!(setting("K: 0X1F\n", "K"), s("0X1F"));
+        assert_eq!(setting("K: 1_000\n", "K"), s("1_000"));
+        // 浮動小数は ryu 表記（`7.0` は `7.0` のまま → u32 への変換は従来どおり失敗する）。
+        assert_eq!(setting("K: 7.0\n", "K"), s("7.0"));
+        assert_eq!(setting("K: 1e3\n", "K"), s("1000.0"));
+        assert_eq!(setting("K: 1.5e16\n", "K"), s("1.5e16"));
+        assert_eq!(setting("K: .inf\n", "K"), s(".inf"));
+        assert_eq!(setting("K: -.inf\n", "K"), s("-.inf"));
+        assert_eq!(setting("K: .NaN\n", "K"), s(".nan"));
+        assert_eq!(setting("K: 1e400\n", "K"), s("1e400"), "f64 溢れは文字列");
+        // Discord ID 規模（u64 内）は整数のまま桁落ちしない。
+        assert_eq!(
+            setting("K: 18446744073709551615\n", "K"),
+            s("18446744073709551615")
+        );
+        // u64/i64 を超え u128/i128 に収まる整数は旧実装同様パース失敗。
+        assert_eq!(setting("K: 18446744073709551616\n", "K"), Err(()));
+        assert_eq!(setting("K: -9223372036854775809\n", "K"), Err(()));
+        // bool は true/True/TRUE 系のみ。YAML 1.1 の yes/on 等は文字列。
+        assert_eq!(setting("K: True\n", "K"), s("true"));
+        assert_eq!(setting("K: FALSE\n", "K"), s("false"));
+        assert_eq!(setting("K: tRuE\n", "K"), s("tRuE"));
+        assert_eq!(setting("K: yes\n", "K"), s("yes"));
+        assert_eq!(setting("K: on\n", "K"), s("on"));
+        // IP・cron・URL・時刻風の値は文字列。
+        assert_eq!(setting("K: 127.0.0.1\n", "K"), s("127.0.0.1"));
+        assert_eq!(setting("K: 12:30:00\n", "K"), s("12:30:00"));
+        assert_eq!(setting("K: 2026-10-19\n", "K"), s("2026-10-19"));
+        assert_eq!(
+            setting("K: redis://127.0.0.1:6379\n", "K"),
+            s("redis://127.0.0.1:6379")
+        );
+    }
+
+    #[test]
+    fn yaml_null_and_empty_values() {
+        // 空・`~`・null 系は値なし（→ env/既定へフォールバック）。引用符付きは文字列。
+        assert_eq!(setting("K:\n", "K"), Ok(None));
+        assert_eq!(setting("K: ~\n", "K"), Ok(None));
+        assert_eq!(setting("K: null\n", "K"), Ok(None));
+        assert_eq!(setting("K: NULL\n", "K"), Ok(None));
+        assert_eq!(setting("K: nUll\n", "K"), s("nUll"));
+        assert_eq!(setting("K: \"\"\n", "K"), s(""));
+        assert_eq!(setting("K: ''\n", "K"), s(""));
+        assert_eq!(setting("K: \"null\"\n", "K"), s("null"));
+        // 配列内の null・入れ子は落とし、スカラーだけカンマ結合する。
+        assert_eq!(
+            setting("K: [1, \"2\", true, ~, [3], {a: 1}, yes]\n", "K"),
+            s("1,2,true,yes")
+        );
+        assert_eq!(setting("K:\n  - a\n  -\n  - ~\n", "K"), s("a"));
+        assert_eq!(setting("K: []\n", "K"), s(""));
+        // mapping 値は文字列化しない。
+        assert_eq!(setting("K: {a: 1}\n", "K"), Ok(None));
+        // ファイル全体が空・コメントのみ・`---` のみなら空 mapping。
+        assert_eq!(setting("", "K"), Ok(None));
+        assert_eq!(setting("# only comment\n", "K"), Ok(None));
+        assert_eq!(setting("---\n", "K"), Ok(None));
+        // ルートが mapping 以外（null・配列・スカラー・引用空文字）はパース失敗。
+        assert_eq!(setting("~\n", "K"), Err(()));
+        assert_eq!(setting("- a\n", "K"), Err(()));
+        assert_eq!(setting("a\n", "K"), Err(()));
+        assert_eq!(setting("\"\"\n", "K"), Err(()));
+    }
+
+    #[test]
+    fn yaml_multiline_strings() {
+        assert_eq!(
+            setting("K: |\n  line1\n  line2\n", "K"),
+            s("line1\nline2\n")
+        );
+        assert_eq!(setting("K: |-\n  line1\n  line2\n", "K"), s("line1\nline2"));
+        assert_eq!(setting("K: |+\n  a\n\n", "K"), s("a\n\n"));
+        assert_eq!(
+            setting("K: >\n  folded\n  text\n\n  para\n", "K"),
+            s("folded text\npara\n")
+        );
+        assert_eq!(setting("K: >-\n  a\n  b\n", "K"), s("a b"));
+        assert_eq!(setting("K: |2\n   indented\n", "K"), s(" indented\n"));
+        // ファイル末尾の空ブロックスカラーは空文字。
+        assert_eq!(setting("K: |\n", "K"), s(""));
+        assert_eq!(setting("K: >\n", "K"), s(""));
+        assert_eq!(
+            setting("K:\n  multi\n  line plain\n", "K"),
+            s("multi line plain")
+        );
+        assert_eq!(setting("K: a\n\n  b\n", "K"), s("a\nb"));
+        assert_eq!(
+            setting("K: \"double\n  quoted\n\n  lines\"\n", "K"),
+            s("double quoted\nlines")
+        );
+        assert_eq!(setting("K: \"a\\\n  b\"\n", "K"), s("ab"));
+        assert_eq!(setting("K: \"a\\tb\\u00e9\"\n", "K"), s("a\tbé"));
+        assert_eq!(setting("K: 'it''s'\n", "K"), s("it's"));
+        assert_eq!(setting("K: 1\r\nL: |\r\n  a\r\n  b\r\n", "L"), s("a\nb\n"));
+    }
+
+    #[test]
+    fn yaml_anchors_aliases_and_merge_keys() {
+        assert_eq!(setting("A: &x hello\nK: *x\n", "K"), s("hello"));
+        assert_eq!(setting("A: &x 0123\nK: *x\n", "K"), s("0123"));
+        assert_eq!(setting("A: &x [1, 2]\nK: *x\n", "K"), s("1,2"));
+        assert_eq!(setting("A: &x\n  - p\nK: [*x, q]\n", "K"), s("q"));
+        // 再定義したアンカーは後勝ち。キーへのアンカーも値として参照できる。
+        assert_eq!(setting("A: &a 1\nB: &a 2\nK: *a\n", "K"), s("2"));
+        assert_eq!(setting("&k K: 1\nL: *k\n", "L"), s("K"));
+        // 未定義エイリアス・自己参照はパース失敗。
+        assert_eq!(setting("K: *undefined\n", "K"), Err(()));
+        assert_eq!(setting("K: &a [*a]\n", "K"), Err(()));
+        // マージキー `<<` は展開しない（通常キー扱い）。
+        assert_eq!(setting("base: &b\n  PORT: 1\n<<: *b\n", "PORT"), Ok(None));
+        assert_eq!(setting("<<: {PORT: 1}\nPORT: 2\n", "PORT"), s("2"));
+        // エイリアスの多重展開でも上限内なら従来どおり読める。
+        let laughs = "a: &a [x, x, x, x, x, x, x, x, x, x]\n\
+                      b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n\
+                      c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n\
+                      K: [*c, *c]\n";
+        assert_eq!(setting(laughs, "K"), s(""));
+    }
+
+    #[test]
+    fn yaml_unknown_keys_tags_and_structure() {
+        // 未知キー・非文字列キー・キーの大小文字違いは無視（UPPERCASE の完全一致のみ）。
+        let src = "UNKNOWN: {nested: [1, 2]}\n1: one\ntrue: t\nk: lower\n\"K\": quoted\n";
+        assert_eq!(setting(src, "K"), s("quoted"));
+        assert_eq!(setting(src, "UNKNOWN"), Ok(None));
+        assert_eq!(setting("? K\n", "K"), Ok(None));
+        // 重複キーは（型込みで同値なら）パース失敗。
+        assert_eq!(setting("K: 1\nK: 2\n", "K"), Err(()));
+        assert_eq!(setting("K: 1\n\"K\": 2\n", "K"), Err(()));
+        assert_eq!(setting("0x10: a\n16: b\n", "K"), Err(()));
+        assert_eq!(setting("1.0: a\n1: b\nK: c\n", "K"), s("c"));
+        assert_eq!(setting("K: {a: 1, a: 2}\n", "K"), Err(()));
+        // 複数ドキュメントはパース失敗（末尾の `...` やコメントは可）。
+        assert_eq!(setting("K: 1\n---\nL: 2\n", "K"), Err(()));
+        assert_eq!(setting("K: 1\n...\n# trailing\n", "K"), s("1"));
+        // コア型タグは厳密に解釈、`!!str` 等は文字列、ローカルタグ付きは値として読まない。
+        assert_eq!(setting("K: !!str 123\n", "K"), s("123"));
+        assert_eq!(setting("K: !!binary aGVsbG8=\n", "K"), s("aGVsbG8="));
+        assert_eq!(setting("K: !!int \"123\"\n", "K"), s("123"));
+        assert_eq!(setting("K: !!float 1\n", "K"), s("1.0"));
+        assert_eq!(setting("K: !!int 0123\n", "K"), Err(()));
+        assert_eq!(setting("K: !!null ''\n", "K"), Err(()));
+        assert_eq!(setting("K: !custom foo\n", "K"), Ok(None));
+        assert_eq!(setting("K: [a, !x 6, !!str 5]\n", "K"), s("a,5"));
+        assert_eq!(setting("!foo {K: 1}\n", "K"), s("1"), "ルートのタグは無視");
+        // BOM 付きファイルも読める。入れ子は 128 段まで。
+        assert_eq!(setting("\u{feff}K: 1\n", "K"), s("1"));
+        let nested = |n: usize| format!("K: {}1{}\n", "[".repeat(n), "]".repeat(n));
+        assert_eq!(setting(&nested(127), "K"), s(""));
+        assert_eq!(setting(&nested(128), "K"), Err(()));
+        // 構文エラーはパース失敗。
+        assert_eq!(setting("K: [1, 2\n", "K"), Err(()));
+        assert_eq!(setting("K: a: b\n", "K"), Err(()));
+    }
+
+    #[test]
+    fn yaml_parse_error_is_config_parse_and_hides_values() {
+        let f = write_yaml("SECRET_VALUE: [unclosed\n");
+        let err = Config::load_and_validate(f.path()).expect_err("parse error");
+        assert!(matches!(err, crate::error::ConfigError::Parse { .. }));
+        let f = write_yaml("K: 18446744073709551616\n");
+        let err = Config::load_and_validate(f.path()).expect_err("parse error");
+        assert!(matches!(
+            &err,
+            crate::error::ConfigError::Parse { source }
+                if !source.to_string().contains("18446744073709551616")
+        ));
+    }
+}

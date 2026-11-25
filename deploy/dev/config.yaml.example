@@ -1,0 +1,44 @@
+# Copy to the WorkingDirectory of yuuka-dev.service (deploy/dev/runtime; deploy/systemd/yuuka-dev.service.example) as config.yaml.
+# BASE_URL must match the browser URL, including HTTPS, for host-only auth cookies and CSRF.
+HOST: "127.0.0.1"
+PORT: 3403
+DB_PATH: "./data/yuuka.db"
+REDIS_URL: "redis://127.0.0.1:6379/15"
+BASE_URL: "https://yuuka-dev.sk-9.net"
+# Login: the standard sk-account over OIDC (client "yuuka-dev"). Put the secret from
+# `sk-account oidc new-secret` here and register the client in sk-account's oidc-clients.toml.
+OIDC_INTERNAL_URL: "http://127.0.0.1:3100"
+OIDC_CLIENT_ID: "yuuka-dev"
+OIDC_CLIENT_SECRET: ""
+# Server-side TTS for devices without WebGPU (deploy/systemd/yuuka-tts.service.example, shared with production).
+TTS_SERVER_URL: "http://127.0.0.1:3410"
+# Ed25519 key that signs requests to the TTS server (clients/pwa/server/tts/keygen.ts; use a different key than production).
+# TTS_SIGNING_KEY: ""
+
+# ==============================================================================
+# Instagram 連携（fork 独自・§3.16・任意）
+# ==============================================================================
+# 自分のInstagram新規投稿をDiscordチャンネルへ自動転送します。トークンを含むため、
+# 環境変数ではなくこの config.yaml（git 管理外）に書くのが簡単です。
+#
+# 前提: Instagramアカウントを Business/Creator に切り替え、Meta for Developers でアプリを作成し
+# instagram_business_basic スコープで認可しておくこと（Facebookページ連携は不要）。
+
+# 転送先DiscordチャンネルID。空欄なら連携サービスは登録されません。
+# INSTAGRAM_CHANNEL_ID: ""
+
+# チャンネル露出ガードの検証対象＝オーナーのDiscordユーザーID。
+# 未設定なら ADMIN_DISCORD_IDS の先頭を使います。このユーザーが転送先チャンネルの
+# ギルドに在籍していないとDMへフォールバックします。
+# INSTAGRAM_OWNER_DISCORD_ID: ""
+
+# 初回連携用アクセストークン（短期可）。起動時に長期トークン（60日）へ交換し、
+# instagram_account テーブルへ暗号化保存します。以降はDB側が正のため削除して構いません。
+# INSTAGRAM_ACCESS_TOKEN: ""
+
+# アプリシークレット。短期→長期トークンの交換に必要です。
+# INSTAGRAM_APP_SECRET: ""
+
+# ポーリング間隔（cron式、既定 */20 * * * *）。
+# Instagram APIのレート制限（1時間200コール/ユーザー）に収まる範囲で設定します。
+# INSTAGRAM_POLL_CRON: "*/20 * * * *"

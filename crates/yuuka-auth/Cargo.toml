@@ -1,0 +1,37 @@
+[package]
+name = "yuuka-auth"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "yuuka 認証バックエンド実装（Cookie=Redis セッション / Bearer=SQLite desktop token）"
+
+[dependencies]
+yuuka-core.workspace = true
+yuuka-types.workspace = true
+yuuka-db.workspace = true
+yuuka-web.workspace = true
+yuuka-crypto.workspace = true          # users.salt（Argon2id ユーザー鍵導出用）の生成
+rusqlite.workspace = true
+redis.workspace = true
+sha2.workspace = true
+serde.workspace = true                 # OIDC のトークン応答・discovery の Deserialize
+serde_json.workspace = true
+async-trait.workspace = true
+axum.workspace = true                  # 認証発行ルート（P1-1・framework 層に merge）
+base64.workspace = true                # セッショントークン（32B → base64url no-pad・Node generateToken パリティ）
+getrandom.workspace = true             # トークンの CSPRNG
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true               # OIDC プロバイダーとの通信（discovery・token・JWKS・revoke）
+jsonwebtoken.workspace = true          # ID トークン・logout_token の署名と claim の検証
+
+[dev-dependencies]
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }
+tempfile = "3"
+ring.workspace = true                  # テスト用 OIDC プロバイダーの ES256 鍵
+
+[lints]
+workspace = true

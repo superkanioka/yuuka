@@ -1,0 +1,1037 @@
+//! マルチテナント管理（現行 `startBot`/`stopBot`/`notifier` の統合点）。
+//!
+//! [`DiscordManager`] は注入ポートを保持し、[`prepare`](DiscordManager::prepare) で起動対象テナントの
+//! トークンを解決して**テナント別 twilight http クライアント**（§8.1.3 の既定案 (a)）を作り、各テナントを
+//! [`TenantRunner`]（supervisor が `run` を監督する単位）として返す。あわせて [`DiscordMessenger`]
+//! （[`Notifier`] 実装＋DM 送信）を作り、FlowDelivery / services から共有配信基盤として使わせる。
+//!
+//! 起動対象は現行 `startBot` と同じ: system_default（トークンがあれば）＋ 各 custom（`stopped`/
+//! `suspended` でなくトークンがあるもの）。
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use secrecy::SecretString;
+use twilight_http::Client;
+use twilight_model::channel::message::AllowedMentions;
+use twilight_model::channel::permission_overwrite::PermissionOverwrite;
+use twilight_model::channel::{Channel, ChannelType};
+use twilight_model::guild::{Permissions, Role};
+use twilight_model::id::marker::{
+    ChannelMarker, GuildMarker, MessageMarker, RoleMarker, UserMarker,
+};
+use twilight_model::id::Id;
+use twilight_util::permission_calculator::PermissionCalculator;
+use yuuka_core::{BotId, DiscordError, UserId};
+
+use crate::idempotent::{MessageDedup, GUIDANCE_TTL};
+use crate::interaction::InteractionDeps;
+use crate::message_flow::FlowDeps;
+use crate::ports::{
+    ActionRow, BotDirectory, Button, ButtonStyle, DecidedRequest, DeliverTarget, DmMessageRef,
+    MembershipService, Notifier, TurnProcessor, TurnReply,
+};
+use crate::reply::{send_channel_reply, to_twilight_components, to_twilight_embeds};
+use crate::tenant::{run_tenant, TenantConfig, TenantStatus};
+use crate::turn_gate::TurnGate;
+
+/// 注入ポート束（呼び出し側が実装を渡す）。
+#[derive(Clone)]
+pub struct ManagerPorts {
+    pub directory: Arc<dyn BotDirectory>,
+    pub processor: Arc<dyn TurnProcessor>,
+    pub membership: Arc<dyn MembershipService>,
+}
+
+/// マルチテナント Discord 管理。
+pub struct DiscordManager {
+    ports: ManagerPorts,
+    dedup: Arc<MessageDedup>,
+    guidance_throttle: Arc<MessageDedup>,
+    turn_gate: Arc<TurnGate>,
+}
+
+/// [`prepare`](DiscordManager::prepare) の結果: 監督対象テナント群と共有 Messenger。
+pub struct Prepared {
+    /// supervisor が各々を [`crate::run_tenant`] 監督する単位。
+    pub runners: Vec<TenantRunner>,
+    /// 共有配信基盤（notifier + DM 送信）。services/WS へ注入する。
+    pub messenger: Arc<DiscordMessenger>,
+}
+
+impl DiscordManager {
+    #[must_use]
+    pub fn new(ports: ManagerPorts) -> Self {
+        Self {
+            ports,
+            dedup: Arc::new(MessageDedup::new()),
+            guidance_throttle: Arc::new(MessageDedup::with_ttl(GUIDANCE_TTL)),
+            turn_gate: Arc::new(TurnGate::new()),
+        }
+    }
+
+    /// 起動対象テナントのトークンを解決してクライアントを作り、runner 群＋Messenger を返す。
+    ///
+    /// トークン欠落・停止/停止処分中の Bot は起動対象から除外する（現行 `startBot` フィルタ）。
+    pub async fn prepare(&self) -> Prepared {
+        let mut eligible: Vec<(BotId, SecretString)> = Vec::new();
+
+        // system_default（トークンがあれば）。
+        let sysid = BotId::system_default();
+        if let Some(token) = self.ports.directory.decrypt_token(&sysid).await {
+            eligible.push((sysid.clone(), token));
+        } else {
+            tracing::info!("system_default のトークン未登録（初期セットアップ未完了）");
+        }
+
+        // 各 custom（stopped/suspended でなくトークンがあるもの）。
+        for bot in self.ports.directory.list_all_bots().await {
+            if bot.id.as_str() == BotId::SYSTEM_DEFAULT || bot.stopped || bot.suspended {
+                continue;
+            }
+            if let Some(token) = self.ports.directory.decrypt_token(&bot.id).await {
+                eligible.push((bot.id, token));
+            }
+        }
+
+        // テナント別 http クライアント。
+        let mut clients: HashMap<BotId, Arc<Client>> = HashMap::new();
+        for (bot_id, token) in &eligible {
+            clients.insert(bot_id.clone(), Arc::new(new_client(token)));
+        }
+
+        let default_client = clients.get(&sysid).cloned();
+        let messenger = Arc::new(DiscordMessenger {
+            clients: RwLock::new(clients.clone()),
+            default_client: RwLock::new(default_client),
+            directory: self.ports.directory.clone(),
+        });
+
+        // runner 群。
+        let mut runners = Vec::with_capacity(eligible.len());
+        for (bot_id, token) in eligible {
+            let http = clients
+                .get(&bot_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(new_client(&token)));
+            runners.push(self.build_runner(bot_id, token, http, &messenger));
+        }
+
+        Prepared { runners, messenger }
+    }
+
+    /// 単一テナントの runner を動的に組む（web からの起動/再起動・トークン更新後の再構築）。
+    ///
+    /// トークンを DB から復号し直し（`restart_default` 等の呼び出し前に保存済み前提）、新しい
+    /// REST クライアントを作って messenger にも登録する（通知経路が新トークンを使えるように）。
+    /// トークン未登録なら `None`（呼び出し側が「起動失敗」として扱う）。
+    pub async fn prepare_runner(
+        &self,
+        bot_id: &BotId,
+        messenger: &Arc<DiscordMessenger>,
+    ) -> Option<TenantRunner> {
+        let token = self.ports.directory.decrypt_token(bot_id).await?;
+        let http = Arc::new(new_client(&token));
+        messenger.register_client(bot_id, http.clone());
+        Some(self.build_runner(bot_id.clone(), token, http, messenger))
+    }
+
+    /// FlowDeps / InteractionDeps を束ねて 1 runner を構築する（prepare / prepare_runner 共通）。
+    fn build_runner(
+        &self,
+        bot_id: BotId,
+        token: SecretString,
+        http: Arc<Client>,
+        messenger: &Arc<DiscordMessenger>,
+    ) -> TenantRunner {
+        let flow = FlowDeps {
+            http: http.clone(),
+            directory: self.ports.directory.clone(),
+            processor: self.ports.processor.clone(),
+            notifier: messenger.clone(),
+            dedup: self.dedup.clone(),
+            guidance_throttle: self.guidance_throttle.clone(),
+            turn_gate: self.turn_gate.clone(),
+        };
+        let interaction_deps = InteractionDeps {
+            http,
+            membership: self.ports.membership.clone(),
+            directory: self.ports.directory.clone(),
+            dm: messenger.clone(),
+        };
+        TenantRunner {
+            config: TenantConfig { bot_id, token },
+            flow,
+            interaction_deps,
+            status: Arc::new(TenantStatus::default()),
+        }
+    }
+}
+
+/// 1 テナントを supervisor 監督下で走らせる単位。
+pub struct TenantRunner {
+    pub config: TenantConfig,
+    flow: FlowDeps,
+    interaction_deps: InteractionDeps,
+    status: Arc<TenantStatus>,
+}
+
+impl TenantRunner {
+    /// テナントの bot_id。
+    #[must_use]
+    pub fn bot_id(&self) -> &BotId {
+        &self.config.bot_id
+    }
+
+    /// gateway 接続状態セル（web 層の稼働表示・起動完了待ちが参照する）。
+    #[must_use]
+    pub fn status(&self) -> Arc<TenantStatus> {
+        self.status.clone()
+    }
+
+    /// テナント別 REST クライアント（web 層の guild-options 照会が使う）。
+    #[must_use]
+    pub fn http(&self) -> Arc<Client> {
+        self.interaction_deps.http.clone()
+    }
+
+    /// Shard poll ループを走らせる（`cancel` まで）。supervisor アダプタから呼ぶ。
+    ///
+    /// `&self` で再実行可能（依存は clone・token は borrow）。supervisor が panic/一過性障害後に
+    /// 同一 runner を再 spawn できる（絶対制約2）。
+    ///
+    /// # Errors
+    /// 恒久クローズ時 [`DiscordError::ShardClosedFatal`]（[`run_tenant`] を参照）。
+    pub async fn run(&self, cancel: impl Future<Output = ()> + Send) -> Result<(), DiscordError> {
+        run_tenant(
+            &self.config,
+            self.flow.clone(),
+            self.interaction_deps.clone(),
+            &self.status,
+            cancel,
+        )
+        .await
+    }
+}
+
+/// 共有配信基盤（現行 `services/notifier` + DM 送信ヘルパ）。
+///
+/// クライアント表は `RwLock`（web からの動的 Bot 起動・トークン更新で REST クライアントを
+/// 差し替えられるように）。読みは短時間の read lock でクローンを取り出し、await を跨がない。
+pub struct DiscordMessenger {
+    clients: RwLock<HashMap<BotId, Arc<Client>>>,
+    default_client: RwLock<Option<Arc<Client>>>,
+    directory: Arc<dyn BotDirectory>,
+}
+
+impl DiscordMessenger {
+    /// 動的起動/トークン更新時に REST クライアントを登録・差し替える（prepare_runner から呼ぶ）。
+    /// system_default はデフォルト（フォールバック）クライアントも更新する。
+    pub fn register_client(&self, bot_id: &BotId, client: Arc<Client>) {
+        if bot_id.as_str() == BotId::SYSTEM_DEFAULT {
+            if let Ok(mut d) = self.default_client.write() {
+                *d = Some(client.clone());
+            }
+        }
+        if let Ok(mut map) = self.clients.write() {
+            map.insert(bot_id.clone(), client);
+        }
+    }
+
+    /// デフォルト（system_default）クライアントのクローンを取り出す。
+    fn default_client(&self) -> Option<Arc<Client>> {
+        self.default_client.read().ok().and_then(|d| d.clone())
+    }
+
+    /// bot_id 指定時のクライアント解決（現行 `resolveClientForUser` の botId 経路）。
+    /// 当該 Bot のクライアントがあればそれ、無ければデフォルト（system_default）へフォールバック。
+    ///
+    /// **意図的 divergence**: Node は `readyAt`（gateway 接続済み）を要求するが、twilight の HTTP
+    /// クライアントはトークンだけで REST 送信できる（gateway 非依存）ため readiness ゲートを設けない。
+    /// gateway 未接続でも DM/チャンネル送信は成功する＝Node が拒否するケースでも配信できる（改善側）。
+    fn resolve_client(&self, bot_id: &BotId) -> Option<Arc<Client>> {
+        if bot_id.as_str() != BotId::SYSTEM_DEFAULT {
+            if let Some(c) = self
+                .clients
+                .read()
+                .ok()
+                .and_then(|m| m.get(bot_id).cloned())
+            {
+                return Some(c);
+            }
+            // 当該 Bot がオフラインでもデフォルトへ届ける（現行フォールバック）。
+        }
+        self.default_client()
+    }
+
+    /// DM チャンネルを開いて channel id を得る。
+    async fn open_dm(client: &Client, user_id: Id<UserMarker>) -> Option<Id<ChannelMarker>> {
+        match client.create_private_channel(user_id).await {
+            Ok(resp) => match resp.model().await {
+                Ok(channel) => Some(channel.id),
+                Err(e) => {
+                    tracing::warn!(error = %e, "DM チャンネルの取得に失敗");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "DM チャンネルの作成に失敗");
+                None
+            }
+        }
+    }
+
+    /// 送信先を twilight channel id へ解決する。ギルドチャンネル宛は対象ユーザーがそのチャンネルに
+    /// 投稿できるか（閲覧＋送信権限）を検証し、不可/検証失敗なら `None`（呼び出し側が DM へフォールバック）。
+    async fn resolve_channel(
+        client: &Client,
+        user_id: &UserId,
+        target: &DeliverTarget,
+    ) -> Option<Id<ChannelMarker>> {
+        match target {
+            DeliverTarget::Channel(id) => {
+                let channel_id = id.parse::<Id<ChannelMarker>>().ok()?;
+                // 現行 notifier.ts の第三者チャンネル露出ガード: 共有/デフォルト Bot を踏み台に、
+                // 対象ユーザーが見られないチャンネルへその人のデータを流し込むのを防ぐ。
+                if Self::user_can_post_in_channel(client, channel_id, user_id).await {
+                    Some(channel_id)
+                } else {
+                    None
+                }
+            }
+            DeliverTarget::Dm => {
+                let uid = user_id.as_str().parse::<Id<UserMarker>>().ok()?;
+                Self::open_dm(client, uid).await
+            }
+        }
+    }
+
+    /// 対象ユーザーがこのチャンネルに投稿してよいか（`VIEW_CHANNEL` + 送信権限）。
+    ///
+    /// ギルドチャンネルなら、ギルド所有者・ロール・チャンネル上書きから twilight-util の権限計算で
+    /// 判定する（在籍だけでは非公開チャンネルに投稿できてしまうため）。スレッドは親チャンネルの
+    /// 上書きを使い、非公開スレッドはスレッドのメンバーかも確かめる。タイムアウト中の利用者と
+    /// ロック中のスレッドも判定に入れる。ギルド外（DM/グループ）チャンネルはガード対象外。
+    /// 取得・判定に失敗したら安全側（不可）に倒し DM フォールバックさせる。
+    async fn user_can_post_in_channel(
+        client: &Client,
+        channel_id: Id<ChannelMarker>,
+        user_id: &UserId,
+    ) -> bool {
+        let Ok(uid) = user_id.as_str().parse::<Id<UserMarker>>() else {
+            return false;
+        };
+        let Some(channel) = Self::fetch_channel(client, channel_id).await else {
+            return false;
+        };
+        // ギルド外チャンネル（DM 等）は露出ガードの対象外。
+        let Some(guild_id) = channel.guild_id else {
+            return true;
+        };
+        let channel_type = channel.kind;
+        let overwrites = if channel_type.is_thread() {
+            let Some(parent_id) = channel.parent_id else {
+                return false;
+            };
+            let Some(parent) = Self::fetch_channel(client, parent_id).await else {
+                return false;
+            };
+            parent.permission_overwrites.unwrap_or_default()
+        } else {
+            channel.permission_overwrites.unwrap_or_default()
+        };
+        let Ok(member) = client.guild_member(guild_id, uid).await else {
+            return false;
+        };
+        let Ok(member) = member.model().await else {
+            return false;
+        };
+        let Ok(guild) = client.guild(guild_id).await else {
+            return false;
+        };
+        let Ok(guild) = guild.model().await else {
+            return false;
+        };
+        // 非公開スレッドはメンバー（か MANAGE_THREADS 持ち）しか見られない。非メンバーは 404 が返る。
+        let private_thread_member = channel_type == ChannelType::PrivateThread
+            && client.thread_member(channel_id, uid).await.is_ok();
+        let timed_out = member
+            .communication_disabled_until
+            .is_some_and(|until| until.as_micros() > now_micros());
+        can_post_in_channel(&PostCheck {
+            guild_id,
+            owner_id: guild.owner_id,
+            user_id: uid,
+            member_role_ids: &member.roles,
+            guild_roles: &guild.roles,
+            channel_type,
+            overwrites: &overwrites,
+            timed_out,
+            thread_locked: channel.thread_metadata.is_some_and(|m| m.locked),
+            private_thread_member,
+        })
+    }
+
+    async fn fetch_channel(client: &Client, id: Id<ChannelMarker>) -> Option<Channel> {
+        client.channel(id).await.ok()?.model().await.ok()
+    }
+
+    /// オーナー宛の DM を、デフォルト（共有）クライアントからボタン付きで送る（DM 招待系の共通）。
+    async fn send_owner_dm(&self, user_id: &str, content: &str, components: &[ActionRow]) -> bool {
+        // 送信可否をそのまま返す（現行 DM sender の boolean 戻り・偽の成功を返さない）。
+        self.send_owner_dm_message(user_id, content, components)
+            .await
+            .is_some()
+    }
+
+    /// [`Self::send_owner_dm`] と同じ送信で、成功時は送った DM の所在を返す（後から編集する用途）。
+    async fn send_owner_dm_message(
+        &self,
+        user_id: &str,
+        content: &str,
+        components: &[ActionRow],
+    ) -> Option<DmMessageRef> {
+        let Some(client) = self.default_client() else {
+            tracing::warn!("デフォルト Bot が未起動のため DM を送れません");
+            return None;
+        };
+        let client = &client;
+        let uid = user_id.parse::<Id<UserMarker>>().ok()?;
+        let channel_id = Self::open_dm(client, uid).await?;
+        let comps = to_twilight_components(components);
+        let message_id =
+            crate::reply::send_channel_message(client, channel_id, None, content, &comps).await?;
+        Some(DmMessageRef {
+            channel_id: channel_id.get().to_string(),
+            message_id: message_id.get().to_string(),
+        })
+    }
+
+    /// 利用申請の受付 DM を決定済みの embed へ置き換え、ボタンを外す（Web から決定した場合）。
+    pub async fn close_member_request_dm(
+        &self,
+        dm: &DmMessageRef,
+        request: &DecidedRequest,
+    ) -> bool {
+        let Some(client) = self.default_client() else {
+            tracing::warn!("デフォルト Bot が未起動のため DM を編集できません");
+            return false;
+        };
+        let (Ok(channel_id), Ok(message_id)) = (
+            dm.channel_id.parse::<Id<ChannelMarker>>(),
+            dm.message_id.parse::<Id<MessageMarker>>(),
+        ) else {
+            return false;
+        };
+        let embeds = to_twilight_embeds(&[request.embed()]);
+        match client
+            .update_message(channel_id, message_id)
+            .content(None)
+            .embeds(Some(&embeds))
+            .components(Some(&[]))
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, channel_id = %channel_id, "利用申請 DM の編集に失敗");
+                false
+            }
+        }
+    }
+
+    // ── DM 送信ヘルパ（web/services が呼ぶ・現行 sendShareInviteDM 等） ──
+
+    /// 共有招待 DM（承認/辞退ボタン付き・現行 `sendShareInviteDM`）。
+    pub async fn send_share_invite_dm(
+        &self,
+        shared_user_id: &str,
+        bot_name: &str,
+        owner_name: &str,
+        recommended_persona_name: Option<&str>,
+        share_id: i64,
+    ) -> bool {
+        let persona_info = recommended_persona_name.map_or_else(String::new, |name| {
+            format!(
+                "\n\nこのBotには推奨ペルソナ「**{name}**」が設定されています。承認後にインポートするか選択できます。"
+            )
+        });
+        let content = format!(
+            "📨 **{owner_name}** さんがあなたをBot「**{bot_name}**」に招待しました。{persona_info}"
+        );
+        let components = share_invite_components(share_id);
+        self.send_owner_dm(shared_user_id, &content, &components)
+            .await
+    }
+
+    /// 利用申請の受付 DM（承認/却下ボタン付き・現行 `sendMemberRequestDM`）。
+    pub async fn send_member_request_dm(
+        &self,
+        owner_id: &str,
+        bot_name: &str,
+        applicant_label: &str,
+        guild_label: &str,
+        note: Option<&str>,
+        request_id: i64,
+    ) -> Option<DmMessageRef> {
+        let note_line = note
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map_or_else(String::new, |n| format!("\n\n📝 申請メッセージ:\n> {n}"));
+        let content = format!(
+            "🙋 Bot「**{bot_name}**」への利用申請が届きました。\n\n\
+             申請者: {applicant_label}\n\
+             ギルド: {guild_label}{note_line}\n\n\
+             下のボタンから承認/却下できます（管理画面の「利用申請」からも操作できます）。"
+        );
+        let components = vec![ActionRow {
+            buttons: vec![
+                Button {
+                    custom_id: format!("memreq_approve:{request_id}"),
+                    label: "承認する".to_owned(),
+                    style: ButtonStyle::Success,
+                },
+                Button {
+                    custom_id: format!("memreq_reject:{request_id}"),
+                    label: "却下する".to_owned(),
+                    style: ButtonStyle::Danger,
+                },
+            ],
+        }];
+        self.send_owner_dm_message(owner_id, &content, &components)
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::ports::MemberDmSender for DiscordMessenger {
+    async fn send_request_dm(
+        &self,
+        owner_id: &str,
+        bot_name: &str,
+        applicant_label: &str,
+        guild_label: &str,
+        note: Option<&str>,
+        request_id: i64,
+    ) -> Option<DmMessageRef> {
+        self.send_member_request_dm(
+            owner_id,
+            bot_name,
+            applicant_label,
+            guild_label,
+            note,
+            request_id,
+        )
+        .await
+    }
+
+    async fn close_request_dm(&self, dm: &DmMessageRef, request: &DecidedRequest) -> bool {
+        self.close_member_request_dm(dm, request).await
+    }
+}
+
+#[async_trait]
+impl crate::ports::ShareInviteDm for DiscordMessenger {
+    async fn send_invite(
+        &self,
+        share_id: i64,
+        target_user_id: &str,
+        bot_name: &str,
+        owner_name: &str,
+        persona_name: Option<&str>,
+    ) -> bool {
+        self.send_share_invite_dm(target_user_id, bot_name, owner_name, persona_name, share_id)
+            .await
+    }
+}
+
+#[async_trait]
+impl Notifier for DiscordMessenger {
+    async fn send_to_user(
+        &self,
+        user_id: &UserId,
+        reply: TurnReply,
+        target: DeliverTarget,
+        bot_id: &BotId,
+    ) -> bool {
+        let Some(client) = self.resolve_client(bot_id) else {
+            tracing::warn!(user = %user_id, "利用可能な Bot クライアントがありません");
+            return false;
+        };
+        // Channel 宛が解決不能（不明チャンネル / 対象ユーザーが閲覧不可）なら DM へフォールバックする
+        // （Node `sendToUser` notifier.ts:130-142・cron 経路は deliver_final を通らないため本メソッドで担保）。
+        let channel_id = match Self::resolve_channel(&client, user_id, &target).await {
+            Some(cid) => cid,
+            None => match &target {
+                DeliverTarget::Channel(_) => {
+                    let Some(dm) =
+                        Self::resolve_channel(&client, user_id, &DeliverTarget::Dm).await
+                    else {
+                        return false;
+                    };
+                    tracing::info!(user = %user_id, "チャンネル宛が解決不能のため DM へフォールバック");
+                    dm
+                }
+                DeliverTarget::Dm => return false,
+            },
+        };
+        // notifier はフレッシュ送信（reply_to なし）。分割・添付は send_channel_reply に委譲。
+        let _ = &self.directory; // 将来 botId 無し経路（listBotsForUser）で使用。
+        send_channel_reply(&client, channel_id, None, &reply).await
+    }
+}
+
+/// 共有招待 DM の承認/辞退ボタン（`share_accept:{id}` / `share_decline:{id}`）。
+///
+/// custom_id は [`crate::interaction::decide`] の `share_accept`/`share_decline` 分岐と一致させる
+/// （押下はデフォルト Bot のテナントが受ける・interaction のテストで往復を検証）。
+pub(crate) fn share_invite_components(share_id: i64) -> Vec<ActionRow> {
+    vec![ActionRow {
+        buttons: vec![
+            Button {
+                custom_id: format!("share_accept:{share_id}"),
+                label: "承認する".to_owned(),
+                style: ButtonStyle::Success,
+            },
+            Button {
+                custom_id: format!("share_decline:{share_id}"),
+                label: "辞退する".to_owned(),
+                style: ButtonStyle::Secondary,
+            },
+        ],
+    }]
+}
+
+/// 投稿可否の判定に使う、ギルド・チャンネル・利用者の状態（REST で集めた値）。
+struct PostCheck<'a> {
+    guild_id: Id<GuildMarker>,
+    owner_id: Id<UserMarker>,
+    user_id: Id<UserMarker>,
+    member_role_ids: &'a [Id<RoleMarker>],
+    guild_roles: &'a [Role],
+    channel_type: ChannelType,
+    /// チャンネルの上書き（スレッドなら親チャンネルの上書き）。
+    overwrites: &'a [PermissionOverwrite],
+    /// タイムアウト中か（`communication_disabled_until` が未来）。
+    timed_out: bool,
+    /// ロック中のスレッドか（送信には `MANAGE_THREADS` が要る）。
+    thread_locked: bool,
+    /// 非公開スレッドのメンバーか（非公開スレッド以外では見ない）。
+    private_thread_member: bool,
+}
+
+/// ギルドチャンネルでユーザーが閲覧・送信できるか（権限計算のみ・I/O なし）。
+fn can_post_in_channel(c: &PostCheck<'_>) -> bool {
+    // @everyone ロールの ID はギルド ID と同じ。
+    let everyone = c
+        .guild_roles
+        .iter()
+        .find(|r| r.id.get() == c.guild_id.get())
+        .map_or(Permissions::empty(), |r| r.permissions);
+    let member_roles: Vec<(Id<RoleMarker>, Permissions)> = c
+        .guild_roles
+        .iter()
+        .filter(|r| c.member_role_ids.contains(&r.id))
+        .map(|r| (r.id, r.permissions))
+        .collect();
+    // twilight の `in_channel` はボイス/ステージで SEND_MESSAGES などを外す（ボイスチャンネルの
+    // テキストチャットを考慮していない）。上書きの計算自体は種別に依存しないので、テキストとして計算する。
+    let calc_type = match c.channel_type {
+        ChannelType::GuildVoice | ChannelType::GuildStageVoice => ChannelType::GuildText,
+        other => other,
+    };
+    let perms = PermissionCalculator::new(c.guild_id, c.user_id, everyone, &member_roles)
+        .owner_id(c.owner_id)
+        .in_channel(calc_type, c.overwrites);
+    let send = if c.channel_type.is_thread() {
+        Permissions::SEND_MESSAGES_IN_THREADS
+    } else {
+        Permissions::SEND_MESSAGES
+    };
+    if !perms.contains(Permissions::VIEW_CHANNEL | send) {
+        return false;
+    }
+    // タイムアウト中は閲覧以外できない（管理者・所有者はタイムアウトの対象外）。
+    if c.timed_out && !perms.contains(Permissions::ADMINISTRATOR) {
+        return false;
+    }
+    let manage_threads = perms.contains(Permissions::MANAGE_THREADS);
+    if c.thread_locked && !manage_threads {
+        return false;
+    }
+    // 非公開スレッドはメンバーか MANAGE_THREADS 持ちしか見られない（親の上書きだけでは決まらない）。
+    if c.channel_type == ChannelType::PrivateThread && !c.private_thread_member && !manage_threads {
+        return false;
+    }
+    true
+}
+
+/// 現在時刻（UNIX マイクロ秒）。タイムアウト期限との比較用（取れなければ 0＝タイムアウト中とみなす側）。
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+/// テナント別 http クライアントを作る（トークン別・レート bucket 別・§8.1.3 案 (a)）。
+fn new_client(token: &SecretString) -> Client {
+    use secrecy::ExposeSecret as _;
+    Client::builder()
+        .token(token.expose_secret().to_owned())
+        .default_allowed_mentions(default_allowed_mentions())
+        .build()
+}
+
+/// 全送信の既定 `allowed_mentions`。`parse` を空にして、本文中の `@everyone`・`@here`・
+/// ロール・ユーザーのメンションを通知させない（LLM 返答経由のメンション注入対策）。
+/// 返信先ユーザーへの通知（`replied_user`）だけは残す。
+///
+/// クライアントの既定は `create_message` / `create_followup` / `update_response` などに効くが、
+/// `InteractionClient::create_response` には効かない。そちらは `interaction::respond` で明示する。
+pub(crate) fn default_allowed_mentions() -> AllowedMentions {
+    AllowedMentions {
+        parse: Vec::new(),
+        replied_user: true,
+        roles: Vec::new(),
+        users: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
+
+    fn messenger_with(clients: &[&str], default: Option<&str>) -> DiscordMessenger {
+        let map: HashMap<BotId, Arc<Client>> = clients
+            .iter()
+            .map(|id| (BotId::new(*id), Arc::new(Client::new(String::new()))))
+            .collect();
+        DiscordMessenger {
+            default_client: RwLock::new(default.and_then(|d| map.get(&BotId::new(d)).cloned())),
+            clients: RwLock::new(map),
+            directory: Arc::new(NoopDirectory),
+        }
+    }
+
+    // 送信は `create_message` 等が `default_allowed_mentions` を継承する。クライアントに既定が
+    // 付いていること（parse が空）を確かめる。
+    #[tokio::test]
+    async fn new_client_denies_all_mentions_by_default() {
+        let client = new_client(&SecretString::from("token".to_owned()));
+        let am = client
+            .default_allowed_mentions()
+            .expect("既定の allowed_mentions が必要");
+        assert!(am.parse.is_empty());
+        assert!(am.roles.is_empty() && am.users.is_empty());
+        assert!(am.replied_user, "返信先ユーザーへの通知は維持する");
+    }
+
+    fn role(id: u64, perms: Permissions) -> Role {
+        #[allow(deprecated)]
+        Role {
+            colors: twilight_model::guild::RoleColors {
+                primary_color: 0,
+                secondary_color: None,
+                tertiary_color: None,
+            },
+            color: 0,
+            hoist: false,
+            icon: None,
+            id: Id::new(id),
+            managed: false,
+            mentionable: false,
+            name: String::new(),
+            permissions: perms,
+            position: 0,
+            flags: twilight_model::guild::RoleFlags::empty(),
+            tags: None,
+            unicode_emoji: None,
+        }
+    }
+
+    fn overwrite(id: u64, allow: Permissions, deny: Permissions) -> PermissionOverwrite {
+        PermissionOverwrite {
+            allow,
+            deny,
+            id: Id::new(id),
+            kind: PermissionOverwriteType::Role,
+        }
+    }
+
+    const GUILD: u64 = 1;
+    const OWNER: u64 = 99;
+    const USER: u64 = 5;
+    const ROLE: u64 = 7;
+
+    fn base() -> Permissions {
+        Permissions::VIEW_CHANNEL
+            | Permissions::SEND_MESSAGES
+            | Permissions::SEND_MESSAGES_IN_THREADS
+    }
+
+    /// 既定は「@everyone に base()・利用者はロール ROLE 持ち・GuildText・上書きなし」。
+    fn check<'a>(
+        roles: &'a [Role],
+        member_roles: &'a [Id<RoleMarker>],
+        channel_type: ChannelType,
+        overwrites: &'a [PermissionOverwrite],
+    ) -> PostCheck<'a> {
+        PostCheck {
+            guild_id: Id::new(GUILD),
+            owner_id: Id::new(OWNER),
+            user_id: Id::new(USER),
+            member_role_ids: member_roles,
+            guild_roles: roles,
+            channel_type,
+            overwrites,
+            timed_out: false,
+            thread_locked: false,
+            private_thread_member: false,
+        }
+    }
+
+    #[test]
+    fn can_post_requires_view_and_send_per_channel() {
+        let roles = [role(GUILD, base()), role(ROLE, Permissions::empty())];
+        let text = ChannelType::GuildText;
+        assert!(can_post_in_channel(&check(&roles, &[], text, &[])));
+        // @everyone の閲覧拒否（非公開チャンネル）→ 不可（DM フォールバック対象）。
+        let private = overwrite(GUILD, Permissions::empty(), Permissions::VIEW_CHANNEL);
+        let only_private = std::slice::from_ref(&private);
+        assert!(!can_post_in_channel(&check(
+            &roles,
+            &[],
+            text,
+            only_private
+        )));
+        // ロールの許可上書きで閲覧可能になる。
+        let allow = overwrite(ROLE, Permissions::VIEW_CHANNEL, Permissions::empty());
+        let member_roles = [Id::new(ROLE)];
+        let ows = [private, allow];
+        assert!(can_post_in_channel(&check(
+            &roles,
+            &member_roles,
+            text,
+            &ows
+        )));
+        // 送信拒否も不可。
+        let no_send = [overwrite(
+            GUILD,
+            Permissions::empty(),
+            Permissions::SEND_MESSAGES,
+        )];
+        assert!(!can_post_in_channel(&check(&roles, &[], text, &no_send)));
+        // 所有者は常に許可。
+        let mut owner = check(&roles, &[], text, only_private);
+        owner.user_id = Id::new(OWNER);
+        assert!(can_post_in_channel(&owner));
+    }
+
+    #[test]
+    fn member_overwrite_and_administrator() {
+        let roles = [role(GUILD, base()), role(ROLE, Permissions::ADMINISTRATOR)];
+        let text = ChannelType::GuildText;
+        // メンバー単位の上書きは、ロールの許可より強い。
+        let member_deny = PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+            id: Id::new(USER),
+            kind: PermissionOverwriteType::Member,
+        };
+        assert!(!can_post_in_channel(&check(
+            &roles,
+            &[],
+            text,
+            std::slice::from_ref(&member_deny)
+        )));
+        let private = overwrite(GUILD, Permissions::empty(), Permissions::VIEW_CHANNEL);
+        let member_allow = PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            id: Id::new(USER),
+            kind: PermissionOverwriteType::Member,
+        };
+        assert!(can_post_in_channel(&check(
+            &roles,
+            &[],
+            text,
+            &[private, member_allow]
+        )));
+        // ADMINISTRATOR ロールは上書きに関係なく可。
+        let admin = [Id::new(ROLE)];
+        assert!(can_post_in_channel(&check(
+            &roles,
+            &admin,
+            text,
+            &[private, member_deny]
+        )));
+    }
+
+    #[test]
+    fn threads_use_send_messages_in_threads() {
+        let roles = [role(GUILD, base())];
+        // 親で SEND_MESSAGES だけ拒否されていても、スレッドへは送れる。
+        let no_send = [overwrite(
+            GUILD,
+            Permissions::empty(),
+            Permissions::SEND_MESSAGES,
+        )];
+        assert!(can_post_in_channel(&check(
+            &roles,
+            &[],
+            ChannelType::PublicThread,
+            &no_send
+        )));
+        // SEND_MESSAGES_IN_THREADS が拒否されていれば不可。
+        let no_thread_send = [overwrite(
+            GUILD,
+            Permissions::empty(),
+            Permissions::SEND_MESSAGES_IN_THREADS,
+        )];
+        assert!(!can_post_in_channel(&check(
+            &roles,
+            &[],
+            ChannelType::PublicThread,
+            &no_thread_send
+        )));
+    }
+
+    #[test]
+    fn private_thread_requires_membership_or_manage_threads() {
+        let roles = [role(GUILD, base()), role(ROLE, Permissions::MANAGE_THREADS)];
+        let t = ChannelType::PrivateThread;
+        // 親を見られても、スレッドのメンバーでなければ不可。
+        assert!(!can_post_in_channel(&check(&roles, &[], t, &[])));
+        let mut member = check(&roles, &[], t, &[]);
+        member.private_thread_member = true;
+        assert!(can_post_in_channel(&member));
+        // MANAGE_THREADS 持ちはメンバーでなくても可。
+        assert!(can_post_in_channel(&check(
+            &roles,
+            &[Id::new(ROLE)],
+            t,
+            &[]
+        )));
+    }
+
+    #[test]
+    fn locked_thread_requires_manage_threads() {
+        let roles = [role(GUILD, base()), role(ROLE, Permissions::MANAGE_THREADS)];
+        let manager = [Id::new(ROLE)];
+        let mut locked = check(&roles, &[], ChannelType::PublicThread, &[]);
+        locked.thread_locked = true;
+        assert!(!can_post_in_channel(&locked));
+        locked.member_role_ids = &manager;
+        assert!(can_post_in_channel(&locked));
+    }
+
+    #[test]
+    fn timed_out_member_cannot_post_unless_admin() {
+        let roles = [role(GUILD, base()), role(ROLE, Permissions::ADMINISTRATOR)];
+        let mut c = check(&roles, &[], ChannelType::GuildText, &[]);
+        c.timed_out = true;
+        assert!(!can_post_in_channel(&c));
+        let admin = [Id::new(ROLE)];
+        c.member_role_ids = &admin;
+        assert!(can_post_in_channel(&c));
+    }
+
+    /// twilight はボイス/ステージで SEND_MESSAGES を外すが、テキストチャットへは送れる。
+    #[test]
+    fn voice_and_stage_channels_keep_send_messages() {
+        let roles = [role(GUILD, base())];
+        for t in [ChannelType::GuildVoice, ChannelType::GuildStageVoice] {
+            assert!(can_post_in_channel(&check(&roles, &[], t, &[])), "{t:?}");
+            let no_send = [overwrite(
+                GUILD,
+                Permissions::empty(),
+                Permissions::SEND_MESSAGES,
+            )];
+            assert!(
+                !can_post_in_channel(&check(&roles, &[], t, &no_send)),
+                "{t:?}"
+            );
+        }
+    }
+
+    // twilight `Client::new` は ratelimiter で Tokio ランタイムを要求するため tokio::test で回す。
+    #[tokio::test]
+    async fn resolve_client_prefers_custom_then_default() {
+        let m = messenger_with(&["system_default", "botX"], Some("system_default"));
+        // custom がある → custom（None にならない）。
+        assert!(m.resolve_client(&BotId::new("botX")).is_some());
+        // 未知の custom → デフォルトへフォールバック。
+        assert!(m.resolve_client(&BotId::new("unknown")).is_some());
+        // system_default → デフォルト。
+        assert!(m.resolve_client(&BotId::system_default()).is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_client_none_when_no_default() {
+        let m = messenger_with(&["botX"], None);
+        // custom はある。
+        assert!(m.resolve_client(&BotId::new("botX")).is_some());
+        // 未知の custom かつデフォルト無し → None。
+        assert!(m.resolve_client(&BotId::new("unknown")).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_client_updates_map_and_default() {
+        let m = messenger_with(&[], None);
+        // 未登録 → None（デフォルトも無し）。
+        assert!(m.resolve_client(&BotId::new("botX")).is_none());
+        // custom を動的登録 → 当該 Bot は解決可・デフォルトは未設定のまま。
+        m.register_client(&BotId::new("botX"), Arc::new(Client::new(String::new())));
+        assert!(m.resolve_client(&BotId::new("botX")).is_some());
+        assert!(m.resolve_client(&BotId::new("unknown")).is_none());
+        // system_default を動的登録 → デフォルトも更新され、未知 Bot がフォールバック解決可能に。
+        m.register_client(
+            &BotId::system_default(),
+            Arc::new(Client::new(String::new())),
+        );
+        assert!(m.resolve_client(&BotId::new("unknown")).is_some());
+    }
+
+    // 最小ダミー directory（resolve_client のテストでは実際には呼ばれない）。
+    struct NoopDirectory;
+    use crate::ports::BotRecord;
+    use yuuka_core::GuildId;
+    #[async_trait]
+    impl BotDirectory for NoopDirectory {
+        async fn get_bot(&self, _b: &BotId) -> Option<BotRecord> {
+            None
+        }
+        async fn list_all_bots(&self) -> Vec<BotRecord> {
+            Vec::new()
+        }
+        async fn list_bots_for_user(&self, _u: &UserId) -> Vec<BotId> {
+            Vec::new()
+        }
+        async fn decrypt_token(&self, _b: &BotId) -> Option<SecretString> {
+            None
+        }
+        async fn update_profile(&self, _b: &BotId, _u: &str, _a: &str, _d: &str) {}
+        async fn is_registered_user(&self, _u: &UserId) -> bool {
+            false
+        }
+        async fn is_bot_member(&self, _b: &BotId, _g: &GuildId, _u: &UserId) -> bool {
+            false
+        }
+        async fn is_guild_allowed(&self, _b: &BotId, _g: &GuildId) -> bool {
+            false
+        }
+        async fn is_channel_enabled(&self, _b: &BotId, _g: &GuildId, _c: &str) -> bool {
+            false
+        }
+        async fn is_channel_muted(&self, _b: &BotId, _g: &GuildId, _c: &str) -> bool {
+            false
+        }
+        async fn is_any_role_allowed(&self, _b: &BotId, _g: &GuildId, _r: &[String]) -> bool {
+            false
+        }
+    }
+}

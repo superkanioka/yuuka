@@ -1,0 +1,486 @@
+//! Function Calling ループ（§8.2.4）— 現行 `runFunctionCallingLoop`
+//! [`src/gemini.ts:501-752`] の型付き 1:1 移植。
+//!
+//! 往復・並行呼び出し（`id` 相関）・`maxIterations`・完了ハルシネーション是正（mode=ANY）を保持。
+//! バックエンドは [`GenerateBackend`] trait 越しなのでテストは canned レスポンスで駆動できる。
+//! provider は `yuuka-core` の凍結 [`ToolProvider`] トレイト（Native/MCP/WASM 透過）。
+//! ツール実行実績（`tool_outcomes`）は [`ToolOutcomeSink`] ポート越しに上位層が永続化する。
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use serde_json::json;
+use yuuka_core::tool::FunctionDeclaration as CoreFnDecl;
+use yuuka_core::{
+    ActionRecorder, DbError, GeminiError, MetricsSink, ResponsePart, ToolContext, ToolName,
+    ToolProvider,
+};
+
+use crate::client::GenerateBackend;
+use crate::wire::{
+    Content, FunctionDeclaration, FunctionResponse, GenerateContentResponse, Part, Role, ToolConfig,
+};
+
+/// 未実行の完了報告を検知した際に注入する是正プロンプト（[`src/gemini.ts:491-495`] 直移植）。
+pub const COMPLETION_CORRECTION_PROMPT: &str = "【システム検証】あなたは今回のやり取りで一度もツール（関数）を呼び出していません。\
+そのため、上記で報告した操作は実際には一切実行されていません。\
+本当にその操作を行うのであれば、今すぐ対応する関数を呼び出してください。\
+操作する必要がない、あるいは実行できない場合は、完了したかのように装わず、その旨を正直に伝えてください。";
+
+/// ループ中のステータス（現行 `onStatusChange` 相当）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Thinking,
+    Writing,
+}
+
+/// ステータス通知コールバック（省略可）。
+pub type StatusCb = Arc<dyn Fn(Status) + Send + Sync>;
+
+/// 生成中の本文を受け取るコールバック（省略可）。1 回の生成でここまでに届いた本文全体を渡し、次の生成
+/// （ツール結果の返送後・完了是正後）では、その生成の本文で最初から渡し直す。
+pub type TextCb = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// ツール実行の成否（`tool_outcomes.status`・Node `"success" | "error"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcomeStatus {
+    Success,
+    Error,
+}
+
+impl ToolOutcomeStatus {
+    /// `functionResponse.response` から成否を判定する（Node `reportedFailure`: JSON の
+    /// `success === false` のときだけ失敗。`success` を持たない結果は成功扱い）。
+    #[must_use]
+    pub fn from_response(response: &serde_json::Value) -> Self {
+        if response.get("success") == Some(&serde_json::Value::Bool(false)) {
+            Self::Error
+        } else {
+            Self::Success
+        }
+    }
+
+    /// DB に保存する文字列表現（`"success"` / `"error"`）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// ツール 1 回分の実行実績（Node `recordToolOutcome` の入力のうち FC ループが知る部分）。
+///
+/// `args` は**生の引数**。永続化する側は必ずダイジェスト化（秘匿マスク）してから保存し、
+/// 引数そのものを残さないこと。user/bot/guild は同時に渡す [`ToolContext`] から取る。
+#[derive(Debug, Clone, Copy)]
+pub struct ToolOutcomeRecord<'a> {
+    /// ツール名（Gemini の functionCall 名）。
+    pub tool_name: &'a str,
+    /// 生の引数（ダイジェスト化前）。
+    pub args: &'a serde_json::Value,
+    /// 成否。
+    pub status: ToolOutcomeStatus,
+    /// dispatch に要した時間（ミリ秒）。
+    pub latency_ms: u64,
+}
+
+/// ツール実行実績の記録先ポート（Node `recordToolOutcome` → `tool_outcomes`）。
+///
+/// FC ループは dispatch 毎に 1 回呼ぶ。失敗はループ側で `warn` ログに落とし、ターンは続行する
+/// （記録の失敗で応答を妨げない）。本番実装は orchestrator の `DbToolOutcomeSink`。
+#[async_trait]
+pub trait ToolOutcomeSink: Send + Sync {
+    /// 実行実績を 1 件記録する。
+    ///
+    /// # Errors
+    /// 永続化に失敗したとき [`DbError`]。
+    async fn record(&self, ctx: &ToolContext, record: ToolOutcomeRecord<'_>)
+        -> Result<(), DbError>;
+}
+
+/// ループ実行オプション。
+pub struct LoopOptions {
+    /// 最大反復回数（現行 `maxIterations=10`）。
+    pub max_iterations: usize,
+    /// 完了是正の最大回数（現行 `maxCorrectionAttempts=2`）。
+    pub max_corrections: usize,
+    /// 完了是正時に mode=ANY で許可するツール名（プラン候補に限定）。空/None なら全許可。
+    pub allowed_tool_names: Option<Vec<String>>,
+    /// ステータス通知（thinking/writing）。
+    pub on_status: Option<StatusCb>,
+    /// 操作履歴レコーダー（Node `recordFunctionCall`）。dispatch 毎に記録し
+    /// `getRecentActionHistory` へ供給する。None なら記録しない。
+    pub action_recorder: Option<Arc<ActionRecorder>>,
+    /// ツール実行実績の記録先（Node `recordToolOutcome`）。dispatch 毎に 1 件記録する。
+    /// None なら記録しない。
+    pub outcome_sink: Option<Arc<dyn ToolOutcomeSink>>,
+    /// 実利用メトリクスの記録先（Node `incrMetric("tool_calls")`）。dispatch 毎に `tool_calls` を 1 増やす。
+    /// None なら記録しない。
+    pub metrics: Option<Arc<dyn MetricsSink>>,
+    /// 生成中の本文の逐次通知（Discord の逐次表示）。None なら本文を逐次受け取らない。
+    pub on_text: Option<TextCb>,
+}
+
+impl Default for LoopOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 10,
+            max_corrections: 2,
+            allowed_tool_names: None,
+            on_status: None,
+            action_recorder: None,
+            outcome_sink: None,
+            metrics: None,
+            on_text: None,
+        }
+    }
+}
+
+/// ループ結果。
+#[derive(Debug, Clone, Default)]
+pub struct LoopResult {
+    /// 最終テキスト応答（空なら呼び出し側がフォールバック定型文を使う）。
+    pub text: String,
+    /// このターンで実際に dispatch したツール名（順序保持・browser 判定等に使う）。
+    pub tool_calls: Vec<String>,
+    /// ツール実行が積み上げたリッチ返信パート（embeds/images 相当・現行 ctx.embeds/files の置換）。
+    pub rich_parts: Vec<ResponsePart>,
+    /// `maxIterations` に到達して打ち切ったか（現行 `browserToolFailed=true` 相当の異常終了）。
+    pub hit_max_iterations: bool,
+}
+
+/// 操作の「完了」を主張するテキストか（完了ハルシネーション検知・[`src/gemini.ts:480-488`]）。
+///
+/// 現行の日本語正規表現 2 本を、依存追加（`regex`）せずに手動走査で移植する:
+/// - `(登録|追加|…)(し(ました|ておきました|ておきます|ますね?))`
+/// - `(やって|して)おき(ました|ます(ね)?)`
+#[must_use]
+pub fn claims_action_completed(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    const VERBS: &[&str] = &[
+        "登録",
+        "追加",
+        "削除",
+        "設定",
+        "記録",
+        "保存",
+        "作成",
+        "更新",
+        "消込",
+        "予約",
+        "同期",
+        "変更",
+        "オン",
+        "オフ",
+        "有効化",
+        "無効化",
+    ];
+    // し + {ました, ておきました, ておきます, ます, ますね}
+    const SHI_FORMS: &[&str] = &[
+        "しました",
+        "しておきました",
+        "しておきます",
+        "しますね",
+        "します",
+    ];
+    for verb in VERBS {
+        for form in SHI_FORMS {
+            if text.contains(&format!("{verb}{form}")) {
+                return true;
+            }
+        }
+    }
+    // (やって|して)おき(ました|ますね|ます)
+    for prefix in ["やって", "して"] {
+        for form in ["ました", "ますね", "ます"] {
+            if text.contains(&format!("{prefix}おき{form}")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// core の provider 中立 `FunctionDeclaration`（IR）を Gemini wire 宣言へ変換する。
+///
+/// フル JSON Schema を `parametersJsonSchema` に載せ、`$schema` キーだけ最小サニタイズする
+/// （深いサニタイズは provider 側の責務・§8.4）。
+fn to_wire_declaration(d: &CoreFnDecl) -> FunctionDeclaration {
+    FunctionDeclaration {
+        name: d.name.as_str().to_owned(),
+        description: d.description.clone(),
+        parameters: None,
+        parameters_json_schema: Some(sanitize_schema(&d.parameters_json_schema)),
+    }
+}
+
+/// JSON Schema から `$schema` キーを再帰的に除去する（Gemini が拒否するため）。
+fn sanitize_schema(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if k == "$schema" {
+                    continue;
+                }
+                out.insert(k.clone(), sanitize_schema(val));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sanitize_schema).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn notify(opts: &LoopOptions, status: Status) {
+    if let Some(cb) = &opts.on_status {
+        cb(status);
+    }
+}
+
+/// ループの 1 回分の生成。`opts.on_text` があれば本文を逐次受け取って渡す。
+///
+/// `may_correct`（まだ一度もツールを呼ばず、完了是正がまだ効く）の間は、「登録しました」等の完了報告に
+/// なった本文を渡さない。是正で取り消す本文を、実行していない操作の報告として利用者へ見せないため。
+async fn generate_step(
+    backend: &dyn GenerateBackend,
+    system_instruction: &str,
+    decls: &[FunctionDeclaration],
+    contents: &[Content],
+    tool_config: Option<ToolConfig>,
+    opts: &LoopOptions,
+    may_correct: bool,
+) -> Result<GenerateContentResponse, GeminiError> {
+    let Some(on_text) = &opts.on_text else {
+        return backend
+            .generate(Some(system_instruction), decls, contents, tool_config)
+            .await;
+    };
+    let forward = |text: &str| {
+        if !(may_correct && claims_action_completed(text)) {
+            on_text(text);
+        }
+    };
+    backend
+        .generate_streaming(
+            Some(system_instruction),
+            decls,
+            contents,
+            tool_config,
+            &forward,
+        )
+        .await
+}
+
+/// Function Calling ループ本体。`contents` は往復のたびに追記される（呼び出し側の履歴）。
+///
+/// # Errors
+/// generateContent 呼び出し自体の失敗（429/5xx/timeout 等を出し切った後）を [`GeminiError`] で返す。
+/// **個別ツールの失敗は握り潰さず** `{success:false, message}` として Gemini へ返送する
+/// （ループは継続・現行 dispatch の catch と同挙動）。
+pub async fn run_function_calling_loop(
+    backend: &dyn GenerateBackend,
+    provider: &dyn ToolProvider,
+    system_instruction: &str,
+    contents: &mut Vec<Content>,
+    ctx: &ToolContext,
+    opts: &LoopOptions,
+) -> Result<LoopResult, GeminiError> {
+    // リクエスト毎に全 provider から宣言を動的生成（現行の毎ターン再構築＝正しいパターン）。
+    let decls: Vec<FunctionDeclaration> =
+        provider.list(ctx).iter().map(to_wire_declaration).collect();
+
+    notify(opts, Status::Thinking);
+    let may_correct = opts.max_corrections > 0 && !decls.is_empty();
+    let mut resp = generate_step(
+        backend,
+        system_instruction,
+        &decls,
+        contents,
+        None,
+        opts,
+        may_correct,
+    )
+    .await?;
+
+    let mut result = LoopResult::default();
+    let mut iterations = 0usize;
+    let mut total_calls = 0usize;
+    let mut corrections = 0usize;
+
+    loop {
+        if iterations >= opts.max_iterations {
+            result.hit_max_iterations = true;
+            break;
+        }
+        let Some(candidate) = resp.candidates.first().cloned() else {
+            break;
+        };
+        let calls = candidate.function_calls();
+
+        if calls.is_empty() {
+            // 完了ハルシネーション是正: このターンで一度も関数を呼ばず「登録しました」等を主張。
+            if total_calls == 0 && corrections < opts.max_corrections && !decls.is_empty() {
+                let text = candidate
+                    .content
+                    .as_ref()
+                    .map(Content::collect_text)
+                    .unwrap_or_default();
+                if claims_action_completed(&text) {
+                    corrections += 1;
+                    if let Some(content) = candidate.content.clone() {
+                        contents.push(content);
+                    }
+                    contents.push(Content::user_text(COMPLETION_CORRECTION_PROMPT));
+                    notify(opts, Status::Thinking);
+                    // mode=ANY で構造的に関数呼び出しを強制（AUTO のままだと是正後も繰り返し得る）。
+                    let tc = ToolConfig::force_any(opts.allowed_tool_names.clone());
+                    let may_correct = corrections < opts.max_corrections;
+                    resp = generate_step(
+                        backend,
+                        system_instruction,
+                        &decls,
+                        contents,
+                        Some(tc),
+                        opts,
+                        may_correct,
+                    )
+                    .await?;
+                    iterations += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        total_calls += calls.len();
+        let mut response_parts: Vec<Part> = Vec::with_capacity(calls.len());
+
+        // 並行呼び出し公式サポート。id を相関に保持する（独立ツールの並行実行は将来最適化）。
+        for fc in &calls {
+            result.tool_calls.push(fc.name.clone());
+            // 操作履歴に記録（Node `recordFunctionCall`・除外/秘匿はレコーダ内で判定・応答を妨げない）。
+            if let Some(recorder) = &opts.action_recorder {
+                recorder.record(ctx.user_id.as_str(), &fc.name, &fc.args);
+            }
+            let started = Instant::now();
+            let response =
+                dispatch_one(provider, ctx, &fc.name, fc.args.clone(), &mut result).await;
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // 実利用メトリクス（Node は recordToolOutcome の直前で `incrMetric("tool_calls")`）。
+            if let Some(metrics) = &opts.metrics {
+                metrics.incr("tool_calls", 1);
+            }
+            // 実行実績を永続化（Node `recordToolOutcome`・失敗は warn のみで応答を妨げない）。
+            if let Some(sink) = &opts.outcome_sink {
+                let record = ToolOutcomeRecord {
+                    tool_name: &fc.name,
+                    args: &fc.args,
+                    status: ToolOutcomeStatus::from_response(&response),
+                    latency_ms,
+                };
+                if let Err(e) = sink.record(ctx, record).await {
+                    tracing::warn!(error = %e, tool = %fc.name, "[ToolOutcome] 記録に失敗しました（無視）");
+                }
+            }
+            response_parts.push(Part::function_response(FunctionResponse {
+                name: fc.name.clone(),
+                response,
+                id: fc.id.clone(),
+            }));
+        }
+
+        // model の functionCall 入り content → functionResponse を返送。
+        if let Some(content) = candidate.content.clone() {
+            contents.push(content);
+        }
+        contents.push(Content {
+            role: Role::User,
+            parts: response_parts,
+        });
+        notify(opts, Status::Writing);
+        resp = generate_step(
+            backend,
+            system_instruction,
+            &decls,
+            contents,
+            None,
+            opts,
+            false,
+        )
+        .await?;
+        iterations += 1;
+    }
+
+    result.text = resp.text();
+    Ok(result)
+}
+
+/// 1 ツールを dispatch し、`functionResponse.response` に載せる JSON を返す。
+/// 個別失敗は握り潰さず `{success:false, message}` へ落とす（Gemini へ返してループ継続）。
+async fn dispatch_one(
+    provider: &dyn ToolProvider,
+    ctx: &ToolContext,
+    name: &str,
+    args: serde_json::Value,
+    result: &mut LoopResult,
+) -> serde_json::Value {
+    let tool_name = match ToolName::checked(name.to_owned()) {
+        Ok(n) => n,
+        Err(e) => return json!({ "success": false, "message": e.to_string() }),
+    };
+    match provider.invoke(&tool_name, args, ctx).await {
+        Ok(outcome) => {
+            // リッチ返信パート（embeds/images）を積み上げて呼び出し側へ渡す。
+            result.rich_parts.extend(outcome.parts);
+            outcome.payload
+        }
+        Err(e) => json!({ "success": false, "message": e.to_string() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claims_action_completed_matches_done_forms() {
+        assert!(claims_action_completed("タスクを登録しました。"));
+        assert!(claims_action_completed("リマインドを設定しておきました"));
+        assert!(claims_action_completed("同期しておきますね"));
+        assert!(claims_action_completed("やっておきました"));
+        assert!(claims_action_completed("しておきますね"));
+        assert!(claims_action_completed("有効化します"));
+    }
+
+    #[test]
+    fn claims_action_completed_ignores_plain_text() {
+        assert!(!claims_action_completed(""));
+        assert!(!claims_action_completed(
+            "こんにちは、今日の天気は晴れです。"
+        ));
+        assert!(!claims_action_completed("登録が必要ですか？"));
+    }
+
+    #[test]
+    fn sanitize_schema_strips_dollar_schema_recursively() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft-07/schema",
+            "type": "object",
+            "properties": {
+                "x": { "$schema": "nested", "type": "string" }
+            }
+        });
+        let out = sanitize_schema(&schema);
+        assert!(out.get("$schema").is_none());
+        assert!(out["properties"]["x"].get("$schema").is_none());
+        assert_eq!(out["properties"]["x"]["type"], "string");
+    }
+}
